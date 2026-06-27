@@ -1,0 +1,31 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Dataset and generated artifacts
+data/
+output/
+palnet_orthodontic_comparison/.venv/
+palnet_orthodontic_comparison/runs/
+palnet_orthodontic_comparison/transforms/
+
+# Embedded upstream git metadata; keep source files in this repo, not as a nested repo.
+palnet_orthodontic_comparison/upstream/.git/
+palnet_orthodontic_comparison/upstream/__pycache__/
+palnet_orthodontic_comparison/upstream/src/**/__pycache__/
+
+# Heavy experiment/model files if created outside ignored run folders.
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.ply
+
