@@ -15,11 +15,16 @@ output/
 palnet_orthodontic_comparison/.venv/
 palnet_orthodontic_comparison/runs/
 palnet_orthodontic_comparison/transforms/
+diffusion_net_orthodontic_comparison/runs/
 
 # Embedded upstream git metadata; keep source files in this repo, not as a nested repo.
 palnet_orthodontic_comparison/upstream/.git/
 palnet_orthodontic_comparison/upstream/__pycache__/
 palnet_orthodontic_comparison/upstream/src/**/__pycache__/
+diffusion_net_orthodontic_comparison/upstream/.git/
+diffusion_net_orthodontic_comparison/upstream/__pycache__/
+diffusion_net_orthodontic_comparison/upstream/src/**/__pycache__/
+diffusion_net_orthodontic_comparison/__pycache__/
 
 # Heavy experiment/model files if created outside ignored run folders.
 *.pth
@@ -28,4 +33,3 @@ palnet_orthodontic_comparison/upstream/src/**/__pycache__/
 *.npy
 *.npz
 *.ply
-
