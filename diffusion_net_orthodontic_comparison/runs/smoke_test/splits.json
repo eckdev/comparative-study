@@ -1,0 +1,39 @@
+{
+  "train": [
+    "Class1_M9",
+    "Class1_M24",
+    "Class1_M23",
+    "Class1_M18",
+    "Class1_M22",
+    "Class1_M3",
+    "Class1_M4",
+    "Class1_M25",
+    "Class1_M17",
+    "Class1_M2",
+    "Class1_M19",
+    "Class1_M5",
+    "Class1_M28",
+    "Class1_M14",
+    "Class1_M6",
+    "Class1_M12",
+    "Class1_M27",
+    "Class1_M13"
+  ],
+  "val": [
+    "Class1_M16",
+    "Class1_M26",
+    "Class1_M10",
+    "Class1_M29",
+    "Class1_M30",
+    "Class1_M1"
+  ],
+  "test": [
+    "Class1_M21",
+    "Class1_M7",
+    "Class1_M11",
+    "Class1_M20",
+    "Class1_M15",
+    "Class1_M8"
+  ],
+  "missing_landmark_meshes": []
+}

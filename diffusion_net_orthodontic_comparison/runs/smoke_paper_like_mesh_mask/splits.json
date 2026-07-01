@@ -1,0 +1,19 @@
+{
+  "train": [
+    "Class1_M3",
+    "Class1_M2",
+    "Class1_M6",
+    "Class1_M9",
+    "Class1_M8",
+    "Class1_M5"
+  ],
+  "val": [
+    "Class1_M1",
+    "Class1_M10"
+  ],
+  "test": [
+    "Class1_M4",
+    "Class1_M7"
+  ],
+  "missing_landmark_meshes": []
+}

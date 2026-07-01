@@ -1,0 +1,62 @@
+{
+  "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
+  "unit": "dataset coordinate unit after optional transformation",
+  "model": "DiffusionNet point-cloud landmark classification adaptation",
+  "n_train": 6,
+  "n_val": 2,
+  "n_test": 2,
+  "surface_points": 1024,
+  "use_mesh_vertices": true,
+  "k_eig": 16,
+  "sigma": 0.04,
+  "mask_radius": 3.5,
+  "loss_mode": "mask_bce",
+  "positive_weight": 0.0,
+  "input_features": "xyz",
+  "hks_dim": 16,
+  "refine_topk": 1,
+  "refine_temperature": 1.0,
+  "postprocess": "softmax",
+  "width": 32,
+  "blocks": 1,
+  "mlp_hidden_dims": [
+    64
+  ],
+  "best_val_loss": 0.7123730182647705,
+  "test_loss": 0.7233091294765472,
+  "diffusionnet_heatmap": {
+    "ale": 73.48349596106488,
+    "std": 16.474212942068213,
+    "median": 69.9903564453125,
+    "max": 138.0763702392578,
+    "per_landmark_ale": [
+      131.68221282958984,
+      101.36986923217773,
+      84.55928802490234,
+      87.45524597167969,
+      76.93737411499023,
+      67.00442123413086,
+      63.609371185302734,
+      65.65752220153809,
+      62.30120086669922,
+      66.77616882324219,
+      72.43267440795898,
+      71.138916015625,
+      74.68841171264648,
+      73.33436965942383,
+      77.43723678588867,
+      73.8838882446289,
+      72.23414611816406,
+      62.23267364501953,
+      60.20773506164551,
+      53.20280647277832,
+      58.06268310546875,
+      65.1010913848877,
+      68.81110000610352
+    ],
+    "per_sample_ale": [
+      75.36917877197266,
+      71.5978131501571
+    ]
+  }
+}
