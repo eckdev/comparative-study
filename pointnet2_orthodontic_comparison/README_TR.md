@@ -61,6 +61,11 @@ cd pointnet2_orthodontic_comparison
 
 ## GPU Icin Onerilen Ana Kosu
 
+Google Colab Pro icin hazir dosyalar:
+
+- `COLAB_TR.md`
+- `colab_pointnet2_orthodontic_gpu.ipynb`
+
 Colab Pro, CUDA GPU veya baska bir guclu GPU ortaminda asil PointNet++ v2 deneyi:
 
 ```bash
