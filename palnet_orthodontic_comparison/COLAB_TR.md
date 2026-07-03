@@ -78,14 +78,14 @@ python -u run_orthodontic.py \
 
 ## A100 / Yuksek VRAM Buyuk Kosu
 
-Paper'a daha yakin yogun ayar icin:
+Paper'a daha yakin yogun ayar ve residual refiner icin:
 
 ```bash
 python -u run_orthodontic.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
   --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
-  --output-dir /content/drive/MyDrive/orthodontic/palnet_runs/palnet_procrustes_p1000_surface100k_e200 \
+  --output-dir /content/drive/MyDrive/orthodontic/palnet_runs/palnet_refiner_p1000_surface100k_e200 \
   --epochs 200 \
   --patience 40 \
   --batch-size 2 \
@@ -94,18 +94,39 @@ python -u run_orthodontic.py \
   --lr 0.001 \
   --snap-k 1 \
   --model PALNET \
-  --loss combined
+  --loss combined \
+  --template-mode class_gender \
+  --train-refiner \
+  --refine-center stage1 \
+  --residual-target \
+  --landmark-weighting val_error \
+  --center-jitter-mm 2.0 \
+  --point-noise-mm 0.1 \
+  --point-dropout 0.05 \
+  --refiner-snap-k-candidates 1,3,5
 ```
 
 Bellek hatasi alirsan sirasiyla `--batch-size 1`, `--surface-points 50000`, `--patch-size 500` deneyebilirsin.
+
+Tek refiner 2 mm ustunde kalirsa ayni hucreyi `--seed 43`, `--seed 44`, `--seed 45` ve farkli `--output-dir` ile calistirip ensemble al:
+
+```bash
+python -u ensemble_palnet_predictions.py \
+  --predictions /content/drive/MyDrive/orthodontic/palnet_runs/run_seed43/refined_predictions_test.csv /content/drive/MyDrive/orthodontic/palnet_runs/run_seed44/refined_predictions_test.csv /content/drive/MyDrive/orthodontic/palnet_runs/run_seed45/refined_predictions_test.csv \
+  --output-dir /content/drive/MyDrive/orthodontic/palnet_runs/palnet_refiner_ensemble
+```
 
 ## Beklenen Ciktilar
 
 Her run klasorunde:
 
 - `metrics.json`: `palnet_raw`, `palnet_snapped` ve baseline ALE ozetleri.
+- `metrics_refined.json`: residual refiner aciksa ana iyilestirilmis ALE/PCK ozetleri.
 - `history.json`: epoch bazli train/validation loss.
+- `refiner_history.json`: residual refiner train/validation loss ve validation ALE.
 - `predictions_test.csv`: uzman ve PAL-Net tahmin koordinatlari.
+- `stage1_predictions_val.csv`, `stage1_predictions_test.csv`, `refined_predictions_test.csv`: iki asamali tahmin dosyalari.
+- `landmark_weights.json`: zor landmark agirliklari.
 - `group_metrics_test.csv`: class/cinsiyet bazli ALE.
 - `splits.json`: ortak split kaynagini gosteren run-local split kaydi.
 - `best_model.pth`: en iyi validation loss checkpoint.

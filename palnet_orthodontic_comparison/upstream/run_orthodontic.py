@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from src.datasets.orthodontic_dataset import OrthodonticDataset
@@ -189,6 +189,397 @@ def write_group_metrics(path, samples, y_true, y_pred):
             writer.writerow([class_name, gender, len(idxs), summary["ale"], summary["std"], summary["median"]])
 
 
+def subset_samples(dataset, indices):
+    return [dataset.samples[i] for i in indices]
+
+
+def parse_int_list(value):
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    return [int(part.strip()) for part in str(value).split(",") if part.strip()]
+
+
+def compute_template_bank(dataset, train_idx):
+    landmarks = []
+    samples = []
+    for idx in train_idx:
+        _, lm, _ = dataset[idx]
+        landmarks.append(lm.numpy())
+        samples.append(dataset.samples[idx])
+    landmarks = np.asarray(landmarks, dtype=np.float32)
+    bank = {
+        "global": landmarks.mean(axis=0),
+        "class": {},
+        "gender": {},
+        "class_gender": {},
+    }
+    for class_name in sorted({sample.class_name for sample in samples}):
+        selected = [i for i, sample in enumerate(samples) if sample.class_name == class_name]
+        bank["class"][class_name] = landmarks[selected].mean(axis=0)
+    for gender in sorted({sample.gender for sample in samples}):
+        selected = [i for i, sample in enumerate(samples) if sample.gender == gender]
+        bank["gender"][gender] = landmarks[selected].mean(axis=0)
+    for key in sorted({(sample.class_name, sample.gender) for sample in samples}):
+        selected = [i for i, sample in enumerate(samples) if (sample.class_name, sample.gender) == key]
+        bank["class_gender"][f"{key[0]}__{key[1]}"] = landmarks[selected].mean(axis=0)
+    return bank
+
+
+def template_for_sample(bank, sample, mode):
+    if mode == "class_gender":
+        key = f"{sample.class_name}__{sample.gender}"
+        if key in bank["class_gender"]:
+            return bank["class_gender"][key]
+    if mode in ("class_gender", "class") and sample.class_name in bank["class"]:
+        return bank["class"][sample.class_name]
+    if mode in ("class_gender", "gender") and sample.gender in bank["gender"]:
+        return bank["gender"][sample.gender]
+    return bank["global"]
+
+
+def template_centers_for_indices(dataset, indices, bank, mode):
+    return np.asarray([template_for_sample(bank, dataset.samples[i], mode) for i in indices], dtype=np.float32)
+
+
+def snap_centers_to_surface(base_dataset, centers):
+    snapped = []
+    for idx in range(len(base_dataset)):
+        sampled_points, _, raw_vertices = base_dataset[idx]
+        point_cloud = raw_vertices.numpy() if raw_vertices is not None else sampled_points.numpy()
+        tree = cKDTree(point_cloud[:, :3])
+        _, nn_idx = tree.query(centers[idx], k=1)
+        snapped.append(point_cloud[nn_idx, :3])
+    return np.asarray(snapped, dtype=np.float32)
+
+
+def extract_centered_patches(raw_vertices, centers, patch_size, reference_point=(0, 0, 0)):
+    point_cloud = np.asarray(raw_vertices, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32)
+    tree = cKDTree(point_cloud[:, :3])
+    _, indices = tree.query(centers, k=patch_size)
+    if patch_size == 1:
+        indices = indices[:, None]
+    patches = point_cloud[indices].astype(np.float32)
+    reference = np.asarray(reference_point, dtype=np.float32).reshape(1, 1, 3)
+    distances = np.linalg.norm(patches[:, :, :3] - reference, axis=2)
+    sorted_idx = np.argsort(distances, axis=1)
+    return np.take_along_axis(patches, sorted_idx[..., None], axis=1).astype(np.float32)
+
+
+class RefinerPatchDataset(Dataset):
+    def __init__(
+        self,
+        base_ds,
+        centers,
+        patch_size,
+        cache_dir,
+        center_jitter_mm=0.0,
+        point_noise_mm=0.0,
+        point_dropout=0.0,
+        augment=False,
+        return_centers=True,
+    ):
+        self.base_ds = base_ds
+        self.centers = np.asarray(centers, dtype=np.float32)
+        self.patch_size = int(patch_size)
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.center_jitter_mm = float(center_jitter_mm)
+        self.point_noise_mm = float(point_noise_mm)
+        self.point_dropout = float(point_dropout)
+        self.augment = bool(augment)
+        self.return_centers = bool(return_centers)
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        x_sampled, landmarks, raw_vertices = self.base_ds[idx]
+        centers = self.centers[idx].copy()
+        if self.augment and self.center_jitter_mm > 0:
+            centers += np.random.normal(0.0, self.center_jitter_mm, size=centers.shape).astype(np.float32)
+
+        cache_fp = self.cache_dir / f"{idx:06d}_patch.npy"
+        if cache_fp.exists() and not self.augment:
+            patch = np.load(cache_fp)
+        else:
+            patch = extract_centered_patches(raw_vertices.numpy(), centers, self.patch_size)
+            if not self.augment:
+                np.save(cache_fp, patch)
+
+        if self.augment and self.point_dropout > 0:
+            mask = np.random.random(size=patch.shape[:2]) < self.point_dropout
+            if mask.any():
+                replacement = patch[:, :1, :]
+                patch = patch.copy()
+                patch[mask] = np.repeat(replacement, patch.shape[1], axis=1)[mask]
+        if self.augment and self.point_noise_mm > 0:
+            patch = patch + np.random.normal(0.0, self.point_noise_mm, size=patch.shape).astype(np.float32)
+
+        patch_tensor = torch.from_numpy(patch.astype(np.float32))
+        center_tensor = torch.from_numpy(centers.astype(np.float32))
+        if self.return_centers:
+            return patch_tensor, landmarks, x_sampled, center_tensor
+        return patch_tensor, landmarks, x_sampled
+
+
+class WeightedCombinedLoss(torch.nn.Module):
+    def __init__(self, landmark_weights=None, alpha=0.6, beta=0.4):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        if landmark_weights is None:
+            self.register_buffer("landmark_weights", torch.ones(23, dtype=torch.float32))
+        else:
+            self.register_buffer("landmark_weights", torch.as_tensor(landmark_weights, dtype=torch.float32))
+
+    def forward(self, y_true, y_pred):
+        errors = torch.norm(y_pred - y_true, dim=-1)
+        weights = self.landmark_weights.to(errors.device).view(1, -1)
+        loc = (errors * weights).sum() / (weights.sum() * errors.shape[0])
+        dist = torch.abs(torch.cdist(y_true, y_true) - torch.cdist(y_pred, y_pred)).mean()
+        return self.alpha * loc + self.beta * dist
+
+
+def compute_landmark_weights(y_true, y_pred, mode):
+    if mode == "none":
+        weights = np.ones(23, dtype=np.float32)
+    else:
+        per_landmark = localization_errors(y_true, y_pred).mean(axis=0)
+        weights = per_landmark / max(float(per_landmark.mean()), 1e-6)
+        weights = np.clip(weights, 0.75, 2.5).astype(np.float32)
+    return weights
+
+
+def write_landmark_weights(path, weights, mode):
+    payload = {
+        "weighting": mode,
+        "min": float(np.min(weights)),
+        "max": float(np.max(weights)),
+        "weights": [float(w) for w in weights],
+    }
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def collect_refiner_predictions(model, loader, device, residual_target=True, snap_k=1):
+    model.eval()
+    preds = []
+    truths = []
+    point_clouds = []
+    centers_all = []
+    with torch.no_grad():
+        for patches, landmarks, sampled_points, centers in loader:
+            patches = patches.to(device, non_blocking=True)
+            outputs = model(patches).cpu()
+            if residual_target:
+                outputs = outputs + centers
+            preds.append(outputs.numpy())
+            truths.append(landmarks.numpy())
+            point_clouds.append(sampled_points.numpy())
+            centers_all.append(centers.numpy())
+    preds = np.concatenate(preds, axis=0)
+    truths = np.concatenate(truths, axis=0)
+    point_clouds = np.concatenate(point_clouds, axis=0)
+    centers_all = np.concatenate(centers_all, axis=0)
+    snapped = nearest_surface_predictions(point_clouds, preds.copy(), k=snap_k)
+    return preds, snapped, truths, point_clouds, centers_all
+
+
+def maybe_inverse(dataset, indices, normalize, *arrays):
+    if not normalize:
+        return arrays
+    return inverse_normalize_arrays(dataset, indices, *arrays)
+
+
+def train_refiner(
+    args,
+    output_dir,
+    dataset,
+    train_idx,
+    val_idx,
+    test_idx,
+    stage1_centers_train,
+    stage1_centers_val,
+    stage1_centers_test,
+    y_val_internal,
+    stage1_val_internal,
+    device,
+    model_cls,
+    output_shape,
+):
+    train_ds = Subset(dataset, train_idx)
+    val_ds = Subset(dataset, val_idx)
+    test_ds = Subset(dataset, test_idx)
+
+    if args.refine_center == "template":
+        bank = compute_template_bank(dataset, train_idx)
+        stage1_centers_train = snap_centers_to_surface(train_ds, template_centers_for_indices(dataset, train_idx, bank, args.template_mode))
+        stage1_centers_val = snap_centers_to_surface(val_ds, template_centers_for_indices(dataset, val_idx, bank, args.template_mode))
+        stage1_centers_test = snap_centers_to_surface(test_ds, template_centers_for_indices(dataset, test_idx, bank, args.template_mode))
+
+    landmark_weights = compute_landmark_weights(y_val_internal, stage1_val_internal, args.landmark_weighting)
+    write_landmark_weights(output_dir / "landmark_weights.json", landmark_weights, args.landmark_weighting)
+
+    train_refiner_ds = RefinerPatchDataset(
+        train_ds,
+        stage1_centers_train,
+        args.patch_size,
+        output_dir / "refiner_patch_cache_train",
+        center_jitter_mm=args.center_jitter_mm,
+        point_noise_mm=args.point_noise_mm,
+        point_dropout=args.point_dropout,
+        augment=True,
+    )
+    val_refiner_ds = RefinerPatchDataset(
+        val_ds,
+        stage1_centers_val,
+        args.patch_size,
+        output_dir / "refiner_patch_cache_val",
+        augment=False,
+    )
+    test_refiner_ds = RefinerPatchDataset(
+        test_ds,
+        stage1_centers_test,
+        args.patch_size,
+        output_dir / "refiner_patch_cache_test",
+        augment=False,
+    )
+
+    train_loader = DataLoader(train_refiner_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_refiner_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_loader = DataLoader(test_refiner_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    first_patch, _, _, _ = train_refiner_ds[0]
+    refiner = model_cls(first_patch.shape, output_shape, seed=args.seed + 1000).to(device)
+    criterion = WeightedCombinedLoss(landmark_weights, alpha=0.6, beta=0.4)
+    optimizer = torch.optim.Adam(refiner.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
+
+    best_val_ale = float("inf")
+    epochs_no_improve = 0
+    history = []
+    best_path = output_dir / "best_refiner_model.pth"
+
+    for epoch in range(args.epochs):
+        refiner.train()
+        train_loss = 0.0
+        for patches, landmarks, _, centers in train_loader:
+            patches = patches.to(device, non_blocking=True)
+            landmarks = landmarks.to(device, non_blocking=True)
+            centers = centers.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            outputs = refiner(patches)
+            pred_abs = outputs + centers if args.residual_target else outputs
+            loss = criterion(landmarks, pred_abs)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * patches.size(0)
+        train_loss /= len(train_refiner_ds)
+
+        refiner.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for patches, landmarks, _, centers in val_loader:
+                patches = patches.to(device, non_blocking=True)
+                landmarks = landmarks.to(device, non_blocking=True)
+                centers = centers.to(device, non_blocking=True)
+                outputs = refiner(patches)
+                pred_abs = outputs + centers if args.residual_target else outputs
+                val_loss += criterion(landmarks, pred_abs).item() * patches.size(0)
+        val_loss /= len(val_refiner_ds)
+        scheduler.step(val_loss)
+
+        _, val_snapped, y_val, _, _ = collect_refiner_predictions(
+            refiner,
+            val_loader,
+            device,
+            residual_target=args.residual_target,
+            snap_k=1,
+        )
+        val_ale = ale_summary(y_val, val_snapped)["ale"]
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "val_ale_snap1": val_ale})
+        print(f"Refiner epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f} val_ALE={val_ale:.4f}")
+
+        if val_ale < best_val_ale:
+            best_val_ale = val_ale
+            epochs_no_improve = 0
+            torch.save(refiner.state_dict(), best_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(f"Refiner early stopping at epoch {epoch + 1}")
+                break
+
+    (output_dir / "refiner_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    refiner.load_state_dict(torch.load(best_path, map_location=device))
+
+    snap_candidates = parse_int_list(args.refiner_snap_k_candidates)
+    val_raw, _, y_val, val_point_clouds, _ = collect_refiner_predictions(
+        refiner,
+        val_loader,
+        device,
+        residual_target=args.residual_target,
+        snap_k=1,
+    )
+    snap_scores = {}
+    for snap_k in snap_candidates:
+        val_snapped = nearest_surface_predictions(val_point_clouds, val_raw.copy(), k=snap_k)
+        snap_scores[str(snap_k)] = ale_summary(y_val, val_snapped)
+    best_snap_k = min(snap_scores, key=lambda key: snap_scores[key]["ale"])
+    best_snap_k = int(best_snap_k)
+
+    test_raw, test_snapped, y_test, test_point_clouds, _ = collect_refiner_predictions(
+        refiner,
+        test_loader,
+        device,
+        residual_target=args.residual_target,
+        snap_k=best_snap_k,
+    )
+    test_samples = subset_samples(dataset, test_idx)
+    test_raw_out, test_snapped_out, y_test_out, test_point_clouds_out = maybe_inverse(
+        dataset,
+        test_idx,
+        args.normalize,
+        test_raw,
+        test_snapped,
+        y_test,
+        test_point_clouds,
+    )
+    refined_raw = ale_summary(y_test_out, test_raw_out)
+    refined_snapped = ale_summary(y_test_out, test_snapped_out)
+    advanced_analysis = build_error_analysis(test_samples, localization_errors(y_test_out, test_snapped_out))
+    metrics = {
+        "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
+        "unit": "dataset coordinate unit",
+        "clinical_threshold_unit": "mm",
+        "model": args.model,
+        "stage": "palnet_residual_refiner",
+        "n_train": len(train_idx),
+        "n_val": len(val_idx),
+        "n_test": len(test_idx),
+        "template_mode": args.template_mode,
+        "refine_center": args.refine_center,
+        "residual_target": args.residual_target,
+        "landmark_weighting": args.landmark_weighting,
+        "center_jitter_mm": args.center_jitter_mm,
+        "point_noise_mm": args.point_noise_mm,
+        "point_dropout": args.point_dropout,
+        "landmark_weights": [float(w) for w in landmark_weights],
+        "snap_candidates": snap_scores,
+        "best_snap_k": best_snap_k,
+        "best_val_ale": best_val_ale,
+        "palnet_refined_raw": refined_raw,
+        "palnet_refined_snapped": refined_snapped,
+        **advanced_analysis,
+    }
+    (output_dir / "metrics_refined.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    write_prediction_csv(output_dir / "refined_predictions_test.csv", test_samples, y_test_out, test_snapped_out)
+    write_group_metrics(output_dir / "group_metrics_refined_test.csv", test_samples, y_test_out, test_snapped_out)
+    write_analysis_csvs(output_dir, advanced_analysis, suffix="refined_test")
+
+    return metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train PAL-Net on the 23-point orthodontic dataset and report ALE.")
     parser.add_argument("--data-root", default="../../data/dataset", help="Path to Class*/ mesh and landmark folders.")
@@ -208,6 +599,16 @@ def main():
     parser.add_argument("--model", choices=["PALNET", "PLNET_noatt"], default="PALNET")
     parser.add_argument("--loss", choices=["combined", "localization"], default="combined")
     parser.add_argument("--normalize", action="store_true", help="Normalize each face to unit scale before training.")
+    parser.add_argument("--template-mode", choices=["global", "class", "gender", "class_gender"], default="global")
+    parser.add_argument("--stage1-model-path", default=None, help="Optional existing PAL-Net checkpoint for stage 1.")
+    parser.add_argument("--train-refiner", action="store_true", help="Train a residual PAL-Net refiner after stage 1.")
+    parser.add_argument("--refine-center", choices=["stage1", "template"], default="stage1")
+    parser.add_argument("--residual-target", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--landmark-weighting", choices=["none", "val_error"], default="val_error")
+    parser.add_argument("--center-jitter-mm", type=float, default=0.0)
+    parser.add_argument("--point-noise-mm", type=float, default=0.0)
+    parser.add_argument("--point-dropout", type=float, default=0.0)
+    parser.add_argument("--refiner-snap-k-candidates", default="1,3,5")
     parser.add_argument(
         "--transformation-dir",
         default=None,
@@ -253,10 +654,59 @@ def main():
 
     train_mean = mean_landmarks(dataset, train_idx)
     np.save(output_dir / "train_mean_landmarks.npy", train_mean.numpy())
+    template_bank = compute_template_bank(dataset, train_idx)
+    np.savez_compressed(
+        output_dir / "template_bank.npz",
+        global_template=template_bank["global"],
+        class_templates=np.asarray(list(template_bank["class"].values()), dtype=np.float32),
+        class_template_keys=np.asarray(list(template_bank["class"].keys())),
+        gender_templates=np.asarray(list(template_bank["gender"].values()), dtype=np.float32),
+        gender_template_keys=np.asarray(list(template_bank["gender"].keys())),
+        class_gender_templates=np.asarray(list(template_bank["class_gender"].values()), dtype=np.float32),
+        class_gender_template_keys=np.asarray(list(template_bank["class_gender"].keys())),
+    )
 
-    train_patches = PatchDataset(train_ds, train_mean, args.patch_size, output_dir / "patch_cache_train")
-    val_patches = PatchDataset(val_ds, train_mean, args.patch_size, output_dir / "patch_cache_val")
-    test_patches = PatchDataset(test_ds, train_mean, args.patch_size, output_dir / "patch_cache_test")
+    if args.template_mode == "global":
+        train_patches = PatchDataset(train_ds, train_mean, args.patch_size, output_dir / "patch_cache_train")
+        val_patches = PatchDataset(val_ds, train_mean, args.patch_size, output_dir / "patch_cache_val")
+        test_patches = PatchDataset(test_ds, train_mean, args.patch_size, output_dir / "patch_cache_test")
+    else:
+        train_template_centers = snap_centers_to_surface(
+            train_ds,
+            template_centers_for_indices(dataset, train_idx, template_bank, args.template_mode),
+        )
+        val_template_centers = snap_centers_to_surface(
+            val_ds,
+            template_centers_for_indices(dataset, val_idx, template_bank, args.template_mode),
+        )
+        test_template_centers = snap_centers_to_surface(
+            test_ds,
+            template_centers_for_indices(dataset, test_idx, template_bank, args.template_mode),
+        )
+        train_patches = RefinerPatchDataset(
+            train_ds,
+            train_template_centers,
+            args.patch_size,
+            output_dir / "patch_cache_train",
+            augment=False,
+            return_centers=False,
+        )
+        val_patches = RefinerPatchDataset(
+            val_ds,
+            val_template_centers,
+            args.patch_size,
+            output_dir / "patch_cache_val",
+            augment=False,
+            return_centers=False,
+        )
+        test_patches = RefinerPatchDataset(
+            test_ds,
+            test_template_centers,
+            args.patch_size,
+            output_dir / "patch_cache_test",
+            augment=False,
+            return_centers=False,
+        )
 
     print("Pre-caching train/val/test patches...")
     for patch_ds in (train_patches, val_patches, test_patches):
@@ -264,6 +714,7 @@ def main():
             _ = patch_ds[i]
 
     train_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    train_eval_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     val_loader = DataLoader(val_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = DataLoader(test_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -283,51 +734,74 @@ def main():
     best_path = output_dir / "best_model.pth"
     history = []
 
-    for epoch in range(args.epochs):
-        model.train()
-        train_loss = 0.0
-        for patches, landmarks, _ in train_loader:
-            patches = patches.to(device, non_blocking=True)
-            landmarks = landmarks.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            outputs = model(patches)
-            loss = criterion(landmarks, outputs)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * patches.size(0)
-        train_loss /= len(train_patches)
-
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for patches, landmarks, _ in val_loader:
+    if args.stage1_model_path:
+        model.load_state_dict(torch.load(args.stage1_model_path, map_location=device))
+        history.append({"stage": "loaded_stage1", "model_path": str(args.stage1_model_path)})
+        best_val = None
+    else:
+        for epoch in range(args.epochs):
+            model.train()
+            train_loss = 0.0
+            for patches, landmarks, _ in train_loader:
                 patches = patches.to(device, non_blocking=True)
                 landmarks = landmarks.to(device, non_blocking=True)
+                optimizer.zero_grad()
                 outputs = model(patches)
-                val_loss += criterion(landmarks, outputs).item() * patches.size(0)
-        val_loss /= len(val_patches)
-        scheduler.step(val_loss)
+                loss = criterion(landmarks, outputs)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * patches.size(0)
+            train_loss /= len(train_patches)
 
-        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
-        print(f"Epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f}")
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for patches, landmarks, _ in val_loader:
+                    patches = patches.to(device, non_blocking=True)
+                    landmarks = landmarks.to(device, non_blocking=True)
+                    outputs = model(patches)
+                    val_loss += criterion(landmarks, outputs).item() * patches.size(0)
+            val_loss /= len(val_patches)
+            scheduler.step(val_loss)
 
-        if val_loss < best_val:
-            best_val = val_loss
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), best_path)
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
+            history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+            print(f"Epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f}")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                epochs_no_improve = 0
+                torch.save(model.state_dict(), best_path)
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= args.patience:
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
+        model.load_state_dict(torch.load(best_path, map_location=device))
 
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    model.load_state_dict(torch.load(best_path, map_location=device))
 
+    stage1_train_raw, stage1_train_snapped, y_train, train_point_clouds = collect_predictions(
+        model, train_eval_loader, device, args.snap_k
+    )
+    stage1_val_raw, stage1_val_snapped, y_val, val_point_clouds = collect_predictions(
+        model, val_loader, device, args.snap_k
+    )
     raw_pred, snapped_pred, y_test, point_clouds = collect_predictions(model, test_loader, device, args.snap_k)
+    stage1_test_snapped_internal = snapped_pred.copy()
     test_samples = [dataset.samples[i] for i in test_idx]
     baseline_raw_pred = template_baseline(train_mean.numpy(), y_test)
     baseline_snapped_pred = template_baseline(train_mean.numpy(), y_test, point_clouds)
+
+    val_samples = [dataset.samples[i] for i in val_idx]
+    val_raw_out, val_snapped_out, y_val_out = maybe_inverse(
+        dataset,
+        val_idx,
+        args.normalize,
+        stage1_val_raw,
+        stage1_val_snapped,
+        y_val,
+    )
+    write_prediction_csv(output_dir / "stage1_predictions_val.csv", val_samples, y_val_out, val_snapped_out)
 
     if args.normalize:
         raw_pred, snapped_pred, y_test, point_clouds, baseline_raw_pred, baseline_snapped_pred = inverse_normalize_arrays(
@@ -341,6 +815,8 @@ def main():
             baseline_snapped_pred,
         )
 
+    write_prediction_csv(output_dir / "stage1_predictions_test.csv", test_samples, y_test, snapped_pred)
+
     palnet_raw = ale_summary(y_test, raw_pred)
     palnet_snapped = ale_summary(y_test, snapped_pred)
     baseline_raw = ale_summary(y_test, baseline_raw_pred)
@@ -352,6 +828,15 @@ def main():
         "unit": "dataset coordinate unit",
         "clinical_threshold_unit": "mm",
         "model": args.model,
+        "stage1_model_path": args.stage1_model_path,
+        "template_mode": args.template_mode,
+        "train_refiner": args.train_refiner,
+        "refine_center": args.refine_center,
+        "residual_target": args.residual_target,
+        "landmark_weighting": args.landmark_weighting,
+        "center_jitter_mm": args.center_jitter_mm,
+        "point_noise_mm": args.point_noise_mm,
+        "point_dropout": args.point_dropout,
         "n_train": len(train_idx),
         "n_val": len(val_idx),
         "n_test": len(test_idx),
@@ -366,9 +851,30 @@ def main():
     write_group_metrics(output_dir / "group_metrics_test.csv", test_samples, y_test, snapped_pred)
     write_analysis_csvs(output_dir, advanced_analysis, suffix="test")
 
+    refined_metrics = None
+    if args.train_refiner:
+        refined_metrics = train_refiner(
+            args,
+            output_dir,
+            dataset,
+            train_idx,
+            val_idx,
+            test_idx,
+            stage1_train_snapped,
+            stage1_val_snapped,
+            stage1_test_snapped_internal,
+            y_val,
+            stage1_val_snapped,
+            device,
+            model_cls,
+            output_shape,
+        )
+
     print("\nEvaluation against expert orthodontist landmarks")
     print(f"PAL-Net raw ALE:      {palnet_raw['ale']:.4f}")
     print(f"PAL-Net snapped ALE:  {palnet_snapped['ale']:.4f}")
+    if refined_metrics:
+        print(f"PAL-Net refined ALE:  {refined_metrics['palnet_refined_snapped']['ale']:.4f}")
     print(f"Mean-template ALE:    {baseline_snapped['ale']:.4f}")
     print(f"Results saved to:     {output_dir}")
 

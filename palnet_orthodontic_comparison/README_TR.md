@@ -51,6 +51,38 @@ Daha gerçekçi eğitim:
 python run_orthodontic.py --epochs 200 --batch-size 8 --patch-size 250 --surface-points 10000 --splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json
 ```
 
+2 asamali PAL-Net + residual refiner kosusu:
+
+```bash
+python run_orthodontic.py \
+  --data-root ../../data/dataset \
+  --splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json \
+  --transformation-dir ../transforms/orthodontic_procrustes_rigid_20260627_143801 \
+  --output-dir ../runs/palnet_refiner_p1000_surface100k_e200 \
+  --epochs 200 \
+  --patience 40 \
+  --batch-size 2 \
+  --patch-size 1000 \
+  --surface-points 100000 \
+  --template-mode class_gender \
+  --train-refiner \
+  --refine-center stage1 \
+  --residual-target \
+  --landmark-weighting val_error \
+  --center-jitter-mm 2.0 \
+  --point-noise-mm 0.1 \
+  --point-dropout 0.05 \
+  --refiner-snap-k-candidates 1,3,5
+```
+
+Uc seed ensemble icin ayni komutu farkli `--seed` ve `--output-dir` ile calistirdiktan sonra:
+
+```bash
+python ensemble_palnet_predictions.py \
+  --predictions ../runs/run_seed1/refined_predictions_test.csv ../runs/run_seed2/refined_predictions_test.csv ../runs/run_seed3/refined_predictions_test.csv \
+  --output-dir ../runs/palnet_refiner_ensemble
+```
+
 ## Ortak Split
 
 DiffusionNet ve PointNet++ ile adil karsilastirma icin PAL-Net de ayni split dosyasi ile calistirilmalidir:
@@ -77,7 +109,11 @@ palnet_orthodontic_comparison/runs/orthodontic_palnet/
 Önemli dosyalar:
 
 - `metrics.json`: PAL-Net ve uzman doktor karşılaştırması için ALE özeti.
+- `metrics_refined.json`: `--train-refiner` aciksa residual refiner ALE, PCK, class/gender ve zor landmark ozetleri.
 - `predictions_test.csv`: Her test hastası ve her landmark için uzman koordinatı, PAL-Net koordinatı ve lokalizasyon hatası.
+- `stage1_predictions_val.csv`, `stage1_predictions_test.csv`: Refiner oncesi Stage 1 tahminleri.
+- `refined_predictions_test.csv`: Residual refiner sonrasi ana test tahminleri.
+- `landmark_weights.json`: Validation hatasindan turetilen landmark agirliklari.
 - `group_metrics_test.csv`: Class/cinsiyet bazlı ALE.
 - `landmark_metrics_test.csv`: Landmark bazli mean, median, std, max ve PCK degerleri.
 - `clinical_thresholds_test.csv`: PCK@2mm, PCK@2.5mm ve PCK@3mm klinik esik analizi.
