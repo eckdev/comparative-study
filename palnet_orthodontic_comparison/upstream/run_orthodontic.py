@@ -63,6 +63,32 @@ def ids_to_indices(dataset, sample_ids):
     return [index_by_id[sample_id] for sample_id in sample_ids]
 
 
+def limit_split_indices(dataset, indices, max_count, seed):
+    if max_count is None or max_count <= 0 or max_count >= len(indices):
+        return list(indices)
+
+    grouped = {}
+    for idx in indices:
+        sample = dataset.samples[idx]
+        grouped.setdefault((sample.class_name, sample.gender), []).append(idx)
+
+    rng = random.Random(seed)
+    for group_indices in grouped.values():
+        rng.shuffle(group_indices)
+
+    selected = []
+    group_keys = sorted(grouped)
+    cursor = 0
+    while len(selected) < max_count and group_keys:
+        key = group_keys[cursor % len(group_keys)]
+        if grouped[key]:
+            selected.append(grouped[key].pop())
+        group_keys = [group_key for group_key in group_keys if grouped[group_key]]
+        cursor += 1
+
+    return sorted(selected)
+
+
 def mean_landmarks(base_dataset, subset_indices):
     total = torch.zeros(23, 3)
     for idx in subset_indices:
@@ -498,7 +524,11 @@ def train_refiner(
         )
         val_ale = ale_summary(y_val, val_snapped)["ale"]
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "val_ale_snap1": val_ale})
-        print(f"Refiner epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f} val_ALE={val_ale:.4f}")
+        print(
+            f"Refiner epoch {epoch + 1:04d}/{args.epochs} "
+            f"train={train_loss:.4f} val={val_loss:.4f} val_ALE={val_ale:.4f}",
+            flush=True,
+        )
 
         if val_ale < best_val_ale:
             best_val_ale = val_ale
@@ -507,7 +537,7 @@ def train_refiner(
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.patience:
-                print(f"Refiner early stopping at epoch {epoch + 1}")
+                print(f"Refiner early stopping at epoch {epoch + 1}", flush=True)
                 break
 
     (output_dir / "refiner_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
@@ -593,6 +623,9 @@ def main():
     parser.add_argument("--test-size", type=float, default=0.20)
     parser.add_argument("--val-size", type=float, default=0.20)
     parser.add_argument("--splits-json", default=None, help="Shared split JSON with train/val/test sample_id lists.")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="Limit train samples for smoke/debug runs.")
+    parser.add_argument("--max-val-samples", type=int, default=None, help="Limit validation samples for smoke/debug runs.")
+    parser.add_argument("--max-test-samples", type=int, default=None, help="Limit test samples for smoke/debug runs.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--snap-k", type=int, default=1, help="Nearest sampled surface points used to snap PAL-Net output.")
@@ -627,8 +660,8 @@ def main():
         normalize=args.normalize,
         transformation_dir=args.transformation_dir,
     )
-    print(f"Paired samples: {len(dataset)}")
-    print(f"Meshes without matching landmark file: {len(dataset.missing_landmarks)}")
+    print(f"Paired samples: {len(dataset)}", flush=True)
+    print(f"Meshes without matching landmark file: {len(dataset.missing_landmarks)}", flush=True)
 
     source_splits_json = None
     if args.splits_json:
@@ -639,11 +672,30 @@ def main():
         test_idx = ids_to_indices(dataset, split_source["test"])
     else:
         train_idx, val_idx, test_idx = make_splits(dataset, args.test_size, args.val_size, args.seed)
+
+    full_counts = {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)}
+    train_idx = limit_split_indices(dataset, train_idx, args.max_train_samples, args.seed + 101)
+    val_idx = limit_split_indices(dataset, val_idx, args.max_val_samples, args.seed + 202)
+    test_idx = limit_split_indices(dataset, test_idx, args.max_test_samples, args.seed + 303)
+    print(
+        "Using samples: "
+        f"train={len(train_idx)}/{full_counts['train']} "
+        f"val={len(val_idx)}/{full_counts['val']} "
+        f"test={len(test_idx)}/{full_counts['test']}",
+        flush=True,
+    )
+
     split_payload = {
         "train": [dataset.samples[i].sample_id for i in train_idx],
         "val": [dataset.samples[i].sample_id for i in val_idx],
         "test": [dataset.samples[i].sample_id for i in test_idx],
         "source_splits_json": source_splits_json,
+        "source_split_counts": full_counts,
+        "sample_limits": {
+            "max_train_samples": args.max_train_samples,
+            "max_val_samples": args.max_val_samples,
+            "max_test_samples": args.max_test_samples,
+        },
         "missing_landmarks": [str(p) for p in dataset.missing_landmarks],
     }
     (output_dir / "splits.json").write_text(json.dumps(split_payload, indent=2), encoding="utf-8")
@@ -708,10 +760,12 @@ def main():
             return_centers=False,
         )
 
-    print("Pre-caching train/val/test patches...")
-    for patch_ds in (train_patches, val_patches, test_patches):
-        for i in tqdm(range(len(patch_ds)), leave=False):
+    print("Pre-caching train/val/test patches...", flush=True)
+    for split_name, patch_ds in (("train", train_patches), ("val", val_patches), ("test", test_patches)):
+        print(f"  cache {split_name}: {len(patch_ds)} samples", flush=True)
+        for i in tqdm(range(len(patch_ds)), desc=f"cache {split_name}", leave=True, mininterval=1.0, file=sys.stdout):
             _ = patch_ds[i]
+        print(f"  cache {split_name}: done", flush=True)
 
     train_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     train_eval_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -723,6 +777,7 @@ def main():
     output_shape = first_landmark.shape
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}", flush=True)
     model_cls = PALNET if args.model == "PALNET" else PLNET_noatt
     model = model_cls(input_shape, output_shape, seed=args.seed).to(device)
     criterion = CombinedLoss(alpha=0.6, beta=0.4) if args.loss == "combined" else localizationLoss()
@@ -735,6 +790,7 @@ def main():
     history = []
 
     if args.stage1_model_path:
+        print(f"Loading stage 1 model: {args.stage1_model_path}", flush=True)
         model.load_state_dict(torch.load(args.stage1_model_path, map_location=device))
         history.append({"stage": "loaded_stage1", "model_path": str(args.stage1_model_path)})
         best_val = None
@@ -765,7 +821,7 @@ def main():
             scheduler.step(val_loss)
 
             history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
-            print(f"Epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f}")
+            print(f"Epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f}", flush=True)
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -774,12 +830,13 @@ def main():
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= args.patience:
-                    print(f"Early stopping at epoch {epoch + 1}")
+                    print(f"Early stopping at epoch {epoch + 1}", flush=True)
                     break
         model.load_state_dict(torch.load(best_path, map_location=device))
 
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
+    print("Collecting stage 1 predictions...", flush=True)
     stage1_train_raw, stage1_train_snapped, y_train, train_point_clouds = collect_predictions(
         model, train_eval_loader, device, args.snap_k
     )
@@ -870,13 +927,13 @@ def main():
             output_shape,
         )
 
-    print("\nEvaluation against expert orthodontist landmarks")
-    print(f"PAL-Net raw ALE:      {palnet_raw['ale']:.4f}")
-    print(f"PAL-Net snapped ALE:  {palnet_snapped['ale']:.4f}")
+    print("\nEvaluation against expert orthodontist landmarks", flush=True)
+    print(f"PAL-Net raw ALE:      {palnet_raw['ale']:.4f}", flush=True)
+    print(f"PAL-Net snapped ALE:  {palnet_snapped['ale']:.4f}", flush=True)
     if refined_metrics:
-        print(f"PAL-Net refined ALE:  {refined_metrics['palnet_refined_snapped']['ale']:.4f}")
-    print(f"Mean-template ALE:    {baseline_snapped['ale']:.4f}")
-    print(f"Results saved to:     {output_dir}")
+        print(f"PAL-Net refined ALE:  {refined_metrics['palnet_refined_snapped']['ale']:.4f}", flush=True)
+    print(f"Mean-template ALE:    {baseline_snapped['ale']:.4f}", flush=True)
+    print(f"Results saved to:     {output_dir}", flush=True)
 
 
 if __name__ == "__main__":

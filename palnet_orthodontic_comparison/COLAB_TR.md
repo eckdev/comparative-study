@@ -39,21 +39,26 @@ Bu split 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 
 
 ## Smoke Test
 
-Once kodun ve veri yollarinin dogru calistigini gormek icin:
+Once kodun ve veri yollarinin dogru calistigini gormek icin kisa smoke test calistir. Bu kosu sadece pipeline kontroludur; ALE sonucu bilimsel raporlamada kullanilmaz. Loglar `-u` ve script icindeki `flush=True` ciktilariyla Colab ekranina anlik akar.
 
 ```bash
 python -u run_orthodontic.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
   --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
-  --output-dir /content/drive/MyDrive/orthodontic/palnet_runs/palnet_smoke_colab \
-  --epochs 2 \
-  --patience 2 \
-  --batch-size 2 \
+  --output-dir /content/drive/MyDrive/orthodontic/palnet_runs/palnet_smoke_fast_colab \
+  --epochs 1 \
+  --patience 1 \
+  --batch-size 8 \
   --patch-size 100 \
-  --surface-points 5000 \
-  --snap-k 1
+  --surface-points 1024 \
+  --snap-k 1 \
+  --max-train-samples 12 \
+  --max-val-samples 6 \
+  --max-test-samples 6
 ```
+
+Smoke testte ekranda sirasiyla `Paired samples`, `Using samples`, `cache train/val/test`, `Device` ve `Epoch` loglarini gormen gerekir. Colab hucre ciktisi yine gecikirse notebook'taki komut hucrelerinde `PYTHONUNBUFFERED=1` ortami zaten ayarlanmistir.
 
 ## Colab Pro Pratik Kosu
 
