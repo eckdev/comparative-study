@@ -34,6 +34,7 @@ Colab Pro GPU icin mevcut PointNet++ v2 protokolunu kullan:
 ```bash
 python run_orthodontic_pointnet2.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir /content/drive/MyDrive/orthodontic/pointnet2_runs/pointnet2_v2_gaussian_normals_p4096_e200 \
   --surface-points 4096 \
@@ -73,6 +74,7 @@ A100 veya yuksek VRAM varsa:
 ```bash
 python run_orthodontic_pointnet2.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir /content/drive/MyDrive/orthodontic/pointnet2_runs/pointnet2_v2_gaussian_normals_p8192_e220 \
   --surface-points 8192 \
@@ -106,6 +108,7 @@ Egitim bittikten sonra farkli postprocess ayarlari ayni checkpoint uzerinde dene
 ```bash
 python run_orthodontic_pointnet2.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir /content/drive/MyDrive/orthodontic/pointnet2_runs/pointnet2_eval_topk20_t1 \
   --surface-points 4096 \
@@ -148,3 +151,7 @@ Median: 3.3463
 ```
 
 Colab Pro kosusu, modeli degistirmeden daha yogun nokta sayisi ve daha uzun egitim ile PointNet++ icin nihai karsilastirma sonucunu uretmek amaciyla kullanilmalidir.
+
+## Ortak Split
+
+Notebook ve komutlar repo icindeki `shared_splits/orthodontic_180_60_60_seed42.json` dosyasini kullanir. Bu dosya 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 60 test hastasina ayirir; PAL-Net ve DiffusionNet ayni listeyle calistirilmalidir.

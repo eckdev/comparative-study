@@ -7,6 +7,8 @@ Bu klasör, `data/dataset` altındaki sınıflandırılmış 3B hasta yüz meshl
 - `upstream/`: GitHub'dan indirilen PAL-Net kodu.
 - `upstream/src/datasets/orthodontic_dataset.py`: Bu veri setinin `Class*/men|women/*.ply` ve `Class*-Landmark/*.txt` düzenini PAL-Net formatına çeviren dataset adapter'ı.
 - `upstream/run_orthodontic.py`: Eğitim, doğrulama, test ve ALE raporlama script'i.
+- `colab_palnet_orthodontic_gpu.ipynb`: Google Colab GPU uzerinde calistirilacak notebook.
+- `COLAB_TR.md`: Colab Drive yapisi ve kosu presetleri.
 - `runs/`: Çalıştırmaların model, metrik ve tahmin çıktıları buraya yazılır.
 
 ## Metrik
@@ -40,14 +42,29 @@ Hızlı bir deneme:
 ```bash
 cd palnet_orthodontic_comparison/upstream
 source ../.venv/bin/activate
-python run_orthodontic.py --epochs 3 --batch-size 4 --patch-size 250 --surface-points 5000
+python run_orthodontic.py --epochs 3 --batch-size 4 --patch-size 250 --surface-points 5000 --splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json
 ```
 
 Daha gerçekçi eğitim:
 
 ```bash
-python run_orthodontic.py --epochs 200 --batch-size 8 --patch-size 250 --surface-points 10000
+python run_orthodontic.py --epochs 200 --batch-size 8 --patch-size 250 --surface-points 10000 --splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json
 ```
+
+## Ortak Split
+
+DiffusionNet ve PointNet++ ile adil karsilastirma icin PAL-Net de ayni split dosyasi ile calistirilmalidir:
+
+```bash
+--splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json
+```
+
+## Google Colab GPU
+
+Colab icin hazir dosyalar:
+
+- `colab_palnet_orthodontic_gpu.ipynb`
+- `COLAB_TR.md`
 
 ## Çıktılar
 

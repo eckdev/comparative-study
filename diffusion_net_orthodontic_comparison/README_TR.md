@@ -28,6 +28,7 @@ ALE, normalize edilmiş model koordinatlarında değil, Procrustes hizalanmış 
 cd diffusion_net_orthodontic_comparison
 ../palnet_orthodontic_comparison/.venv/bin/python run_orthodontic_diffusion.py \
   --data-root ../data/dataset \
+  --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir runs/diffusionnet_orthodontic_maskseg_xyz_p2048_k48_w64_b4_e60 \
   --surface-points 2048 \
@@ -53,6 +54,14 @@ Colab için hazır notebook:
 Ayrıntılı kullanım:
 
 - `COLAB_TR.md`
+
+## Ortak Split
+
+PAL-Net, DiffusionNet ve PointNet++ karsilastirmasinda ayni 180 egitim, 60 validasyon ve 60 test dosyasini kullanmak icin:
+
+```bash
+--splits-json ../shared_splits/orthodontic_180_60_60_seed42.json
+```
 
 ## Çıktılar
 

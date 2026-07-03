@@ -47,6 +47,14 @@ def make_splits(dataset, test_size, val_size, seed):
     return train_idx.tolist(), val_idx.tolist(), test_idx.tolist()
 
 
+def ids_to_indices(dataset, sample_ids):
+    index_by_id = {sample.sample_id: idx for idx, sample in enumerate(dataset.samples)}
+    missing = [sample_id for sample_id in sample_ids if sample_id not in index_by_id]
+    if missing:
+        raise ValueError(f"Split file references samples not found in dataset: {missing[:10]}")
+    return [index_by_id[sample_id] for sample_id in sample_ids]
+
+
 def mean_landmarks(base_dataset, subset_indices):
     total = torch.zeros(23, 3)
     for idx in subset_indices:
@@ -180,6 +188,7 @@ def main():
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--test-size", type=float, default=0.20)
     parser.add_argument("--val-size", type=float, default=0.20)
+    parser.add_argument("--splits-json", default=None, help="Shared split JSON with train/val/test sample_id lists.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--snap-k", type=int, default=1, help="Nearest sampled surface points used to snap PAL-Net output.")
@@ -207,11 +216,20 @@ def main():
     print(f"Paired samples: {len(dataset)}")
     print(f"Meshes without matching landmark file: {len(dataset.missing_landmarks)}")
 
-    train_idx, val_idx, test_idx = make_splits(dataset, args.test_size, args.val_size, args.seed)
+    source_splits_json = None
+    if args.splits_json:
+        source_splits_json = str(Path(args.splits_json))
+        split_source = json.loads(Path(args.splits_json).read_text(encoding="utf-8"))
+        train_idx = ids_to_indices(dataset, split_source["train"])
+        val_idx = ids_to_indices(dataset, split_source["val"])
+        test_idx = ids_to_indices(dataset, split_source["test"])
+    else:
+        train_idx, val_idx, test_idx = make_splits(dataset, args.test_size, args.val_size, args.seed)
     split_payload = {
         "train": [dataset.samples[i].sample_id for i in train_idx],
         "val": [dataset.samples[i].sample_id for i in val_idx],
         "test": [dataset.samples[i].sample_id for i in test_idx],
+        "source_splits_json": source_splits_json,
         "missing_landmarks": [str(p) for p in dataset.missing_landmarks],
     }
     (output_dir / "splits.json").write_text(json.dumps(split_payload, indent=2), encoding="utf-8")

@@ -34,6 +34,7 @@ Notebook icindeki `Pratik GPU kosusu` hucreleri standart Colab T4/L4 icin daha u
 ```bash
 python run_orthodontic_diffusion.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir /content/drive/MyDrive/orthodontic/diffusion_runs/diffusionnet_maskseg_xyz_p4096_k64_w128_b6_e120 \
   --surface-points 4096 \
@@ -51,6 +52,10 @@ python run_orthodontic_diffusion.py \
 ```
 
 Paper'a daha yakin tam ayar icin `use_mesh_vertices`, `width=384`, `blocks=12`, `mlp_hidden_dims=768`, `epochs=200` kullanilir. Bu ayar 24 GB ve ustu GPU bellegi icin daha uygundur.
+
+## Ortak Split
+
+Notebook ve komutlar `SPLITS_JSON = /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json` dosyasini kullanir. Bu dosya PAL-Net, DiffusionNet ve PointNet++ icin ayni 180/60/60 hasta listesini sabitler.
 
 ## Beklenen fark
 

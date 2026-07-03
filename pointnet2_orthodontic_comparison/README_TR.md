@@ -41,6 +41,7 @@ cd pointnet2_orthodontic_comparison
 
 ../palnet_orthodontic_comparison/.venv/bin/python run_orthodontic_pointnet2.py \
   --data-root ../data/dataset \
+  --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir runs/pointnet2_v2_smoke \
   --surface-points 512 \
@@ -73,6 +74,7 @@ cd pointnet2_orthodontic_comparison
 
 ../palnet_orthodontic_comparison/.venv/bin/python run_orthodontic_pointnet2.py \
   --data-root ../data/dataset \
+  --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir runs/pointnet2_v2_gaussian_normals_p4096_e200 \
   --surface-points 4096 \
@@ -108,6 +110,7 @@ Egitilmis checkpoint uzerinde yeniden egitmeden farkli test nokta sayisi veya po
 ```bash
 ../palnet_orthodontic_comparison/.venv/bin/python run_orthodontic_pointnet2.py \
   --data-root ../data/dataset \
+  --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --output-dir runs/pointnet2_v2_gaussian_normals_p4096_e200 \
   --surface-points 4096 \
@@ -181,3 +184,7 @@ Bu nedenle bu checkpoint icin en iyi pratik ayar `surface_points=1024`, `topk=10
 - `group_metrics_test.csv`: class/cinsiyet bazli ALE.
 - `history.json`: epoch bazli train/validation ve learning rate.
 - `best_model.pth`: en iyi validation ALE checkpoint.
+
+## Ortak Split
+
+Uc modelin adil karsilastirilmasi icin repo kokundeki `shared_splits/orthodontic_180_60_60_seed42.json` dosyasi kullanilir. Bu dosya 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 60 test hasta dosyasina ayirir.
