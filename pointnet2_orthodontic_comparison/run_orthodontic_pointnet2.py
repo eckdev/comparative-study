@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,13 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 import trimesh
 from trimesh.transformations import transform_points
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "shared_metrics" / "orthodontic_analysis.py").exists():
+        sys.path.append(str(parent))
+        break
+
+from shared_metrics.orthodontic_analysis import build_error_analysis, write_analysis_csvs
 
 
 LANDMARK_RE = re.compile(
@@ -110,7 +118,7 @@ def normalize_vectors(vectors):
 
 def summarize_errors(errors):
     errors = np.asarray(errors, dtype=np.float64)
-    return {
+    summary = {
         "ale": float(errors.mean()),
         "std": float(errors.std()),
         "median": float(np.median(errors)),
@@ -118,6 +126,19 @@ def summarize_errors(errors):
         "per_landmark_ale": errors.reshape((-1, 23)).mean(axis=0).astype(float).tolist(),
         "per_sample_ale": errors.reshape((-1, 23)).mean(axis=1).astype(float).tolist(),
     }
+    for threshold in (2.0, 2.5, 3.0):
+        key = ("%g" % threshold).replace(".", "_")
+        summary[f"pck_at_{key}mm"] = float((errors <= threshold).mean())
+    return summary
+
+
+def analysis_from_eval_rows(dataset, eval_rows):
+    samples = []
+    error_rows = []
+    for sample_idx, _, _, errors in eval_rows:
+        samples.append(dataset.metadata(sample_idx))
+        error_rows.append(np.asarray(errors, dtype=np.float64))
+    return build_error_analysis(samples, np.stack(error_rows, axis=0))
 
 
 class OrthodonticPointCloudDataset(Dataset):
@@ -784,6 +805,7 @@ def main():
         metrics = {
             "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
             "unit": "dataset coordinate unit after optional transformation",
+            "clinical_threshold_unit": "mm",
             "model": "PointNet++ set abstraction / feature propagation landmark mask segmentation",
             "n_train": len(train_idx),
             "n_val": len(val_idx),
@@ -810,9 +832,12 @@ def main():
             "test_loss": test_loss,
             "pointnet2": summarize_errors(test_errors),
         }
+        advanced_analysis = analysis_from_eval_rows(eval_dataset, test_rows)
+        metrics.update(advanced_analysis)
         (output_dir / "metrics_eval.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         write_predictions(output_dir / "predictions_eval_test.csv", eval_dataset, test_rows)
         write_group_metrics(output_dir / "group_metrics_eval_test.csv", eval_dataset, test_rows)
+        write_analysis_csvs(output_dir, advanced_analysis, suffix="eval_test")
         print("\nEvaluation against expert orthodontist landmarks")
         print(f"PointNet++ ALE: {metrics['pointnet2']['ale']:.4f}")
         print(f"PointNet++ median: {metrics['pointnet2']['median']:.4f}")
@@ -903,6 +928,7 @@ def main():
     metrics = {
         "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
         "unit": "dataset coordinate unit after optional transformation",
+        "clinical_threshold_unit": "mm",
         "model": "PointNet++ set abstraction / feature propagation landmark mask segmentation",
         "n_train": len(train_idx),
         "n_val": len(val_idx),
@@ -930,9 +956,12 @@ def main():
         "test_loss": test_loss,
         "pointnet2": summarize_errors(test_errors),
     }
+    advanced_analysis = analysis_from_eval_rows(eval_dataset, test_rows)
+    metrics.update(advanced_analysis)
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     write_predictions(output_dir / "predictions_test.csv", eval_dataset, test_rows)
     write_group_metrics(output_dir / "group_metrics_test.csv", eval_dataset, test_rows)
+    write_analysis_csvs(output_dir, advanced_analysis, suffix="test")
 
     print("\nEvaluation against expert orthodontist landmarks")
     print(f"PointNet++ ALE: {metrics['pointnet2']['ale']:.4f}")

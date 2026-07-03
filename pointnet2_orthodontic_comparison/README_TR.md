@@ -182,6 +182,11 @@ Bu nedenle bu checkpoint icin en iyi pratik ayar `surface_points=1024`, `topk=10
 - `metrics.json`: ALE, median, landmark bazli hata ve egitim ayarlari.
 - `predictions_test.csv`: uzman ve PointNet++ tahmin koordinatlari.
 - `group_metrics_test.csv`: class/cinsiyet bazli ALE.
+- `landmark_metrics_test.csv`: Landmark bazli mean, median, std, max ve PCK degerleri.
+- `clinical_thresholds_test.csv`: PCK@2mm, PCK@2.5mm ve PCK@3mm klinik esik analizi.
+- `class_metrics_test.csv`: Class I / II / III bazli performans.
+- `gender_metrics_test.csv`: Female / male bazli performans.
+- `difficult_landmarks_test.csv`: En zor landmark siralamasi.
 - `history.json`: epoch bazli train/validation ve learning rate.
 - `best_model.pth`: en iyi validation ALE checkpoint.
 

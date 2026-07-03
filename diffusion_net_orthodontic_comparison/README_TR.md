@@ -68,5 +68,10 @@ PAL-Net, DiffusionNet ve PointNet++ karsilastirmasinda ayni 180 egitim, 60 valid
 - `metrics.json`: PAL-Net raporlarıyla aynı ana metrik ailesinde ALE özeti.
 - `predictions_test.csv`: Test örneği, landmark, uzman koordinatı, DiffusionNet tahmini ve lokalizasyon hatası.
 - `group_metrics_test.csv`: Class/cinsiyet bazlı ALE.
+- `landmark_metrics_test.csv`: Landmark bazli mean, median, std, max ve PCK degerleri.
+- `clinical_thresholds_test.csv`: PCK@2mm, PCK@2.5mm ve PCK@3mm klinik esik analizi.
+- `class_metrics_test.csv`: Class I / II / III bazli performans.
+- `gender_metrics_test.csv`: Female / male bazli performans.
+- `difficult_landmarks_test.csv`: En zor landmark siralamasi.
 - `splits.json`: Train/validation/test ayrımı.
 - `best_model.pth`: En düşük validation kaybına sahip model.

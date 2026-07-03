@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,13 @@ from src.datasets.orthodontic_dataset import OrthodonticDataset
 from src.datasets.patch_dataset import PatchDataset
 from src.models.loss import CombinedLoss, localizationLoss
 from src.models.model import PALNET, PLNET_noatt
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "shared_metrics" / "orthodontic_analysis.py").exists():
+        sys.path.append(str(parent))
+        break
+
+from shared_metrics.orthodontic_analysis import build_error_analysis, write_analysis_csvs
 
 
 def set_seed(seed):
@@ -81,13 +89,18 @@ def localization_errors(y_true, y_pred):
 
 def ale_summary(y_true, y_pred):
     errors = localization_errors(y_true, y_pred)
-    return {
+    summary = {
         "ale": float(errors.mean()),
         "std": float(errors.std()),
         "median": float(np.median(errors)),
+        "max": float(errors.max()),
         "per_landmark_ale": errors.mean(axis=0).tolist(),
         "per_sample_ale": errors.mean(axis=1).tolist(),
     }
+    for threshold in (2.0, 2.5, 3.0):
+        key = ("%g" % threshold).replace(".", "_")
+        summary[f"pck_at_{key}mm"] = float((errors <= threshold).mean())
+    return summary
 
 
 def template_baseline(train_mean, y_true, point_clouds=None):
@@ -332,10 +345,12 @@ def main():
     palnet_snapped = ale_summary(y_test, snapped_pred)
     baseline_raw = ale_summary(y_test, baseline_raw_pred)
     baseline_snapped = ale_summary(y_test, baseline_snapped_pred)
+    advanced_analysis = build_error_analysis(test_samples, localization_errors(y_test, snapped_pred))
 
     metrics = {
         "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
         "unit": "dataset coordinate unit",
+        "clinical_threshold_unit": "mm",
         "model": args.model,
         "n_train": len(train_idx),
         "n_val": len(val_idx),
@@ -344,10 +359,12 @@ def main():
         "palnet_snapped": palnet_snapped,
         "mean_shape_baseline_raw": baseline_raw,
         "mean_shape_baseline_snapped": baseline_snapped,
+        **advanced_analysis,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     write_prediction_csv(output_dir / "predictions_test.csv", test_samples, y_test, snapped_pred)
     write_group_metrics(output_dir / "group_metrics_test.csv", test_samples, y_test, snapped_pred)
+    write_analysis_csvs(output_dir, advanced_analysis, suffix="test")
 
     print("\nEvaluation against expert orthodontist landmarks")
     print(f"PAL-Net raw ALE:      {palnet_raw['ale']:.4f}")

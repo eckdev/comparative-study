@@ -79,5 +79,10 @@ palnet_orthodontic_comparison/runs/orthodontic_palnet/
 - `metrics.json`: PAL-Net ve uzman doktor karşılaştırması için ALE özeti.
 - `predictions_test.csv`: Her test hastası ve her landmark için uzman koordinatı, PAL-Net koordinatı ve lokalizasyon hatası.
 - `group_metrics_test.csv`: Class/cinsiyet bazlı ALE.
+- `landmark_metrics_test.csv`: Landmark bazli mean, median, std, max ve PCK degerleri.
+- `clinical_thresholds_test.csv`: PCK@2mm, PCK@2.5mm ve PCK@3mm klinik esik analizi.
+- `class_metrics_test.csv`: Class I / II / III bazli performans.
+- `gender_metrics_test.csv`: Female / male bazli performans.
+- `difficult_landmarks_test.csv`: En zor landmark siralamasi.
 - `splits.json`: Train/validation/test ayrımı ve landmark dosyası eksik olan meshler.
 - `best_model.pth`: En iyi validation kaybına sahip PAL-Net ağırlıkları.

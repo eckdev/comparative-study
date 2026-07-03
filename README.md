@@ -23,6 +23,24 @@ Adil karsilastirma icin tum modeller ayni dosya listeleriyle calistirilmalidir:
 
 Bu split 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 60 test hastasina ayirir.
 
+## Ek Analiz Ciktilari
+
+Egitim veya evaluate-only calismalari su ek analizleri de uretir:
+
+- Landmark bazli mean/median/std/max hata ve PCK.
+- Klinik esik analizi: PCK@2mm, PCK@2.5mm, PCK@3mm.
+- Class I / II / III performansi.
+- Female / male performansi.
+- Zor landmark siralamasi.
+
+Eski run klasorlerine yeniden egitim yapmadan analiz eklemek icin:
+
+```bash
+python -m shared_metrics.add_analysis_from_predictions \
+  --predictions path/to/predictions_test.csv \
+  --suffix test
+```
+
 ## Disarida Birakilanlar
 
 - `data/`: Hasta meshleri ve landmark dosyalari.
