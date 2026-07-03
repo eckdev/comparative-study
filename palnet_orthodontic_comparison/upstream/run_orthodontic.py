@@ -445,11 +445,13 @@ def train_refiner(
 
     landmark_weights = compute_landmark_weights(y_val_internal, stage1_val_internal, args.landmark_weighting)
     write_landmark_weights(output_dir / "landmark_weights.json", landmark_weights, args.landmark_weighting)
+    refiner_patch_size = args.refiner_patch_size or args.patch_size
+    print(f"Refiner patch size: {refiner_patch_size}", flush=True)
 
     train_refiner_ds = RefinerPatchDataset(
         train_ds,
         stage1_centers_train,
-        args.patch_size,
+        refiner_patch_size,
         output_dir / "refiner_patch_cache_train",
         center_jitter_mm=args.center_jitter_mm,
         point_noise_mm=args.point_noise_mm,
@@ -459,14 +461,14 @@ def train_refiner(
     val_refiner_ds = RefinerPatchDataset(
         val_ds,
         stage1_centers_val,
-        args.patch_size,
+        refiner_patch_size,
         output_dir / "refiner_patch_cache_val",
         augment=False,
     )
     test_refiner_ds = RefinerPatchDataset(
         test_ds,
         stage1_centers_test,
-        args.patch_size,
+        refiner_patch_size,
         output_dir / "refiner_patch_cache_test",
         augment=False,
     )
@@ -594,6 +596,8 @@ def train_refiner(
         "center_jitter_mm": args.center_jitter_mm,
         "point_noise_mm": args.point_noise_mm,
         "point_dropout": args.point_dropout,
+        "stage1_patch_size": args.patch_size,
+        "refiner_patch_size": refiner_patch_size,
         "landmark_weights": [float(w) for w in landmark_weights],
         "snap_candidates": snap_scores,
         "best_snap_k": best_snap_k,
@@ -617,6 +621,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--patch-size", type=int, default=250)
+    parser.add_argument(
+        "--refiner-patch-size",
+        type=int,
+        default=None,
+        help="Patch size for Stage 2 residual refiner. Defaults to --patch-size.",
+    )
     parser.add_argument("--surface-points", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=30)

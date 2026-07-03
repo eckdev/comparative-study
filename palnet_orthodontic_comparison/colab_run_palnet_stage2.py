@@ -36,7 +36,9 @@ def build_command(args):
         "--batch-size",
         str(args.batch_size),
         "--patch-size",
-        str(args.patch_size),
+        str(args.stage1_patch_size),
+        "--refiner-patch-size",
+        str(args.refiner_patch_size),
         "--surface-points",
         str(args.surface_points),
         "--lr",
@@ -108,7 +110,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=160)
     parser.add_argument("--patience", type=int, default=35)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--patch-size", type=int, default=500)
+    parser.add_argument("--stage1-patch-size", type=int, default=1000)
+    parser.add_argument("--refiner-patch-size", type=int, default=500)
     parser.add_argument("--surface-points", type=int, default=100000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--snap-k", type=int, default=1)

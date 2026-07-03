@@ -95,6 +95,7 @@ python -u run_orthodontic.py \
   --patience 40 \
   --batch-size 2 \
   --patch-size 1000 \
+  --refiner-patch-size 500 \
   --surface-points 100000 \
   --lr 0.001 \
   --snap-k 1 \
@@ -111,7 +112,9 @@ python -u run_orthodontic.py \
   --refiner-snap-k-candidates 1,3,5
 ```
 
-Bellek hatasi alirsan sirasiyla `--batch-size 1`, `--surface-points 50000`, `--patch-size 500` deneyebilirsin.
+`--patch-size` Stage 1 PAL-Net mimarisidir; var olan `p1000` checkpoint yuklenecekse 1000 kalmalidir. Stage 2 lokal refiner boyutu icin `--refiner-patch-size` kullanilir.
+
+Bellek hatasi alirsan sirasiyla `--batch-size 1`, `--surface-points 50000`, `--refiner-patch-size 500` deneyebilirsin.
 
 Tek refiner 2 mm ustunde kalirsa ayni hucreyi `--seed 43`, `--seed 44`, `--seed 45` ve farkli `--output-dir` ile calistirip ensemble al:
 
