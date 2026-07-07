@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,28 @@ from trimesh.transformations import transform_points
 
 ROOT = Path(__file__).resolve().parent
 DIFFUSION_SRC = ROOT / "upstream" / "src"
+if not (DIFFUSION_SRC / "diffusion_net").exists():
+    fallback_root = Path(os.environ.get("DIFFUSION_NET_UPSTREAM", "/tmp/diffusion-net-upstream"))
+    fallback_src = fallback_root / "src"
+    if not (fallback_src / "diffusion_net").exists():
+        if fallback_root.exists() and any(fallback_root.iterdir()):
+            raise ModuleNotFoundError(
+                "diffusion_net paketi bulunamadi. "
+                f"Beklenen yer: {DIFFUSION_SRC / 'diffusion_net'}. "
+                f"Fallback klasoru dolu ama eksik: {fallback_root}. "
+                "Colab'da /tmp/diffusion-net-upstream klasorunu silip tekrar deneyin veya "
+                "git clone https://github.com/nmwsharp/diffusion-net.git diffusion_net_orthodontic_comparison/upstream komutunu calistirin."
+            )
+        print(
+            "diffusion_net paketi repo icinde bulunamadi; "
+            f"DiffusionNet upstream /tmp altina klonlaniyor: {fallback_root}",
+            flush=True,
+        )
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/nmwsharp/diffusion-net.git", str(fallback_root)],
+            check=True,
+        )
+    DIFFUSION_SRC = fallback_src
 sys.path.append(str(DIFFUSION_SRC))
 import diffusion_net  # noqa: E402
 
