@@ -62,5 +62,6 @@ python -u colab_run_aghformer_shared_metrics.py \
 - Logların akması için `python -u` kullanılmalıdır.
 - İlk epoch yavaş olabilir; mesh örnekleme ve lokal geometri cache dosyaları oluşturulur.
 - `best_model.pth` güncelleniyorsa validasyon ALE bakımından daha iyi bir checkpoint bulunmuştur.
-- Nihai karşılaştırmada `metrics.json` içindeki `aghformer_snapped.ale` ana değer olarak kullanılmalıdır.
+- Nihai karşılaştırmada `metrics.json` içindeki `aghformer_snapped.ale` ana değer olarak kullanılmalıdır; direct residual modelin örnekleme bağımsız kontrolü için `aghformer_raw.ale` de raporlanmalıdır.
 - Çıktılar varsayılan olarak `/content/drive/MyDrive/orthodontic/diffusion_runs` altına yazılır.
+- Güncel iyileştirilmiş preset çıktıları `aghformer_v2_template_*` adıyla yazılır; önceki 8-9 mm koşuları ezilmez.

@@ -10,11 +10,12 @@ AGH-Former, PAL-Net, DiffusionNet ve PointNet++ modellerinden farklı olarak lan
 - Özellikler: `XYZ`, yüzey normali, lokal yoğunluk ve lokal eğrilik proxy değeri.
 - Global encoder: yüzey noktalarından nokta bazlı morfolojik temsil çıkarır.
 - Landmark tokenları: 23 anatomik landmark için öğrenilebilir token kullanır.
+- Template prior: yalnızca train split landmarklarından hesaplanan class-gender anatomik template kullanılır.
 - Cross-attention: landmark tokenları tüm yüzeyden bilgi toplar.
 - Anatomik graph bias: landmark tokenları arasında bölge, simetri ve orta hat ilişkilerini temsil eder.
 - Heatmap hedefi: her landmark için Gaussian yüzey aktivasyonu.
-- Koordinat hedefi: heatmap ağırlıklı koordinat + residual düzeltme.
-- Kayıp: heatmap, koordinat, anatomik mesafe, simetri, klinik eşik ve belirsizlik bileşenleri.
+- Koordinat hedefi: train-template + modelin öğrendiği residual düzeltme.
+- Kayıp: pozitif ağırlıklı heatmap, koordinat, anatomik mesafe, simetri, klinik eşik ve belirsizlik bileşenleri.
 
 Ana değerlendirme metriği:
 
@@ -30,7 +31,7 @@ python run_orthodontic_aghformer.py \
   --data-root ../data/dataset \
   --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
-  --output-dir runs/aghformer_smoke \
+  --output-dir runs/aghformer_v2_template_smoke \
   --surface-points 512 \
   --epochs 2 \
   --patience 2 \
@@ -38,6 +39,12 @@ python run_orthodontic_aghformer.py \
   --width 64 \
   --blocks 1 \
   --heads 4 \
+  --template-mode class_gender \
+  --prediction-mode direct \
+  --selection-metric raw \
+  --coord-weight 1.0 \
+  --heatmap-positive-weight 20 \
+  --heatmap-ce-weight 0.05 \
   --topk 10 \
   --device auto
 ```
@@ -50,7 +57,7 @@ python -u run_orthodontic_aghformer.py \
   --data-root ../data/dataset \
   --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
-  --output-dir runs/aghformer_p12000_w192_b4_e220 \
+  --output-dir runs/aghformer_v2_template_p12000_w192_b4_e220 \
   --surface-points 12000 \
   --eval-surface-points 12000 \
   --epochs 220 \
@@ -64,13 +71,20 @@ python -u run_orthodontic_aghformer.py \
   --mlp-ratio 2.0 \
   --heatmap-sigma-start 5.0 \
   --heatmap-sigma-end 2.5 \
-  --coord-weight 0.45 \
+  --heatmap-loss weighted_mse \
+  --heatmap-positive-weight 20 \
+  --heatmap-ce-weight 0.05 \
+  --template-mode class_gender \
+  --prediction-mode direct \
+  --selection-metric raw \
+  --residual-scale 0.18 \
+  --coord-weight 1.0 \
   --structure-weight 0.08 \
   --symmetry-weight 0.02 \
   --clinical-weight 0.05 \
   --uncertainty-weight 0.02 \
-  --rotation-aug-deg 4.0 \
-  --point-jitter-std 0.003 \
+  --rotation-aug-deg 2.0 \
+  --point-jitter-std 0.001 \
   --feature-dropout 0.05 \
   --topk 30 \
   --temperature 1.0 \
@@ -86,13 +100,16 @@ python -u run_orthodontic_aghformer.py \
   --data-root ../data/dataset \
   --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
-  --output-dir runs/aghformer_p12000_w192_b4_e220 \
+  --output-dir runs/aghformer_v2_template_p12000_w192_b4_e220 \
   --surface-points 12000 \
   --width 192 \
   --blocks 4 \
   --heads 6 \
   --evaluate-only \
-  --model-path runs/aghformer_p12000_w192_b4_e220/best_model.pth \
+  --model-path runs/aghformer_v2_template_p12000_w192_b4_e220/best_model.pth \
+  --template-mode class_gender \
+  --prediction-mode direct \
+  --selection-metric raw \
   --topk 30 \
   --device auto
 ```
@@ -101,6 +118,7 @@ python -u run_orthodontic_aghformer.py \
 
 - `metrics.json`: ana ALE, median, PCK ve gelişmiş analizler.
 - `predictions_test.csv`: uzman ve AGH-Former koordinatları.
+- `template_landmarks.json`: yalnızca train split üzerinden hesaplanan template prior.
 - `landmark_metrics_test.csv`: landmark bazlı mean, median, std, max ve PCK.
 - `clinical_thresholds_test.csv`: PCK@2mm, PCK@2.5mm, PCK@3mm.
 - `class_metrics_test.csv`: Class I / II / III performansı.

@@ -165,6 +165,8 @@ class AGHFormerDataset(Dataset):
         self.local_geometry_k = int(local_geometry_k)
         self.transformation_dir = Path(transformation_dir) if transformation_dir else None
         self.seed = int(seed)
+        self.template_mode = "class_gender"
+        self.template_landmarks = {}
 
     def __len__(self):
         return len(self.samples)
@@ -177,6 +179,41 @@ class AGHFormerDataset(Dataset):
             return None
         rel_parent = sample.mesh_path.relative_to(self.root_dir).parent
         return self.transformation_dir / rel_parent / f"{sample.mesh_path.stem}_transformation_matrix.npy"
+
+    def load_landmarks_world(self, idx):
+        sample = self.samples[idx]
+        landmarks = read_landmarks(sample.landmark_path)
+        transform_path = self._transform_path(sample)
+        if transform_path is not None:
+            if not transform_path.exists():
+                raise FileNotFoundError(f"Missing transform for {sample.sample_id}: {transform_path}")
+            matrix = np.load(transform_path)
+            landmarks = transform_points(landmarks, matrix).astype(np.float32)
+        return landmarks.astype(np.float32)
+
+    def template_key_candidates(self, sample):
+        return [
+            f"class_gender:{sample.class_name}:{sample.gender}",
+            f"class:{sample.class_name}",
+            f"gender:{sample.gender}",
+            "global",
+        ]
+
+    def template_for_sample(self, sample):
+        if not self.template_landmarks:
+            return None
+        mode_to_key = {
+            "class_gender": f"class_gender:{sample.class_name}:{sample.gender}",
+            "class": f"class:{sample.class_name}",
+            "gender": f"gender:{sample.gender}",
+            "global": "global",
+        }
+        preferred = mode_to_key.get(self.template_mode, "global")
+        keys = [preferred] + [key for key in self.template_key_candidates(sample) if key != preferred]
+        for key in keys:
+            if key in self.template_landmarks:
+                return self.template_landmarks[key].astype(np.float32)
+        return None
 
     def _cache_path(self, sample):
         transform_tag = "aligned" if self.transformation_dir else "raw"
@@ -239,6 +276,10 @@ class AGHFormerDataset(Dataset):
         center, scale = mesh_normalization(points_world)
         points_norm = ((points_world - center) / scale).astype(np.float32)
         landmarks_norm = ((landmarks - center) / scale).astype(np.float32)
+        template_world = self.template_for_sample(sample)
+        if template_world is None:
+            template_world = np.zeros_like(landmarks, dtype=np.float32)
+        template_norm = ((template_world - center) / scale).astype(np.float32)
         normals = normalize_vectors(normals).astype(np.float32)
         feature_parts = [points_norm]
         if self.use_normals:
@@ -262,16 +303,49 @@ class AGHFormerDataset(Dataset):
             center=center.astype(np.float32),
             scale=np.asarray([scale], dtype=np.float32),
         )
-        return points_norm, features, points_world, landmarks_norm, landmarks, targets, center.astype(np.float32), np.asarray([scale], dtype=np.float32)
+        return (
+            points_norm,
+            features,
+            points_world,
+            landmarks_norm,
+            landmarks,
+            targets,
+            center.astype(np.float32),
+            np.asarray([scale], dtype=np.float32),
+            template_norm,
+            template_world.astype(np.float32),
+        )
 
     def __getitem__(self, idx):
-        points_norm, features, points_world, landmarks_norm, landmarks_world, targets, center, scale = self._load_arrays(idx)
+        loaded = self._load_arrays(idx)
+        if len(loaded) == 8:
+            points_norm, features, points_world, landmarks_norm, landmarks_world, targets, center, scale = loaded
+            sample = self.samples[idx]
+            template_world = self.template_for_sample(sample)
+            if template_world is None:
+                template_world = np.zeros_like(landmarks_world, dtype=np.float32)
+            template_norm = ((template_world - center) / scale).astype(np.float32)
+        else:
+            (
+                points_norm,
+                features,
+                points_world,
+                landmarks_norm,
+                landmarks_world,
+                targets,
+                center,
+                scale,
+                template_norm,
+                template_world,
+            ) = loaded
         return {
             "points_norm": torch.tensor(points_norm, dtype=torch.float32),
             "features": torch.tensor(features, dtype=torch.float32),
             "points_world": torch.tensor(points_world, dtype=torch.float32),
             "landmarks_norm": torch.tensor(landmarks_norm, dtype=torch.float32),
             "landmarks_world": torch.tensor(landmarks_world, dtype=torch.float32),
+            "template_norm": torch.tensor(template_norm, dtype=torch.float32),
+            "template_world": torch.tensor(template_world, dtype=torch.float32),
             "targets": torch.tensor(targets, dtype=torch.float32),
             "center": torch.tensor(center.reshape(3), dtype=torch.float32),
             "scale": torch.tensor(scale.reshape(1), dtype=torch.float32),
@@ -382,7 +456,7 @@ class AGHFormer(nn.Module):
         mlp_ratio=2.0,
         dropout=0.1,
         graph_adjacency=None,
-        residual_scale=0.08,
+        residual_scale=0.18,
     ):
         super().__init__()
         self.num_landmarks = int(num_landmarks)
@@ -396,12 +470,15 @@ class AGHFormer(nn.Module):
         )
         self.surface_blocks = nn.ModuleList([SurfaceEncoderBlock(width, dropout=dropout) for _ in range(max(1, blocks // 2))])
         self.landmark_tokens = nn.Parameter(torch.randn(num_landmarks, width) * 0.02)
+        self.template_proj = nn.Sequential(nn.Linear(3, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, width))
         self.cross_blocks = nn.ModuleList(
             [CrossTokenBlock(width, heads, mlp_ratio=mlp_ratio, dropout=dropout) for _ in range(blocks)]
         )
         self.surface_heat = nn.Linear(width, width, bias=False)
         self.token_heat = nn.Linear(width, width, bias=False)
         self.coord_head = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, 3))
+        nn.init.zeros_(self.coord_head[-1].weight)
+        nn.init.zeros_(self.coord_head[-1].bias)
         self.log_var_head = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, num_landmarks))
         if graph_adjacency is None:
             graph_adjacency = torch.ones(num_landmarks, num_landmarks)
@@ -410,12 +487,14 @@ class AGHFormer(nn.Module):
         graph_mask[disallowed] = -10000.0
         self.register_buffer("graph_mask", graph_mask)
 
-    def forward(self, points_norm, features):
+    def forward(self, points_norm, features, template_norm=None):
         surface = self.feature_proj(features)
         for block in self.surface_blocks:
             surface = block(surface)
         batch = features.shape[0]
         tokens = self.landmark_tokens.unsqueeze(0).expand(batch, -1, -1)
+        if template_norm is not None:
+            tokens = tokens + self.template_proj(template_norm)
         for block in self.cross_blocks:
             tokens = block(tokens, surface, self.graph_mask)
         surface_key = F.normalize(self.surface_heat(surface), dim=-1)
@@ -424,9 +503,15 @@ class AGHFormer(nn.Module):
         weights = torch.softmax(logits, dim=1)
         heatmap_coords = torch.einsum("bnl,bnd->bld", weights, points_norm)
         residual = torch.tanh(self.coord_head(tokens)) * self.residual_scale
-        pred_norm = heatmap_coords + residual
+        pred_norm = (template_norm if template_norm is not None else heatmap_coords) + residual
         log_vars = self.log_var_head(tokens).diagonal(dim1=1, dim2=2).contiguous()
-        return {"logits": logits, "pred_norm": pred_norm, "residual_norm": residual, "log_vars": log_vars}
+        return {
+            "logits": logits,
+            "pred_norm": pred_norm,
+            "heatmap_coords": heatmap_coords,
+            "residual_norm": residual,
+            "log_vars": log_vars,
+        }
 
 
 def sharpen_targets(targets, sigma_start, sigma_current):
@@ -434,6 +519,32 @@ def sharpen_targets(targets, sigma_start, sigma_current):
     sigma_current = max(float(sigma_current), 1e-6)
     exponent = (sigma_start / sigma_current) ** 2
     return torch.clamp(targets, 0.0, 1.0) ** exponent
+
+
+def heatmap_supervision_loss(logits, target_heatmaps, mode="weighted_mse", positive_weight=20.0, ce_weight=0.0):
+    mode = str(mode)
+    if mode == "mse":
+        heatmap = F.mse_loss(torch.sigmoid(logits), target_heatmaps)
+    elif mode == "focal_bce":
+        bce = F.binary_cross_entropy_with_logits(logits, target_heatmaps, reduction="none")
+        probs = torch.sigmoid(logits)
+        pt = probs * target_heatmaps + (1.0 - probs) * (1.0 - target_heatmaps)
+        focal = (1.0 - pt).pow(2.0) * bce
+        weights = 1.0 + float(positive_weight) * target_heatmaps
+        heatmap = (focal * weights).sum() / weights.sum().clamp_min(1.0)
+    else:
+        weights = 1.0 + float(positive_weight) * target_heatmaps
+        squared = (torch.sigmoid(logits) - target_heatmaps).pow(2.0)
+        heatmap = (squared * weights).sum() / weights.sum().clamp_min(1.0)
+
+    if ce_weight > 0:
+        target_idx = target_heatmaps.argmax(dim=1)
+        batch, n_points, n_landmarks = logits.shape
+        ce_logits = logits.permute(0, 2, 1).contiguous().view(batch * n_landmarks, n_points)
+        ce_targets = target_idx.contiguous().view(batch * n_landmarks)
+        ce = F.cross_entropy(ce_logits, ce_targets)
+        heatmap = heatmap + float(ce_weight) * ce
+    return heatmap
 
 
 def pairwise_structure_loss(pred_norm, target_norm):
@@ -484,9 +595,18 @@ def aghformer_loss(
     symmetry_pairs,
     midline_indices,
     clinical_threshold_mm,
+    heatmap_loss_mode,
+    heatmap_positive_weight,
+    heatmap_ce_weight,
 ):
     target_heatmaps = sharpen_targets(targets, sigma_start, sigma_current)
-    heatmap_loss = F.mse_loss(torch.sigmoid(outputs["logits"]), target_heatmaps)
+    heatmap_loss = heatmap_supervision_loss(
+        outputs["logits"],
+        target_heatmaps,
+        mode=heatmap_loss_mode,
+        positive_weight=heatmap_positive_weight,
+        ce_weight=heatmap_ce_weight,
+    )
     coord_loss = F.smooth_l1_loss(outputs["pred_norm"], landmarks_norm)
     loss = heatmap_loss + float(coord_weight) * coord_loss
     structure = pairwise_structure_loss(outputs["pred_norm"], landmarks_norm)
@@ -523,11 +643,12 @@ def random_rotation_matrix(batch, max_deg, device):
     return rz @ ry @ rx
 
 
-def augment_batch(points_norm, features, landmarks_norm, rotation_aug_deg, point_jitter_std, feature_dropout, use_normals):
+def augment_batch(points_norm, features, landmarks_norm, template_norm, rotation_aug_deg, point_jitter_std, feature_dropout, use_normals):
     if rotation_aug_deg > 0:
         rot = random_rotation_matrix(points_norm.shape[0], rotation_aug_deg, points_norm.device)
         points_norm = torch.einsum("bij,bnj->bni", rot, points_norm)
         landmarks_norm = torch.einsum("bij,blj->bli", rot, landmarks_norm)
+        template_norm = torch.einsum("bij,blj->bli", rot, template_norm)
         features = features.clone()
         features[:, :, :3] = points_norm
         if use_normals and features.shape[-1] >= 6:
@@ -540,17 +661,29 @@ def augment_batch(points_norm, features, landmarks_norm, rotation_aug_deg, point
     if feature_dropout > 0:
         keep = (torch.rand(features.shape[:2], device=features.device) > float(feature_dropout)).float().unsqueeze(-1)
         features = features * keep
-    return points_norm, features, landmarks_norm
+    return points_norm, features, landmarks_norm, template_norm
 
 
-def predict_landmarks(outputs, points_world, scale, postprocess="topk_softmax", temperature=1.0, topk=30, snap=True):
+def predict_landmarks(outputs, points_world, center, scale, postprocess="topk_softmax", temperature=1.0, topk=30, snap=True, prediction_mode="direct"):
     logits = outputs["logits"].detach().cpu().numpy()
     residual_norm = outputs["residual_norm"].detach().cpu().numpy()
+    pred_norm = outputs["pred_norm"].detach().cpu().numpy()
     points_world_np = points_world.detach().cpu().numpy()
+    center_np = center.detach().cpu().numpy().reshape((-1, 1, 3))
     scale_np = scale.detach().cpu().numpy().reshape(-1)
     batch, n_points, n_landmarks = logits.shape
     preds = np.zeros((batch, n_landmarks, 3), dtype=np.float32)
     raw_preds = np.zeros((batch, n_landmarks, 3), dtype=np.float32)
+    if prediction_mode == "direct":
+        raw_preds = (pred_norm * scale_np[:, None, None] + center_np).astype(np.float32)
+        if not snap:
+            return raw_preds, raw_preds.copy()
+        for b in range(batch):
+            for lm_idx in range(n_landmarks):
+                nearest = np.linalg.norm(points_world_np[b] - raw_preds[b, lm_idx][None, :], axis=1).argmin()
+                preds[b, lm_idx] = points_world_np[b, nearest]
+        return raw_preds, preds
+
     for b in range(batch):
         for lm_idx in range(n_landmarks):
             scores = logits[b, :, lm_idx]
@@ -648,17 +781,19 @@ def train_epoch(model, loader, optimizer, device, args, symmetry_pairs, midline_
         features = batch["features"].to(device)
         targets = batch["targets"].to(device)
         landmarks_norm = batch["landmarks_norm"].to(device)
+        template_norm = batch["template_norm"].to(device)
         scale = batch["scale"].to(device)
-        points, features, landmarks_norm = augment_batch(
+        points, features, landmarks_norm, template_norm = augment_batch(
             points,
             features,
             landmarks_norm,
+            template_norm,
             args.rotation_aug_deg,
             args.point_jitter_std,
             args.feature_dropout,
             args.use_normals,
         )
-        outputs = model(points, features)
+        outputs = model(points, features, template_norm=template_norm)
         loss, parts = aghformer_loss(
             outputs,
             targets,
@@ -674,6 +809,9 @@ def train_epoch(model, loader, optimizer, device, args, symmetry_pairs, midline_
             symmetry_pairs,
             midline_indices,
             args.clinical_threshold_mm,
+            args.heatmap_loss,
+            args.heatmap_positive_weight,
+            args.heatmap_ce_weight,
         )
         optimizer.zero_grad()
         loss.backward()
@@ -702,8 +840,9 @@ def evaluate(model, loader, device, args, symmetry_pairs, midline_indices, sigma
         features = batch["features"].to(device)
         targets = batch["targets"].to(device)
         landmarks_norm = batch["landmarks_norm"].to(device)
+        template_norm = batch["template_norm"].to(device)
         scale = batch["scale"].to(device)
-        outputs = model(points, features)
+        outputs = model(points, features, template_norm=template_norm)
         loss, parts = aghformer_loss(
             outputs,
             targets,
@@ -719,6 +858,9 @@ def evaluate(model, loader, device, args, symmetry_pairs, midline_indices, sigma
             symmetry_pairs,
             midline_indices,
             args.clinical_threshold_mm,
+            args.heatmap_loss,
+            args.heatmap_positive_weight,
+            args.heatmap_ce_weight,
         )
         total += float(loss.detach().cpu()) * points.shape[0]
         for key, value in parts.items():
@@ -726,10 +868,12 @@ def evaluate(model, loader, device, args, symmetry_pairs, midline_indices, sigma
         raw_preds, snapped_preds = predict_landmarks(
             outputs,
             batch["points_world"],
+            batch["center"],
             batch["scale"],
             postprocess=args.postprocess,
             temperature=args.temperature,
             topk=args.topk,
+            prediction_mode=args.prediction_mode,
             snap=True,
         )
         landmarks = batch["landmarks_world"].cpu().numpy()
@@ -891,6 +1035,27 @@ def limit_samples_balanced(samples, max_samples, seed):
     return sorted(selected, key=lambda s: (s.class_name, s.gender, s.subject_id))
 
 
+def compute_train_templates(dataset, train_idx):
+    groups = {"global": []}
+    for idx in train_idx:
+        sample = dataset.samples[idx]
+        landmarks = dataset.load_landmarks_world(idx)
+        groups.setdefault(f"class:{sample.class_name}", []).append(landmarks)
+        groups.setdefault(f"gender:{sample.gender}", []).append(landmarks)
+        groups.setdefault(f"class_gender:{sample.class_name}:{sample.gender}", []).append(landmarks)
+        groups["global"].append(landmarks)
+    return {
+        key: np.mean(np.stack(values, axis=0), axis=0).astype(np.float32)
+        for key, values in groups.items()
+        if values
+    }
+
+
+def write_templates_json(path, templates):
+    serializable = {key: value.astype(float).tolist() for key, value in sorted(templates.items())}
+    Path(path).write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+
+
 def build_loaders(args):
     output_dir = Path(args.output_dir)
     dataset = AGHFormerDataset(
@@ -916,6 +1081,10 @@ def build_loaders(args):
         train_idx, val_idx, test_idx = make_splits(dataset, args.test_size, args.val_size, args.seed)
         source_splits_json = None if not args.splits_json else f"{Path(args.splits_json)} ignored because --max-samples was used"
 
+    templates = compute_train_templates(dataset, train_idx)
+    dataset.template_mode = args.template_mode
+    dataset.template_landmarks = templates
+
     eval_dataset = dataset
     if args.eval_surface_points is not None and args.eval_surface_points != args.surface_points:
         eval_dataset = AGHFormerDataset(
@@ -931,6 +1100,8 @@ def build_loaders(args):
         )
         if args.max_samples is not None:
             eval_dataset.samples = limit_samples_balanced(eval_dataset.samples, args.max_samples, args.seed)
+        eval_dataset.template_mode = args.template_mode
+        eval_dataset.template_landmarks = templates
 
     split_payload = {
         "train": [dataset.samples[i].sample_id for i in train_idx],
@@ -940,6 +1111,7 @@ def build_loaders(args):
         "missing_landmark_meshes": dataset.missing_landmarks,
     }
     (output_dir / "splits.json").write_text(json.dumps(split_payload, indent=2), encoding="utf-8")
+    write_templates_json(output_dir / "template_landmarks.json", templates)
     train_loader = DataLoader(Subset(dataset, train_idx), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(Subset(dataset, val_idx), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = DataLoader(Subset(eval_dataset, test_idx), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -966,6 +1138,11 @@ def save_outputs(output_dir, args, eval_dataset, test_rows, raw_errors, snapped_
         "mlp_ratio": args.mlp_ratio,
         "heatmap_sigma_start": args.heatmap_sigma_start,
         "heatmap_sigma_end": args.heatmap_sigma_end,
+        "heatmap_loss": args.heatmap_loss,
+        "heatmap_positive_weight": args.heatmap_positive_weight,
+        "heatmap_ce_weight": args.heatmap_ce_weight,
+        "template_mode": args.template_mode,
+        "prediction_mode": args.prediction_mode,
         "coord_weight": args.coord_weight,
         "structure_weight": args.structure_weight,
         "symmetry_weight": args.symmetry_weight,
@@ -1003,15 +1180,19 @@ def main():
     parser.add_argument("--use-normals", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-local-geometry", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-geometry-k", type=int, default=16)
+    parser.add_argument("--template-mode", choices=["global", "class", "gender", "class_gender"], default="class_gender")
     parser.add_argument("--heatmap-sigma-start", type=float, default=5.0)
     parser.add_argument("--heatmap-sigma-end", type=float, default=2.5)
+    parser.add_argument("--heatmap-loss", choices=["mse", "weighted_mse", "focal_bce"], default="weighted_mse")
+    parser.add_argument("--heatmap-positive-weight", type=float, default=20.0)
+    parser.add_argument("--heatmap-ce-weight", type=float, default=0.05)
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=3)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--mlp-ratio", type=float, default=2.0)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--residual-scale", type=float, default=0.08)
-    parser.add_argument("--coord-weight", type=float, default=0.45)
+    parser.add_argument("--residual-scale", type=float, default=0.18)
+    parser.add_argument("--coord-weight", type=float, default=1.0)
     parser.add_argument("--structure-weight", type=float, default=0.08)
     parser.add_argument("--symmetry-weight", type=float, default=0.02)
     parser.add_argument("--clinical-weight", type=float, default=0.05)
@@ -1030,6 +1211,8 @@ def main():
     parser.add_argument("--feature-dropout", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--postprocess", choices=["softmax", "topk_softmax", "argmax"], default="topk_softmax")
+    parser.add_argument("--prediction-mode", choices=["direct", "heatmap_residual"], default="direct")
+    parser.add_argument("--selection-metric", choices=["raw", "snapped"], default="raw")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=30)
     parser.add_argument("--evaluate-only", action="store_true")
@@ -1121,8 +1304,8 @@ def main():
     epochs_no_improve = 0
     for epoch in range(1, args.epochs + 1):
         train_loss, train_parts, sigma_current = train_epoch(model, train_loader, optimizer, device, args, symmetry_pairs, midline_indices, epoch)
-        val_loss, val_parts, _, _, val_snapped_errors = evaluate(model, val_loader, device, args, symmetry_pairs, midline_indices, sigma_current)
-        val_ale = float(val_snapped_errors.mean())
+        val_loss, val_parts, _, val_raw_errors, val_snapped_errors = evaluate(model, val_loader, device, args, symmetry_pairs, midline_indices, sigma_current)
+        val_ale = float((val_raw_errors if args.selection_metric == "raw" else val_snapped_errors).mean())
         if args.scheduler == "plateau" and scheduler is not None:
             scheduler.step(val_loss)
         elif scheduler is not None:
@@ -1133,6 +1316,9 @@ def main():
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_ale": val_ale,
+                "selection_metric": args.selection_metric,
+                "val_raw_ale": float(val_raw_errors.mean()),
+                "val_snapped_ale": float(val_snapped_errors.mean()),
                 "sigma_current": sigma_current,
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "train_parts": train_parts,
