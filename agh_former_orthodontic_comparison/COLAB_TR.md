@@ -7,27 +7,37 @@ from google.colab import drive
 drive.mount('/content/drive')
 ```
 
-Repo ve dataset Drive üzerinde şu yapıda olmalıdır:
+GitHub repo ve dataset ayrı konumdadır. Bu runner varsayılan olarak şu yolları kullanır:
 
 ```text
-/content/drive/MyDrive/comparative-study/
-  data/dataset/
-  shared_splits/
-  palnet_orthodontic_comparison/transforms/
-  agh_former_orthodontic_comparison/
+CODE_ROOT     = /content/comparative-study
+DATA_ROOT     = /content/drive/MyDrive/orthodontic/data/dataset
+SPLITS_JSON   = /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json
+TRANSFORM_DIR = /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801
+RUN_ROOT      = /content/drive/MyDrive/orthodontic/diffusion_runs
 ```
+
+`TRANSFORM_DIR` varsa Procrustes transformları kullanılır; yoksa script raw koordinatlarla devam eder.
 
 ## 2. Kurulum
 
+Notebook ile çalışmak için:
+
+```text
+agh_former_orthodontic_comparison/colab_aghformer_orthodontic_gpu.ipynb
+```
+
+Manuel komutlarla çalışmak için:
+
 ```bash
-cd /content/drive/MyDrive/comparative-study
+cd /content/comparative-study
 pip install -r agh_former_orthodontic_comparison/requirements.txt
 ```
 
 ## 3. Smoke Test
 
 ```bash
-cd /content/drive/MyDrive/comparative-study/agh_former_orthodontic_comparison
+cd /content/comparative-study/agh_former_orthodontic_comparison
 python -u colab_run_aghformer_shared_metrics.py \
   --preset smoke
 ```
@@ -35,7 +45,7 @@ python -u colab_run_aghformer_shared_metrics.py \
 ## 4. Ana A100 Koşusu
 
 ```bash
-cd /content/drive/MyDrive/comparative-study/agh_former_orthodontic_comparison
+cd /content/comparative-study/agh_former_orthodontic_comparison
 python -u colab_run_aghformer_shared_metrics.py \
   --preset a100
 ```
@@ -53,3 +63,4 @@ python -u colab_run_aghformer_shared_metrics.py \
 - İlk epoch yavaş olabilir; mesh örnekleme ve lokal geometri cache dosyaları oluşturulur.
 - `best_model.pth` güncelleniyorsa validasyon ALE bakımından daha iyi bir checkpoint bulunmuştur.
 - Nihai karşılaştırmada `metrics.json` içindeki `aghformer_snapped.ale` ana değer olarak kullanılmalıdır.
+- Çıktılar varsayılan olarak `/content/drive/MyDrive/orthodontic/diffusion_runs` altına yazılır.

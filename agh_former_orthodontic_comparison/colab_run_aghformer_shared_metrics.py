@@ -5,24 +5,57 @@ import sys
 from pathlib import Path
 
 
-def repo_root():
+DATA_ROOT = Path("/content/drive/MyDrive/orthodontic/data/dataset")
+SPLITS_JSON = Path("/content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json")
+TRANSFORM_DIR = Path("/content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801")
+RUN_ROOT = Path("/content/drive/MyDrive/orthodontic/diffusion_runs")
+
+
+def repo_root(explicit=None):
+    if explicit:
+        return Path(explicit)
     here = Path(__file__).resolve().parent
-    if (here.parent / "shared_splits").exists():
-        return here.parent
-    return Path("/content/drive/MyDrive/comparative-study")
+    return here.parent
+
+
+def has_paired_dataset(path):
+    path = Path(path)
+    return any(path.glob("Class*/men/*.ply")) or any(path.glob("Class*/women/*.ply"))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Colab presets for AGH-Former orthodontic landmark localization.")
     parser.add_argument("--preset", choices=["smoke", "a100", "a100_16k"], default="smoke")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--repo-root", default=None)
+    parser.add_argument("--data-root", default=str(DATA_ROOT))
+    parser.add_argument("--splits-json", default=str(SPLITS_JSON))
+    parser.add_argument("--transformation-dir", default=str(TRANSFORM_DIR))
+    parser.add_argument("--run-root", default=str(RUN_ROOT))
     args = parser.parse_args()
 
-    root = repo_root()
+    root = repo_root(args.repo_root)
     work_dir = root / "agh_former_orthodontic_comparison"
-    data_root = root / "data" / "dataset"
-    splits_json = root / "shared_splits" / "orthodontic_180_60_60_seed42.json"
-    transform_dir = root / "palnet_orthodontic_comparison" / "transforms" / "orthodontic_procrustes_rigid_20260627_143801"
+    data_root = Path(args.data_root)
+    splits_json = Path(args.splits_json)
+    transform_dir = Path(args.transformation_dir)
+    run_root = Path(args.run_root)
+    use_transforms = transform_dir.exists()
+
+    print(f"CODE_ROOT = {root}", flush=True)
+    print(f"DATA_ROOT = {data_root}", flush=True)
+    print(f"SPLITS_JSON = {splits_json}", flush=True)
+    print(f"TRANSFORM_DIR = {transform_dir}", flush=True)
+    print(f"RUN_ROOT = {run_root}", flush=True)
+    print(f"USE_TRANSFORMS = {use_transforms}", flush=True)
+    if not has_paired_dataset(data_root):
+        raise SystemExit(
+            "Dataset bulunamadi. Beklenen yapi: "
+            f"{data_root}/Class1/men/*.ply ve "
+            f"{data_root}/Class1/Class1-Landmark/men/Class1_M1.txt"
+        )
+    if not splits_json.exists():
+        raise SystemExit(f"Split dosyasi bulunamadi: {splits_json}")
 
     common = [
         sys.executable,
@@ -32,16 +65,16 @@ def main():
         str(data_root),
         "--splits-json",
         str(splits_json),
-        "--transformation-dir",
-        str(transform_dir),
         "--device",
         args.device,
     ]
+    if use_transforms:
+        common.extend(["--transformation-dir", str(transform_dir)])
 
     if args.preset == "smoke":
         cmd = common + [
             "--output-dir",
-            str(work_dir / "runs" / "aghformer_smoke_colab"),
+            str(run_root / "aghformer_smoke_colab"),
             "--surface-points",
             "512",
             "--epochs",
@@ -64,7 +97,7 @@ def main():
     elif args.preset == "a100":
         cmd = common + [
             "--output-dir",
-            str(work_dir / "runs" / "aghformer_p12000_w192_b4_e220"),
+            str(run_root / "aghformer_p12000_w192_b4_e220"),
             "--surface-points",
             "12000",
             "--eval-surface-points",
@@ -115,7 +148,7 @@ def main():
     else:
         cmd = common + [
             "--output-dir",
-            str(work_dir / "runs" / "aghformer_p16000_w192_b4_e240"),
+            str(run_root / "aghformer_p16000_w192_b4_e240"),
             "--surface-points",
             "16000",
             "--eval-surface-points",
