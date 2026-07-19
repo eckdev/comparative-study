@@ -27,6 +27,9 @@ diffusion_net_orthodontic_comparison/upstream/src/**/__pycache__/
 diffusion_net_orthodontic_comparison/__pycache__/
 pointnet2_orthodontic_comparison/__pycache__/
 
+diffusion_net_orthodontic_comparison/runs/
+pointnet2_orthodontic_comparison/runs/
+
 # Heavy experiment/model files if created outside ignored run folders.
 *.pth
 *.pt
@@ -34,3 +37,4 @@ pointnet2_orthodontic_comparison/__pycache__/
 *.npy
 *.npz
 *.ply
+manuscript
