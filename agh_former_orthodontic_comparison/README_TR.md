@@ -93,6 +93,51 @@ python -u run_orthodontic_aghformer.py \
 
 Bellek yetmezse sırasıyla `--batch-size 1`, sonra `--surface-points 8192`, sonra `--width 128` denenmelidir.
 
+## Stage 2 Lokal Refiner
+
+Stage 2, tamamlanmış AGH-Former v2 checkpoint'ini sabit Stage 1 olarak kullanır. Her landmark için Stage 1 snapped tahmini çevresinden lokal patch çıkarır ve yalnızca residual düzeltme öğrenir:
+
+```text
+stage2_prediction = stage1_prediction + predicted_delta
+```
+
+Google Colab runner ile:
+
+```bash
+cd /content/comparative-study/agh_former_orthodontic_comparison
+python -u colab_run_aghformer_shared_metrics.py --preset stage2
+```
+
+Manuel çalıştırma:
+
+```bash
+python -u run_aghformer_stage2_refiner.py \
+  --data-root ../data/dataset \
+  --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
+  --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
+  --stage1-run-dir runs/aghformer_v2_template_p12000_w192_b4_e220 \
+  --output-dir runs/aghformer_v3_stage2_refiner_p12000 \
+  --surface-points 12000 \
+  --patch-points 1024 \
+  --patch-radius-mm 18 \
+  --stage1-center snapped \
+  --epochs 160 \
+  --patience 30 \
+  --batch-size 256 \
+  --refiner-width 192 \
+  --landmark-embedding-dim 48 \
+  --center-jitter-mm 1.5 \
+  --point-noise-mm 0.1 \
+  --point-dropout 0.05 \
+  --device auto
+```
+
+Stage 2 smoke test:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py --preset stage2_smoke
+```
+
 ## Evaluate-only
 
 ```bash
@@ -128,3 +173,7 @@ python -u run_orthodontic_aghformer.py \
 - `uncertainty_metrics_test.csv`: belirsizlik-hata korelasyonu.
 - `history.json`: epoch bazlı eğitim geçmişi.
 - `best_model.pth`: en iyi validasyon ALE checkpoint.
+- `stage1_predictions_train.csv`, `stage1_predictions_val.csv`, `stage1_predictions_test.csv`: Stage 2 için kullanılan sabit Stage 1 tahminleri.
+- `best_refiner.pth`: Stage 2 lokal refiner checkpoint.
+- `refined_predictions_test.csv`: Stage 2 nihai test tahminleri.
+- `metrics_refined.json`: Stage 2 raw/snapped ALE, PCK ve detaylı analizler.

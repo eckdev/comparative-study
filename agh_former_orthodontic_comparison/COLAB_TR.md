@@ -57,7 +57,29 @@ python -u colab_run_aghformer_shared_metrics.py \
   --preset a100_16k
 ```
 
-## 6. Notlar
+## 6. Stage 2 Lokal Refiner
+
+Önce `--preset a100` koşusu tamamlanmış olmalıdır. Ardından:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py \
+  --preset stage2
+```
+
+Hızlı kontrol için:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py \
+  --preset stage2_smoke
+```
+
+Stage 2 çıktıları:
+
+```text
+/content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v3_stage2_refiner_p12000
+```
+
+## 7. Notlar
 
 - Logların akması için `python -u` kullanılmalıdır.
 - İlk epoch yavaş olabilir; mesh örnekleme ve lokal geometri cache dosyaları oluşturulur.

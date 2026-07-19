@@ -25,13 +25,14 @@ def has_paired_dataset(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Colab presets for AGH-Former orthodontic landmark localization.")
-    parser.add_argument("--preset", choices=["smoke", "a100", "a100_16k"], default="smoke")
+    parser.add_argument("--preset", choices=["smoke", "a100", "a100_16k", "stage2", "stage2_smoke"], default="smoke")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--data-root", default=str(DATA_ROOT))
     parser.add_argument("--splits-json", default=str(SPLITS_JSON))
     parser.add_argument("--transformation-dir", default=str(TRANSFORM_DIR))
     parser.add_argument("--run-root", default=str(RUN_ROOT))
+    parser.add_argument("--stage1-run-dir", default=None)
     args = parser.parse_args()
 
     root = repo_root(args.repo_root)
@@ -171,7 +172,7 @@ def main():
             "--temperature",
             "1.0",
         ]
-    else:
+    elif args.preset == "a100_16k":
         cmd = common + [
             "--output-dir",
             str(run_root / "aghformer_v2_template_p16000_w192_b4_e240"),
@@ -234,6 +235,96 @@ def main():
             "--topk",
             "30",
         ]
+    elif args.preset == "stage2_smoke":
+        stage1_run_dir = Path(args.stage1_run_dir) if args.stage1_run_dir else run_root / "aghformer_v2_template_smoke_colab"
+        cmd = [
+            sys.executable,
+            "-u",
+            str(work_dir / "run_aghformer_stage2_refiner.py"),
+            "--data-root",
+            str(data_root),
+            "--splits-json",
+            str(splits_json),
+            "--stage1-run-dir",
+            str(stage1_run_dir),
+            "--output-dir",
+            str(run_root / "aghformer_v3_stage2_smoke_colab"),
+            "--surface-points",
+            "512",
+            "--patch-points",
+            "128",
+            "--patch-radius-mm",
+            "15",
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--batch-size",
+            "64",
+            "--refiner-width",
+            "64",
+            "--max-samples",
+            "24",
+            "--device",
+            args.device,
+        ]
+        if use_transforms:
+            cmd.extend(["--transformation-dir", str(transform_dir)])
+    else:
+        stage1_run_dir = Path(args.stage1_run_dir) if args.stage1_run_dir else run_root / "aghformer_v2_template_p12000_w192_b4_e220"
+        cmd = [
+            sys.executable,
+            "-u",
+            str(work_dir / "run_aghformer_stage2_refiner.py"),
+            "--data-root",
+            str(data_root),
+            "--splits-json",
+            str(splits_json),
+            "--stage1-run-dir",
+            str(stage1_run_dir),
+            "--output-dir",
+            str(run_root / "aghformer_v3_stage2_refiner_p12000"),
+            "--surface-points",
+            "12000",
+            "--patch-points",
+            "1024",
+            "--patch-radius-mm",
+            "18",
+            "--stage1-center",
+            "snapped",
+            "--epochs",
+            "160",
+            "--patience",
+            "30",
+            "--batch-size",
+            "256",
+            "--lr",
+            "0.001",
+            "--weight-decay",
+            "0.0001",
+            "--refiner-width",
+            "192",
+            "--landmark-embedding-dim",
+            "48",
+            "--residual-limit-mm",
+            "12",
+            "--center-jitter-mm",
+            "1.5",
+            "--point-noise-mm",
+            "0.1",
+            "--point-dropout",
+            "0.05",
+            "--clinical-weight",
+            "0.08",
+            "--delta-reg-weight",
+            "0.002",
+            "--uncertainty-weight",
+            "0.01",
+            "--device",
+            args.device,
+        ]
+        if use_transforms:
+            cmd.extend(["--transformation-dir", str(transform_dir)])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
