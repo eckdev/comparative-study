@@ -162,13 +162,13 @@ def generate_stage1_predictions(model, dataset, indices, args, device, output_cs
     return pred_by_idx
 
 
-def stage1_landmark_weights(pred_by_idx, mode="train_error"):
+def stage1_landmark_weights(pred_by_idx, mode="train_error", min_weight=0.75, max_weight=2.5):
     if mode == "none":
         return np.ones(23, dtype=np.float32)
     errors = np.stack([entry["snapped_errors"] for entry in pred_by_idx.values()], axis=0)
     means = errors.mean(axis=0)
     weights = means / max(float(means.mean()), 1e-6)
-    return np.clip(weights, 0.75, 2.5).astype(np.float32)
+    return np.clip(weights, float(min_weight), float(max_weight)).astype(np.float32)
 
 
 class Stage2PatchDataset(Dataset):
@@ -601,6 +601,8 @@ def main():
     parser.add_argument("--projection-topk", type=int, default=5)
     parser.add_argument("--selection-metric", choices=["raw", "snapped"], default="snapped")
     parser.add_argument("--landmark-weighting", choices=["none", "train_error"], default="train_error")
+    parser.add_argument("--landmark-weight-min", type=float, default=0.75)
+    parser.add_argument("--landmark-weight-max", type=float, default=2.5)
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -676,7 +678,12 @@ def main():
     stage1_all.update(stage1_val)
     stage1_all.update(stage1_test)
 
-    weights_np = stage1_landmark_weights(stage1_train, args.landmark_weighting)
+    weights_np = stage1_landmark_weights(
+        stage1_train,
+        args.landmark_weighting,
+        min_weight=args.landmark_weight_min,
+        max_weight=args.landmark_weight_max,
+    )
     (output_dir / "landmark_weights.json").write_text(json.dumps(weights_np.astype(float).tolist(), indent=2), encoding="utf-8")
     landmark_weights = torch.tensor(weights_np, dtype=torch.float32, device=device)
 

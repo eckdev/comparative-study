@@ -27,7 +27,16 @@ def main():
     parser = argparse.ArgumentParser(description="Colab presets for AGH-Former orthodontic landmark localization.")
     parser.add_argument(
         "--preset",
-        choices=["smoke", "a100", "a100_16k", "stage2", "stage2_raw", "stage2_raw_fine", "stage2_smoke"],
+        choices=[
+            "smoke",
+            "a100",
+            "a100_16k",
+            "stage2",
+            "stage2_raw",
+            "stage2_raw_fine",
+            "stage2_wide_hard",
+            "stage2_smoke",
+        ],
         default="smoke",
     )
     parser.add_argument("--device", default="auto")
@@ -294,6 +303,8 @@ def main():
         stage1_run_dir = Path(args.stage1_run_dir) if args.stage1_run_dir else run_root / "aghformer_v2_template_p12000_w192_b4_e220"
         stage2_raw = args.preset in {"stage2_raw", "stage2_raw_fine"}
         stage2_raw_fine = args.preset == "stage2_raw_fine"
+        stage2_wide_hard = args.preset == "stage2_wide_hard"
+        stage2_raw = stage2_raw or stage2_wide_hard
         cmd = [
             sys.executable,
             "-u",
@@ -312,6 +323,8 @@ def main():
                 / (
                     "aghformer_v6_stage2_raw_fine_refiner_p12000"
                     if stage2_raw_fine
+                    else "aghformer_v7_stage2_wide_hard_refiner_p12000"
+                    if stage2_wide_hard
                     else "aghformer_v5_stage2_raw_refiner_p12000"
                     if stage2_raw
                     else "aghformer_v4_stage2_heatmap_refiner_p12000"
@@ -320,11 +333,11 @@ def main():
             "--surface-points",
             "12000",
             "--patch-points",
-            "1024",
+            "2048" if stage2_wide_hard else "1024",
             "--patch-radius-mm",
-            "12" if stage2_raw_fine else "15" if stage2_raw else "18",
+            "24" if stage2_wide_hard else "12" if stage2_raw_fine else "15" if stage2_raw else "18",
             "--patch-heatmap-sigma-mm",
-            "2.0" if stage2_raw_fine else "2.5" if stage2_raw else "3.0",
+            "3.5" if stage2_wide_hard else "2.0" if stage2_raw_fine else "2.5" if stage2_raw else "3.0",
             "--stage1-center",
             "snapped",
             "--epochs",
@@ -332,7 +345,7 @@ def main():
             "--patience",
             "30",
             "--batch-size",
-            "192" if stage2_raw_fine else "256",
+            "128" if stage2_wide_hard else "192" if stage2_raw_fine else "256",
             "--lr",
             "0.001",
             "--weight-decay",
@@ -342,11 +355,11 @@ def main():
             "--landmark-embedding-dim",
             "64" if stage2_raw_fine else "48",
             "--residual-limit-mm",
-            "12",
+            "24" if stage2_wide_hard else "12",
             "--final-mode",
             "center_delta",
             "--heatmap-refine-weight",
-            "0.05" if stage2_raw_fine else "0.1" if stage2_raw else "0.2",
+            "0.1" if stage2_wide_hard else "0.05" if stage2_raw_fine else "0.1" if stage2_raw else "0.2",
             "--heatmap-temperature",
             "0.8",
             "--patch-heatmap-weight",
@@ -366,13 +379,15 @@ def main():
             "--selection-metric",
             "raw" if stage2_raw else "snapped",
             "--center-jitter-mm",
-            "0.35" if stage2_raw_fine else "0.75" if stage2_raw else "1.5",
+            "1.0" if stage2_wide_hard else "0.35" if stage2_raw_fine else "0.75" if stage2_raw else "1.5",
             "--point-noise-mm",
-            "0.05" if stage2_raw_fine else "0.1",
+            "0.08" if stage2_wide_hard else "0.05" if stage2_raw_fine else "0.1",
             "--point-dropout",
-            "0.02" if stage2_raw_fine else "0.05",
+            "0.04" if stage2_wide_hard else "0.02" if stage2_raw_fine else "0.05",
             "--clinical-weight",
-            "0.08",
+            "0.12" if stage2_wide_hard else "0.08",
+            "--landmark-weight-max",
+            "5.0" if stage2_wide_hard else "2.5",
             "--delta-reg-weight",
             "0.002",
             "--uncertainty-weight",
