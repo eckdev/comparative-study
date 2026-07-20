@@ -588,6 +588,7 @@ def main():
     parser.add_argument("--eval-topk", type=int, default=30)
     parser.add_argument("--projection-mode", choices=["nearest", "topk_distance", "none"], default="topk_distance")
     parser.add_argument("--projection-topk", type=int, default=5)
+    parser.add_argument("--selection-metric", choices=["raw", "snapped"], default="snapped")
     parser.add_argument("--landmark-weighting", choices=["none", "train_error"], default="train_error")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--patience", type=int, default=25)
@@ -724,23 +725,27 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss, train_parts = train_refiner_epoch(refiner, train_loader, optimizer, device, landmark_weights, args)
         val_rows, val_raw_errors, val_snapped_errors, val_stage1_errors = evaluate_refiner(refiner, val_loader, dataset, val_idx, device, args)
-        val_ale = float(val_snapped_errors.mean())
+        val_raw_ale = float(val_raw_errors.mean())
+        val_snapped_ale = float(val_snapped_errors.mean())
+        val_ale = val_raw_ale if args.selection_metric == "raw" else val_snapped_ale
         scheduler.step()
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "train_parts": train_parts,
-                "val_raw_ale": float(val_raw_errors.mean()),
-                "val_snapped_ale": val_ale,
+                "val_raw_ale": val_raw_ale,
+                "val_snapped_ale": val_snapped_ale,
+                "selection_metric": args.selection_metric,
+                "val_selected_ale": val_ale,
                 "val_stage1_center_ale": float(val_stage1_errors.mean()),
                 "lr": float(optimizer.param_groups[0]["lr"]),
             }
         )
         print(
             f"Epoch {epoch:04d}/{args.epochs} train={train_loss:.5f} "
-            f"val_stage1={float(val_stage1_errors.mean()):.4f} val_raw={float(val_raw_errors.mean()):.4f} "
-            f"val_snapped={val_ale:.4f}",
+            f"val_stage1={float(val_stage1_errors.mean()):.4f} val_raw={val_raw_ale:.4f} "
+            f"val_snapped={val_snapped_ale:.4f} selected_{args.selection_metric}={val_ale:.4f}",
             flush=True,
         )
         if val_ale < best_val_ale:

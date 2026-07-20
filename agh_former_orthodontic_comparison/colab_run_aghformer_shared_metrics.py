@@ -25,7 +25,11 @@ def has_paired_dataset(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Colab presets for AGH-Former orthodontic landmark localization.")
-    parser.add_argument("--preset", choices=["smoke", "a100", "a100_16k", "stage2", "stage2_smoke"], default="smoke")
+    parser.add_argument(
+        "--preset",
+        choices=["smoke", "a100", "a100_16k", "stage2", "stage2_raw", "stage2_smoke"],
+        default="smoke",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--data-root", default=str(DATA_ROOT))
@@ -288,6 +292,7 @@ def main():
             cmd.extend(["--transformation-dir", str(transform_dir)])
     else:
         stage1_run_dir = Path(args.stage1_run_dir) if args.stage1_run_dir else run_root / "aghformer_v2_template_p12000_w192_b4_e220"
+        stage2_raw = args.preset == "stage2_raw"
         cmd = [
             sys.executable,
             "-u",
@@ -298,16 +303,18 @@ def main():
             str(splits_json),
             "--stage1-run-dir",
             str(stage1_run_dir),
+            "--stage1-batch-size",
+            "2",
             "--output-dir",
-            str(run_root / "aghformer_v4_stage2_heatmap_refiner_p12000"),
+            str(run_root / ("aghformer_v5_stage2_raw_refiner_p12000" if stage2_raw else "aghformer_v4_stage2_heatmap_refiner_p12000")),
             "--surface-points",
             "12000",
             "--patch-points",
             "1024",
             "--patch-radius-mm",
-            "18",
+            "15" if stage2_raw else "18",
             "--patch-heatmap-sigma-mm",
-            "3.0",
+            "2.5" if stage2_raw else "3.0",
             "--stage1-center",
             "snapped",
             "--epochs",
@@ -329,7 +336,7 @@ def main():
             "--final-mode",
             "center_delta",
             "--heatmap-refine-weight",
-            "0.2",
+            "0.1" if stage2_raw else "0.2",
             "--heatmap-temperature",
             "0.8",
             "--patch-heatmap-weight",
@@ -343,11 +350,13 @@ def main():
             "--eval-topk",
             "30",
             "--projection-mode",
-            "topk_distance",
+            "none" if stage2_raw else "topk_distance",
             "--projection-topk",
             "5",
+            "--selection-metric",
+            "raw" if stage2_raw else "snapped",
             "--center-jitter-mm",
-            "1.5",
+            "0.75" if stage2_raw else "1.5",
             "--point-noise-mm",
             "0.1",
             "--point-dropout",
