@@ -93,7 +93,17 @@ def build_stage1_model(args, stage1_config, input_dim, device):
 
 @torch.no_grad()
 def generate_stage1_predictions(model, dataset, indices, args, device, output_csv):
-    loader = DataLoader(torch.utils.data.Subset(dataset, indices), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    loader = DataLoader(
+        torch.utils.data.Subset(dataset, indices),
+        batch_size=args.stage1_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    print(
+        f"Generating Stage1 predictions: {Path(output_csv).name} "
+        f"n={len(indices)} batch_size={args.stage1_batch_size}",
+        flush=True,
+    )
     pred_by_idx = {}
     rows = []
     for batch in tqdm(loader, desc=f"stage1 {Path(output_csv).stem}", leave=False, disable=args.no_tqdm):
@@ -551,6 +561,7 @@ def main():
     parser.add_argument("--transformation-dir", default=None)
     parser.add_argument("--stage1-run-dir", required=True)
     parser.add_argument("--stage1-model-path", default=None)
+    parser.add_argument("--stage1-batch-size", type=int, default=2)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--surface-points", type=int, default=None)
     parser.add_argument("--heatmap-sigma-start", type=float, default=5.0)
