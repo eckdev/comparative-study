@@ -76,7 +76,7 @@ python -u colab_run_aghformer_shared_metrics.py \
 Stage 2 çıktıları:
 
 ```text
-/content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v3_stage2_refiner_p12000
+/content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v4_stage2_heatmap_refiner_p12000
 ```
 
 ## 7. Notlar

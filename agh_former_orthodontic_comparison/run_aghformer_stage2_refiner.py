@@ -172,6 +172,7 @@ class Stage2PatchDataset(Dataset):
         center_jitter_mm=0.0,
         point_noise_mm=0.0,
         point_dropout=0.0,
+        heatmap_sigma_mm=3.0,
         seed=42,
     ):
         self.base_dataset = base_dataset
@@ -182,6 +183,7 @@ class Stage2PatchDataset(Dataset):
         self.center_jitter_mm = float(center_jitter_mm)
         self.point_noise_mm = float(point_noise_mm)
         self.point_dropout = float(point_dropout)
+        self.heatmap_sigma_mm = float(heatmap_sigma_mm)
         self.seed = int(seed)
 
     def __len__(self):
@@ -210,6 +212,9 @@ class Stage2PatchDataset(Dataset):
             extra = rng.choice(local_order, self.patch_points - len(local_order), replace=True)
             local_order = np.concatenate([local_order, extra], axis=0)
         points_patch = points_world[local_order].astype(np.float32)
+        expert_dists = np.linalg.norm(points_patch - expert[None, :], axis=1)
+        sigma = max(self.heatmap_sigma_mm, 1e-6)
+        patch_heatmap = np.exp(-(expert_dists**2) / (2.0 * sigma**2)).astype(np.float32)
         local_xyz = (points_patch - center[None, :]) / max(self.patch_radius_mm, 1e-6)
         if self.point_noise_mm > 0:
             local_xyz = local_xyz + rng.normal(0.0, self.point_noise_mm / max(self.patch_radius_mm, 1e-6), size=local_xyz.shape).astype(np.float32)
@@ -225,6 +230,7 @@ class Stage2PatchDataset(Dataset):
         return {
             "patch_features": torch.tensor(patch_features, dtype=torch.float32),
             "patch_points_world": torch.tensor(points_patch, dtype=torch.float32),
+            "patch_heatmap": torch.tensor(patch_heatmap, dtype=torch.float32),
             "stage1_center": torch.tensor(stage1_center, dtype=torch.float32),
             "expert": torch.tensor(expert, dtype=torch.float32),
             "target_delta": torch.tensor(target_delta, dtype=torch.float32),
@@ -256,6 +262,7 @@ class LocalPatchResidualRefiner(nn.Module):
             nn.Linear(width, width // 2),
             nn.ReLU(inplace=True),
         )
+        self.heatmap_head = nn.Conv1d(width, 1, 1)
         self.delta_head = nn.Linear(width // 2, 3)
         self.log_var_head = nn.Linear(width // 2, 1)
         nn.init.zeros_(self.delta_head.weight)
@@ -264,13 +271,29 @@ class LocalPatchResidualRefiner(nn.Module):
     def forward(self, patch_features, landmark):
         x = patch_features.transpose(1, 2).contiguous()
         point_features = self.point_mlp(x)
+        point_logits = self.heatmap_head(point_features).squeeze(1)
         pooled_max = point_features.max(dim=2).values
         pooled_mean = point_features.mean(dim=2)
         lm_emb = self.landmark_embedding(landmark)
         hidden = self.head(torch.cat([pooled_max, pooled_mean, lm_emb], dim=1))
         delta = torch.tanh(self.delta_head(hidden)) * self.residual_limit_mm
         log_var = torch.clamp(self.log_var_head(hidden).squeeze(1), min=-6.0, max=6.0)
-        return delta, log_var
+        return delta, log_var, point_logits
+
+
+def differentiable_patch_coordinate(point_logits, patch_points_world, temperature=1.0):
+    weights = torch.softmax(point_logits / max(float(temperature), 1e-6), dim=1)
+    return torch.einsum("bp,bpd->bd", weights, patch_points_world)
+
+
+def patch_heatmap_loss(point_logits, patch_heatmap, positive_weight=20.0, ce_weight=0.05):
+    weights = 1.0 + float(positive_weight) * patch_heatmap
+    mse = ((torch.sigmoid(point_logits) - patch_heatmap).pow(2.0) * weights).sum() / weights.sum().clamp_min(1.0)
+    if ce_weight <= 0:
+        return mse
+    target_idx = patch_heatmap.argmax(dim=1)
+    ce = F.cross_entropy(point_logits, target_idx)
+    return mse + float(ce_weight) * ce
 
 
 def clinical_loss(pred, expert, threshold_mm=2.0, margin_mm=0.5):
@@ -278,19 +301,38 @@ def clinical_loss(pred, expert, threshold_mm=2.0, margin_mm=0.5):
     return F.softplus((err - float(threshold_mm)) / max(float(margin_mm), 1e-6)).mean()
 
 
-def refiner_loss(delta, log_var, batch, landmark_weights, args):
-    final = batch["stage1_center"] + delta
+def refiner_loss(delta, log_var, point_logits, batch, landmark_weights, args):
+    heatmap_coord = differentiable_patch_coordinate(point_logits, batch["patch_points_world"], args.heatmap_temperature)
+    if args.final_mode == "center_delta":
+        final = batch["stage1_center"] + delta
+    elif args.final_mode == "heatmap_only":
+        final = heatmap_coord
+    else:
+        final = batch["stage1_center"] + delta + float(args.heatmap_refine_weight) * (heatmap_coord - batch["stage1_center"])
     expert = batch["expert"]
     per_item = F.smooth_l1_loss(final, expert, reduction="none").mean(dim=1)
     weights = landmark_weights[batch["landmark"]]
     coord = (per_item * weights).mean()
+    heatmap = patch_heatmap_loss(
+        point_logits,
+        batch["patch_heatmap"],
+        positive_weight=args.patch_heatmap_positive_weight,
+        ce_weight=args.patch_heatmap_ce_weight,
+    )
     clinical = clinical_loss(final, expert, args.clinical_threshold_mm)
     delta_reg = torch.linalg.norm(delta, dim=1).mean()
     err_detached = torch.linalg.norm(final - expert, dim=1).detach()
     uncertain = (torch.exp(-log_var) * err_detached + log_var).mean()
-    loss = coord + args.clinical_weight * clinical + args.delta_reg_weight * delta_reg + args.uncertainty_weight * uncertain
+    loss = (
+        coord
+        + args.patch_heatmap_weight * heatmap
+        + args.clinical_weight * clinical
+        + args.delta_reg_weight * delta_reg
+        + args.uncertainty_weight * uncertain
+    )
     return loss, {
         "coord_loss": float(coord.detach().cpu()),
+        "patch_heatmap_loss": float(heatmap.detach().cpu()),
         "clinical_loss": float(clinical.detach().cpu()),
         "delta_reg": float(delta_reg.detach().cpu()),
         "uncertainty_loss": float(uncertain.detach().cpu()),
@@ -303,8 +345,8 @@ def train_refiner_epoch(model, loader, optimizer, device, landmark_weights, args
     parts_total = {}
     for batch in tqdm(loader, desc="stage2 train", leave=False, disable=args.no_tqdm):
         batch = {k: v.to(device) for k, v in batch.items()}
-        delta, log_var = model(batch["patch_features"], batch["landmark"])
-        loss, parts = refiner_loss(delta, log_var, batch, landmark_weights, args)
+        delta, log_var, point_logits = model(batch["patch_features"], batch["landmark"])
+        loss, parts = refiner_loss(delta, log_var, point_logits, batch, landmark_weights, args)
         optimizer.zero_grad()
         loss.backward()
         if args.grad_clip > 0:
@@ -315,6 +357,29 @@ def train_refiner_epoch(model, loader, optimizer, device, landmark_weights, args
             parts_total[key] = parts_total.get(key, 0.0) + value * batch["patch_features"].shape[0]
     n = max(1, len(loader.dataset))
     return total / n, {k: v / n for k, v in parts_total.items()}
+
+
+def numpy_topk_patch_coordinate(logits, patch_points, topk=30, temperature=1.0):
+    k = min(int(topk), len(logits))
+    idx = np.argpartition(logits, -k)[-k:]
+    scores = logits[idx] / max(float(temperature), 1e-6)
+    scores = scores - scores.max()
+    weights = np.exp(scores)
+    weights = weights / max(float(weights.sum()), 1e-12)
+    return np.sum(patch_points[idx] * weights[:, None], axis=0).astype(np.float32)
+
+
+def project_to_patch_surface(raw, patch_points, mode="topk_distance", topk=5):
+    if mode == "none":
+        return raw.astype(np.float32)
+    dists = np.linalg.norm(patch_points - raw[None, :], axis=1)
+    if mode == "nearest" or topk <= 1:
+        return patch_points[dists.argmin()].astype(np.float32)
+    k = min(int(topk), len(dists))
+    idx = np.argpartition(dists, k - 1)[:k]
+    weights = 1.0 / np.clip(dists[idx], 1e-6, None)
+    weights = weights / max(float(weights.sum()), 1e-12)
+    return np.sum(patch_points[idx] * weights[:, None], axis=0).astype(np.float32)
 
 
 @torch.no_grad()
@@ -329,8 +394,18 @@ def evaluate_refiner(model, loader, base_dataset, split_indices, device, args):
     stage1_centers = np.zeros((n_samples, 23, 3), dtype=np.float32)
     for batch in tqdm(loader, desc="stage2 eval", leave=False, disable=args.no_tqdm):
         device_batch = {k: v.to(device) for k, v in batch.items()}
-        delta, log_var = model(device_batch["patch_features"], device_batch["landmark"])
-        final = (device_batch["stage1_center"] + delta).cpu().numpy().astype(np.float32)
+        delta, log_var, point_logits = model(device_batch["patch_features"], device_batch["landmark"])
+        heatmap_coord = differentiable_patch_coordinate(point_logits, device_batch["patch_points_world"], args.heatmap_temperature)
+        if args.final_mode == "center_delta":
+            final_t = device_batch["stage1_center"] + delta
+        elif args.final_mode == "heatmap_only":
+            final_t = heatmap_coord
+        else:
+            final_t = device_batch["stage1_center"] + delta + float(args.heatmap_refine_weight) * (
+                heatmap_coord - device_batch["stage1_center"]
+            )
+        final = final_t.cpu().numpy().astype(np.float32)
+        logits_np = point_logits.cpu().numpy().astype(np.float32)
         patch_points = batch["patch_points_world"].numpy().astype(np.float32)
         sample_indices = batch["sample_index"].numpy().astype(int)
         landmarks = batch["landmark"].numpy().astype(int)
@@ -343,8 +418,21 @@ def evaluate_refiner(model, loader, base_dataset, split_indices, device, args):
             experts[pos, lm_idx] = expert_np[row_i]
             stage1_centers[pos, lm_idx] = centers_np[row_i]
             log_vars[pos, lm_idx] = float(log_var[row_i].cpu())
-            nearest = np.linalg.norm(patch_points[row_i] - final[row_i][None, :], axis=1).argmin()
-            snapped_pred[pos, lm_idx] = patch_points[row_i, nearest]
+            if args.eval_coordinate_mode == "topk_heatmap":
+                projected_source = numpy_topk_patch_coordinate(
+                    logits_np[row_i],
+                    patch_points[row_i],
+                    topk=args.eval_topk,
+                    temperature=args.heatmap_temperature,
+                )
+            else:
+                projected_source = final[row_i]
+            snapped_pred[pos, lm_idx] = project_to_patch_surface(
+                projected_source,
+                patch_points[row_i],
+                mode=args.projection_mode,
+                topk=args.projection_topk,
+            )
     raw_errors = np.linalg.norm(raw_pred - experts, axis=-1)
     snapped_errors = np.linalg.norm(snapped_pred - experts, axis=-1)
     stage1_errors = np.linalg.norm(stage1_centers - experts, axis=-1)
@@ -438,6 +526,13 @@ def save_refiner_outputs(output_dir, args, dataset, split_indices, eval_rows, ra
         "stage1_center": args.stage1_center,
         "patch_points": args.patch_points,
         "patch_radius_mm": args.patch_radius_mm,
+        "patch_heatmap_sigma_mm": args.patch_heatmap_sigma_mm,
+        "final_mode": args.final_mode,
+        "heatmap_refine_weight": args.heatmap_refine_weight,
+        "eval_coordinate_mode": args.eval_coordinate_mode,
+        "eval_topk": args.eval_topk,
+        "projection_mode": args.projection_mode,
+        "projection_topk": args.projection_topk,
         "stage2_raw": summarize_errors(raw_errors),
         "stage2_snapped": summarize_errors(snapped_errors),
         "stage1_center_baseline": summarize_errors(stage1_errors),
@@ -475,6 +570,7 @@ def main():
     parser.add_argument("--midline-indices", default="0,5,6,9,18")
     parser.add_argument("--patch-points", type=int, default=512)
     parser.add_argument("--patch-radius-mm", type=float, default=12.0)
+    parser.add_argument("--patch-heatmap-sigma-mm", type=float, default=3.0)
     parser.add_argument("--center-jitter-mm", type=float, default=1.5)
     parser.add_argument("--point-noise-mm", type=float, default=0.1)
     parser.add_argument("--point-dropout", type=float, default=0.05)
@@ -482,6 +578,16 @@ def main():
     parser.add_argument("--landmark-embedding-dim", type=int, default=32)
     parser.add_argument("--refiner-dropout", type=float, default=0.1)
     parser.add_argument("--residual-limit-mm", type=float, default=12.0)
+    parser.add_argument("--final-mode", choices=["heatmap_delta", "center_delta", "heatmap_only"], default="center_delta")
+    parser.add_argument("--heatmap-refine-weight", type=float, default=0.25)
+    parser.add_argument("--heatmap-temperature", type=float, default=1.0)
+    parser.add_argument("--patch-heatmap-weight", type=float, default=0.25)
+    parser.add_argument("--patch-heatmap-positive-weight", type=float, default=20.0)
+    parser.add_argument("--patch-heatmap-ce-weight", type=float, default=0.05)
+    parser.add_argument("--eval-coordinate-mode", choices=["raw_final", "topk_heatmap"], default="raw_final")
+    parser.add_argument("--eval-topk", type=int, default=30)
+    parser.add_argument("--projection-mode", choices=["nearest", "topk_distance", "none"], default="topk_distance")
+    parser.add_argument("--projection-topk", type=int, default=5)
     parser.add_argument("--landmark-weighting", choices=["none", "train_error"], default="train_error")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--patience", type=int, default=25)
@@ -568,13 +674,36 @@ def main():
         stage1_all,
         patch_points=args.patch_points,
         patch_radius_mm=args.patch_radius_mm,
+        heatmap_sigma_mm=args.patch_heatmap_sigma_mm,
         center_jitter_mm=args.center_jitter_mm,
         point_noise_mm=args.point_noise_mm,
         point_dropout=args.point_dropout,
         seed=args.seed,
     )
-    val_ds = Stage2PatchDataset(dataset, val_idx, stage1_all, args.patch_points, args.patch_radius_mm, 0.0, 0.0, 0.0, args.seed)
-    test_ds = Stage2PatchDataset(dataset, test_idx, stage1_all, args.patch_points, args.patch_radius_mm, 0.0, 0.0, 0.0, args.seed)
+    val_ds = Stage2PatchDataset(
+        dataset,
+        val_idx,
+        stage1_all,
+        args.patch_points,
+        args.patch_radius_mm,
+        0.0,
+        0.0,
+        0.0,
+        args.patch_heatmap_sigma_mm,
+        args.seed,
+    )
+    test_ds = Stage2PatchDataset(
+        dataset,
+        test_idx,
+        stage1_all,
+        args.patch_points,
+        args.patch_radius_mm,
+        0.0,
+        0.0,
+        0.0,
+        args.patch_heatmap_sigma_mm,
+        args.seed,
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)

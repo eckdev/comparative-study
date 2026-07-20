@@ -95,7 +95,7 @@ Bellek yetmezse sırasıyla `--batch-size 1`, sonra `--surface-points 8192`, son
 
 ## Stage 2 Lokal Refiner
 
-Stage 2, tamamlanmış AGH-Former v2 checkpoint'ini sabit Stage 1 olarak kullanır. Her landmark için Stage 1 snapped tahmini çevresinden lokal patch çıkarır ve yalnızca residual düzeltme öğrenir:
+Stage 2, tamamlanmış AGH-Former v2 checkpoint'ini sabit Stage 1 olarak kullanır. Her landmark için Stage 1 snapped tahmini çevresinden lokal patch çıkarır. v4 sürümünde refiner, residual düzeltmeye ek olarak patch içinde lokal heatmap yardımcı görevi öğrenir ve tek nokta snap yerine top-k surface projection kullanır:
 
 ```text
 stage2_prediction = stage1_prediction + predicted_delta
@@ -116,16 +116,23 @@ python -u run_aghformer_stage2_refiner.py \
   --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json \
   --transformation-dir ../palnet_orthodontic_comparison/transforms/orthodontic_procrustes_rigid_20260627_143801 \
   --stage1-run-dir runs/aghformer_v2_template_p12000_w192_b4_e220 \
-  --output-dir runs/aghformer_v3_stage2_refiner_p12000 \
+  --output-dir runs/aghformer_v4_stage2_heatmap_refiner_p12000 \
   --surface-points 12000 \
   --patch-points 1024 \
   --patch-radius-mm 18 \
+  --patch-heatmap-sigma-mm 3.0 \
   --stage1-center snapped \
   --epochs 160 \
   --patience 30 \
   --batch-size 256 \
   --refiner-width 192 \
   --landmark-embedding-dim 48 \
+  --final-mode center_delta \
+  --patch-heatmap-weight 0.25 \
+  --patch-heatmap-positive-weight 20 \
+  --patch-heatmap-ce-weight 0.05 \
+  --projection-mode topk_distance \
+  --projection-topk 5 \
   --center-jitter-mm 1.5 \
   --point-noise-mm 0.1 \
   --point-dropout 0.05 \
