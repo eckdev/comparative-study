@@ -35,6 +35,7 @@ def main():
             "stage2_raw",
             "stage2_raw_fine",
             "stage2_wide_hard",
+            "hard_postprocess",
             "stage2_smoke",
         ],
         default="smoke",
@@ -46,6 +47,7 @@ def main():
     parser.add_argument("--transformation-dir", default=str(TRANSFORM_DIR))
     parser.add_argument("--run-root", default=str(RUN_ROOT))
     parser.add_argument("--stage1-run-dir", default=None)
+    parser.add_argument("--base-run-dir", default=None)
     args = parser.parse_args()
 
     root = repo_root(args.repo_root)
@@ -296,6 +298,43 @@ def main():
             "24",
             "--device",
             args.device,
+        ]
+        if use_transforms:
+            cmd.extend(["--transformation-dir", str(transform_dir)])
+    elif args.preset == "hard_postprocess":
+        base_run_dir = Path(args.base_run_dir) if args.base_run_dir else run_root / "aghformer_v6_stage2_raw_fine_refiner_p12000"
+        cmd = [
+            sys.executable,
+            "-u",
+            str(work_dir / "hard_landmark_postprocess.py"),
+            "--base-run-dir",
+            str(base_run_dir),
+            "--data-root",
+            str(data_root),
+            "--splits-json",
+            str(splits_json),
+            "--output-dir",
+            str(run_root / "aghformer_v9_hard_landmark_postprocess_v6"),
+            "--hard-landmarks",
+            "0,21,22",
+            "--stage1-center",
+            "snapped",
+            "--source-prefix",
+            "stage2_raw",
+            "--surface-points",
+            "12000",
+            "--candidate-radius-mm",
+            "18",
+            "--stage1-radius-mm",
+            "22",
+            "--max-candidates",
+            "384",
+            "--num-neighbors",
+            "8",
+            "--min-cov-variance",
+            "1.0",
+            "--min-val-improvement-mm",
+            "0.0",
         ]
         if use_transforms:
             cmd.extend(["--transformation-dir", str(transform_dir)])

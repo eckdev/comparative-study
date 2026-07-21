@@ -145,6 +145,27 @@ Stage 2 smoke test:
 python -u colab_run_aghformer_shared_metrics.py --preset stage2_smoke
 ```
 
+## LM0/21/22 Hard Landmark Postprocess
+
+AGH-Former v6 sonucu korunur; yalnızca `LM0`, `LM21`, `LM22` için validasyonla seçilen yüzey adayları denenir. Bu adım yeniden eğitim yapmaz.
+
+Colab preset:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py --preset hard_postprocess
+```
+
+Manuel çalıştırma:
+
+```bash
+python -u hard_landmark_postprocess.py \
+  --base-run-dir /content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v6_stage2_raw_fine_refiner_p12000 \
+  --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --splits-json /content/comparative-study/shared_splits/orthodontic_180_60_60_seed42.json \
+  --transformation-dir /content/drive/MyDrive/orthodontic/transforms/orthodontic_procrustes_rigid_20260627_143801 \
+  --output-dir /content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v9_hard_landmark_postprocess_v6
+```
+
 ## Evaluate-only
 
 ```bash
@@ -184,3 +205,5 @@ python -u run_orthodontic_aghformer.py \
 - `best_refiner.pth`: Stage 2 lokal refiner checkpoint.
 - `refined_predictions_test.csv`: Stage 2 nihai test tahminleri.
 - `metrics_refined.json`: Stage 2 raw/snapped ALE, PCK ve detaylı analizler.
+- `metrics_hard_postprocess.json`: LM0/21/22 aday seçimi sonrası v6 ile karşılaştırmalı sonuç.
+- `hard_postprocess_predictions_test.csv`: hard landmark postprocess sonrası test tahminleri.
