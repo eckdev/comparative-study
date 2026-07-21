@@ -166,6 +166,22 @@ python -u hard_landmark_postprocess.py \
   --output-dir /content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v9_hard_landmark_postprocess_v6
 ```
 
+## Stage 3 Mid-Landmark Fine Refiner
+
+AGH-Former v6 sonucu base alınır. `LM2`, `LM10`, `LM11`, `LM12`, `LM13`, `LM16`, `LM19`, `LM20` için küçük residual refiner eğitilir. Finalde yalnızca validasyonda iyileşen landmarklar testte değiştirilir.
+
+Colab preset:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py --preset stage3_mid
+```
+
+Ana çıktı klasörü:
+
+```text
+/content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v11_stage3_mid_refiner_v6
+```
+
 ## Evaluate-only
 
 ```bash
@@ -207,3 +223,5 @@ python -u run_orthodontic_aghformer.py \
 - `metrics_refined.json`: Stage 2 raw/snapped ALE, PCK ve detaylı analizler.
 - `metrics_hard_postprocess.json`: LM0/21/22 aday seçimi sonrası v6 ile karşılaştırmalı sonuç.
 - `hard_postprocess_predictions_test.csv`: hard landmark postprocess sonrası test tahminleri.
+- `metrics_stage3.json`: Stage 3 base, all-target ve validation-gated test sonuçları.
+- `stage3_predictions_test.csv`: Stage 3 öncesi/sonrası test tahminleri.
