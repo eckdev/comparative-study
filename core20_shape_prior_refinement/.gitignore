@@ -1,5 +1,5 @@
 runs/
-core20_2p5d_*/
+shape_prior_*/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
