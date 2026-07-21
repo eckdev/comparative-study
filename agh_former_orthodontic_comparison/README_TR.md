@@ -176,10 +176,17 @@ Colab preset:
 python -u colab_run_aghformer_shared_metrics.py --preset stage3_mid
 ```
 
+LM0/21/22 dışındaki 20 landmark için daha geniş hedefli Stage 3:
+
+```bash
+python -u colab_run_aghformer_shared_metrics.py --preset stage3_core20
+```
+
 Ana çıktı klasörü:
 
 ```text
 /content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v11_stage3_mid_refiner_v6
+/content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v12_stage3_core20_refiner_v6
 ```
 
 ## Evaluate-only

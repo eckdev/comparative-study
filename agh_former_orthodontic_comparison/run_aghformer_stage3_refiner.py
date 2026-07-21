@@ -57,6 +57,11 @@ def summarize(errors):
     return out
 
 
+def summarize_subset(errors, landmarks):
+    arr = np.asarray(errors, dtype=np.float64)[:, list(landmarks)]
+    return summarize(arr.reshape((arr.shape[0], len(landmarks))))
+
+
 def load_json(path, default=None):
     path = Path(path)
     if not path.exists():
@@ -725,6 +730,10 @@ def main():
         "base_test": summarize(test_base_errors),
         "stage3_all_target_test": summarize(test_stage3_errors),
         "stage3_gated_test": summarize(test_final_errors),
+        "base_target_landmarks_test": summarize_subset(test_base_errors, target_landmarks),
+        "stage3_gated_target_landmarks_test": summarize_subset(test_final_errors, target_landmarks),
+        "base_core20_test": summarize_subset(test_base_errors, [idx for idx in range(23) if idx not in {0, 21, 22}]),
+        "stage3_gated_core20_test": summarize_subset(test_final_errors, [idx for idx in range(23) if idx not in {0, 21, 22}]),
     }
     (output_dir / "metrics_stage3.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print("\nEvaluation against expert orthodontist landmarks", flush=True)

@@ -1,4 +1,6 @@
 runs/
+aghformer_v6_stage2_raw_fine_refiner_p12000/
+aghformer_v11_stage3_mid_refiner_v6/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
