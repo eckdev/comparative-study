@@ -8,6 +8,7 @@ Ana fikir:
 - Hedef: uzman landmarklarına göre residual vektörleri.
 - Model: kapalı-form ridge regression + validation ile seçilen shrinkage.
 - Seçim: validation setinde iyileşen landmarklar testte gated olarak aktif edilir.
+- Varsayılan final protokolü: `shape_prior`. Yani tüm anatomik residual kalibrasyonu uygulanır; `gated` sonuç ayrıca raporlanır.
 
 Bu yöntem küçük veri setlerinde derin lokal refiner yerine daha kontrollüdür; overfit riski ridge katsayısı ve shrinkage ile sınırlanır.
 
@@ -42,8 +43,19 @@ Ana çıktılar:
 - `predictions_val.csv`
 - `predictions_test.csv`
 - `landmark_metrics_test.csv`
+- `landmark_metrics_val.csv`
 - `delta_analysis_shape_prior.csv`
+- `bootstrap_metrics.json`
+- `group_metrics_val.csv`
+- `group_metrics_test.csv`
 - `config_shape_prior.json`
+
+Sağlamlaştırma çıktıları:
+
+- Hasta-bazlı bootstrap CI: `bootstrap_metrics.json`
+- Landmark bazlı base / shape-prior / gated / selected karşılaştırması
+- Class I/II/III ve kadın/erkek grup metrikleri
+- Validation sweep: `sweep_validation.csv`
 
 Yerel v11 prediction CSV'leriyle doğrulama sonucu:
 
@@ -51,7 +63,10 @@ Yerel v11 prediction CSV'leriyle doğrulama sonucu:
 Base ALE: 2.5049
 Shape-prior all-target ALE: 2.3684
 Shape-prior gated ALE: 2.3789
-Core20 base/gated ALE: 2.1143 -> 2.0620
+Selected policy: shape_prior
+Selected median: 1.9124
+Core20 base/selected ALE: 2.1143 -> 2.0499
+All23 ALE delta CI95: [-0.1668, -0.1075]
 ```
 
 Core20-only koşu:

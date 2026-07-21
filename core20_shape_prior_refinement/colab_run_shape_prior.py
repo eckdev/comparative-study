@@ -27,7 +27,9 @@ def main():
     parser.add_argument("--target-landmarks", default="all")
     parser.add_argument("--gate-landmarks", default="all")
     parser.add_argument("--selection-metric", choices=["all", "core20", "target"], default="core20")
+    parser.add_argument("--final-policy", choices=["shape_prior", "gated"], default="shape_prior")
     parser.add_argument("--min-val-improvement-mm", default="0.0")
+    parser.add_argument("--bootstrap-iters", default="2000")
     args = parser.parse_args()
 
     work_dir = CODE_ROOT / "core20_shape_prior_refinement"
@@ -48,8 +50,12 @@ def main():
         args.gate_landmarks,
         "--selection-metric",
         args.selection_metric,
+        "--final-policy",
+        args.final_policy,
         "--min-val-improvement-mm",
         args.min_val_improvement_mm,
+        "--bootstrap-iters",
+        args.bootstrap_iters,
     ]
     print("Prediction dir:", prediction_dir, flush=True)
     print("Output dir:", output_dir, flush=True)

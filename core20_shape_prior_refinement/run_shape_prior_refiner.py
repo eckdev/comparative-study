@@ -1,7 +1,6 @@
 import argparse
 import csv
 import json
-import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -177,6 +176,50 @@ def summarize(errors):
     return out
 
 
+def summarize_difference(base_errors, candidate_errors):
+    base = np.asarray(base_errors, dtype=np.float64)
+    candidate = np.asarray(candidate_errors, dtype=np.float64)
+    diff = candidate.reshape(-1) - base.reshape(-1)
+    return {
+        "mean_delta_mm": float(diff.mean()),
+        "median_delta_mm": float(np.median(diff)),
+        "improved_fraction": float((diff < 0).mean()),
+        "worsened_fraction": float((diff > 0).mean()),
+    }
+
+
+def bootstrap_comparison(base_errors, candidate_errors, landmark_sets, n_boot=2000, seed=42):
+    base = np.asarray(base_errors, dtype=np.float64)
+    candidate = np.asarray(candidate_errors, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    sample_count = base.shape[0]
+    results = {}
+    for name, landmarks in landmark_sets.items():
+        landmarks = list(landmarks)
+        base_mean = float(base[:, landmarks].mean())
+        candidate_mean = float(candidate[:, landmarks].mean())
+        deltas = []
+        pck2_deltas = []
+        for _ in range(int(n_boot)):
+            idx = rng.integers(0, sample_count, size=sample_count)
+            b = base[idx][:, landmarks].reshape(-1)
+            c = candidate[idx][:, landmarks].reshape(-1)
+            deltas.append(float(c.mean() - b.mean()))
+            pck2_deltas.append(float((c <= 2.0).mean() - (b <= 2.0).mean()))
+        delta_arr = np.asarray(deltas, dtype=np.float64)
+        pck2_arr = np.asarray(pck2_deltas, dtype=np.float64)
+        results[name] = {
+            "base_ale": base_mean,
+            "candidate_ale": candidate_mean,
+            "delta_ale": candidate_mean - base_mean,
+            "delta_ale_ci95": [float(np.percentile(delta_arr, 2.5)), float(np.percentile(delta_arr, 97.5))],
+            "probability_candidate_better": float((delta_arr < 0).mean()),
+            "delta_pck_at_2mm": float((candidate[:, landmarks].reshape(-1) <= 2.0).mean() - (base[:, landmarks].reshape(-1) <= 2.0).mean()),
+            "delta_pck_at_2mm_ci95": [float(np.percentile(pck2_arr, 2.5)), float(np.percentile(pck2_arr, 97.5))],
+        }
+    return results
+
+
 def validation_gate(base_errors, pred_errors, target_landmarks, min_improvement):
     enabled = []
     for lm_idx in target_landmarks:
@@ -231,56 +274,82 @@ def write_prediction_csv(path, split, pred, final, enabled):
     write_rows(path, rows)
 
 
-def write_landmark_metrics(path, base_errors, pred_errors, final_errors, enabled):
+def write_landmark_metrics(path, base_errors, pred_errors, gated_errors, selected_errors, enabled):
     rows = []
     enabled_set = set(enabled)
     for lm_idx in range(23):
         base = base_errors[:, lm_idx]
         pred = pred_errors[:, lm_idx]
-        final = final_errors[:, lm_idx]
+        gated = gated_errors[:, lm_idx]
+        selected = selected_errors[:, lm_idx]
         rows.append(
             {
                 "landmark": lm_idx,
                 "enabled": lm_idx in enabled_set,
                 "base_ale": float(base.mean()),
                 "shape_prior_ale": float(pred.mean()),
-                "final_ale": float(final.mean()),
-                "final_delta": float(final.mean() - base.mean()),
+                "gated_ale": float(gated.mean()),
+                "selected_ale": float(selected.mean()),
+                "shape_prior_delta": float(pred.mean() - base.mean()),
+                "gated_delta": float(gated.mean() - base.mean()),
+                "selected_delta": float(selected.mean() - base.mean()),
                 "base_median": float(np.median(base)),
-                "final_median": float(np.median(final)),
+                "shape_prior_median": float(np.median(pred)),
+                "gated_median": float(np.median(gated)),
+                "selected_median": float(np.median(selected)),
                 "base_pck_at_2mm": float((base <= 2.0).mean()),
-                "final_pck_at_2mm": float((final <= 2.0).mean()),
+                "shape_prior_pck_at_2mm": float((pred <= 2.0).mean()),
+                "gated_pck_at_2mm": float((gated <= 2.0).mean()),
+                "selected_pck_at_2mm": float((selected <= 2.0).mean()),
                 "base_pck_at_2_5mm": float((base <= 2.5).mean()),
-                "final_pck_at_2_5mm": float((final <= 2.5).mean()),
+                "shape_prior_pck_at_2_5mm": float((pred <= 2.5).mean()),
+                "gated_pck_at_2_5mm": float((gated <= 2.5).mean()),
+                "selected_pck_at_2_5mm": float((selected <= 2.5).mean()),
                 "base_pck_at_3mm": float((base <= 3.0).mean()),
-                "final_pck_at_3mm": float((final <= 3.0).mean()),
-                "improved_count": int((final < base).sum()),
-                "worsened_count": int((final > base).sum()),
+                "shape_prior_pck_at_3mm": float((pred <= 3.0).mean()),
+                "gated_pck_at_3mm": float((gated <= 3.0).mean()),
+                "selected_pck_at_3mm": float((selected <= 3.0).mean()),
+                "shape_prior_improved_count": int((pred < base).sum()),
+                "shape_prior_worsened_count": int((pred > base).sum()),
+                "selected_improved_count": int((selected < base).sum()),
+                "selected_worsened_count": int((selected > base).sum()),
                 "n": int(len(base)),
             }
         )
     write_rows(path, rows)
 
 
-def class_gender_metrics(split, errors):
-    grouped = defaultdict(list)
+def class_gender_metrics(split, base_errors, pred_errors, gated_errors, selected_errors):
+    grouped = defaultdict(lambda: {"base": [], "shape_prior": [], "gated": [], "selected": []})
     for sample_pos, sample_id in enumerate(split["sample_ids"]):
         meta = split["metadata"][sample_id]
-        grouped[("class", meta.get("class", ""))].extend(errors[sample_pos].tolist())
-        grouped[("gender", meta.get("gender", ""))].extend(errors[sample_pos].tolist())
+        for key in [("class", meta.get("class", "")), ("gender", meta.get("gender", ""))]:
+            grouped[key]["base"].extend(base_errors[sample_pos].tolist())
+            grouped[key]["shape_prior"].extend(pred_errors[sample_pos].tolist())
+            grouped[key]["gated"].extend(gated_errors[sample_pos].tolist())
+            grouped[key]["selected"].extend(selected_errors[sample_pos].tolist())
     rows = []
     for (group_type, group), values in sorted(grouped.items()):
-        arr = np.asarray(values, dtype=np.float64)
+        base = np.asarray(values["base"], dtype=np.float64)
+        pred = np.asarray(values["shape_prior"], dtype=np.float64)
+        gated = np.asarray(values["gated"], dtype=np.float64)
+        selected = np.asarray(values["selected"], dtype=np.float64)
         rows.append(
             {
                 "group_type": group_type,
                 "group": group,
-                "ale": float(arr.mean()),
-                "median": float(np.median(arr)),
-                "pck_at_2mm": float((arr <= 2.0).mean()),
-                "pck_at_2_5mm": float((arr <= 2.5).mean()),
-                "pck_at_3mm": float((arr <= 3.0).mean()),
-                "n": int(len(arr)),
+                "base_ale": float(base.mean()),
+                "shape_prior_ale": float(pred.mean()),
+                "gated_ale": float(gated.mean()),
+                "selected_ale": float(selected.mean()),
+                "shape_prior_delta": float(pred.mean() - base.mean()),
+                "gated_delta": float(gated.mean() - base.mean()),
+                "selected_delta": float(selected.mean() - base.mean()),
+                "selected_median": float(np.median(selected)),
+                "selected_pck_at_2mm": float((selected <= 2.0).mean()),
+                "selected_pck_at_2_5mm": float((selected <= 2.5).mean()),
+                "selected_pck_at_3mm": float((selected <= 3.0).mean()),
+                "n": int(len(base)),
             }
         )
     return rows
@@ -296,8 +365,11 @@ def main():
     parser.add_argument("--l2-grid", default="0.01,0.03,0.1,0.3,1,3,10,30,100,300,1000")
     parser.add_argument("--shrinkage-grid", default="0.05,0.1,0.15,0.2,0.3,0.5,0.75,1.0")
     parser.add_argument("--selection-metric", choices=["all", "core20", "target"], default="core20")
+    parser.add_argument("--final-policy", choices=["shape_prior", "gated"], default="shape_prior")
     parser.add_argument("--min-val-improvement-mm", type=float, default=0.0)
     parser.add_argument("--max-residual-mm", type=float, default=8.0)
+    parser.add_argument("--bootstrap-iters", type=int, default=2000)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -363,13 +435,34 @@ def main():
     test_final = apply_gate(test["base"], test_pred, enabled)
     val_final_errors = np.linalg.norm(val_final - val["expert"], axis=-1)
     test_final_errors = np.linalg.norm(test_final - test["expert"], axis=-1)
+    if args.final_policy == "shape_prior":
+        val_selected = val_pred
+        test_selected = test_pred
+    else:
+        val_selected = val_final
+        test_selected = test_final
+    val_selected_errors = np.linalg.norm(val_selected - val["expert"], axis=-1)
+    test_selected_errors = np.linalg.norm(test_selected - test["expert"], axis=-1)
 
-    write_prediction_csv(output_dir / "predictions_val.csv", val, val_pred, val_final, enabled)
-    write_prediction_csv(output_dir / "predictions_test.csv", test, test_pred, test_final, enabled)
-    write_landmark_metrics(output_dir / "landmark_metrics_test.csv", test_base_errors, test_pred_errors, test_final_errors, enabled)
+    write_prediction_csv(output_dir / "predictions_val.csv", val, val_pred, val_selected, enabled)
+    write_prediction_csv(output_dir / "predictions_test.csv", test, test_pred, test_selected, enabled)
+    write_landmark_metrics(output_dir / "landmark_metrics_val.csv", val_base_errors, val_pred_errors, val_final_errors, val_selected_errors, enabled)
+    write_landmark_metrics(output_dir / "landmark_metrics_test.csv", test_base_errors, test_pred_errors, test_final_errors, test_selected_errors, enabled)
     write_rows(output_dir / "delta_analysis_shape_prior.csv", read_rows(output_dir / "landmark_metrics_test.csv"))
-    write_rows(output_dir / "group_metrics_test.csv", class_gender_metrics(test, test_final_errors))
+    write_rows(output_dir / "group_metrics_val.csv", class_gender_metrics(val, val_base_errors, val_pred_errors, val_final_errors, val_selected_errors))
+    write_rows(output_dir / "group_metrics_test.csv", class_gender_metrics(test, test_base_errors, test_pred_errors, test_final_errors, test_selected_errors))
     write_rows(output_dir / "sweep_validation.csv", sweep_rows)
+    landmark_sets = {
+        "all23": list(range(23)),
+        "core20": CORE20,
+        "hard_landmarks": sorted(HARD_LANDMARKS),
+    }
+    bootstrap = {
+        "shape_prior_vs_base": bootstrap_comparison(test_base_errors, test_pred_errors, landmark_sets, args.bootstrap_iters, args.seed),
+        "gated_vs_base": bootstrap_comparison(test_base_errors, test_final_errors, landmark_sets, args.bootstrap_iters, args.seed + 1),
+        "selected_vs_base": bootstrap_comparison(test_base_errors, test_selected_errors, landmark_sets, args.bootstrap_iters, args.seed + 2),
+    }
+    (output_dir / "bootstrap_metrics.json").write_text(json.dumps(bootstrap, indent=2), encoding="utf-8")
 
     metrics = {
         "model": "Shape-prior residual refiner",
@@ -378,18 +471,29 @@ def main():
         "target_landmarks": target_landmarks,
         "gate_landmarks": gate_landmarks,
         "selection_metric": args.selection_metric,
+        "final_policy": args.final_policy,
         "best_l2": float(best["l2"]),
         "best_shrinkage": float(best["shrinkage"]),
         "enabled_landmarks": enabled,
         "base_validation": summarize(val_base_errors),
         "shape_prior_validation": summarize(val_pred_errors),
         "gated_validation": summarize(val_final_errors),
+        "selected_validation": summarize(val_selected_errors),
+        "shape_prior_vs_base_validation": summarize_difference(val_base_errors, val_pred_errors),
+        "gated_vs_base_validation": summarize_difference(val_base_errors, val_final_errors),
+        "selected_vs_base_validation": summarize_difference(val_base_errors, val_selected_errors),
         "base_test": summarize(test_base_errors),
         "shape_prior_test": summarize(test_pred_errors),
         "gated_test": summarize(test_final_errors),
+        "selected_test": summarize(test_selected_errors),
+        "shape_prior_vs_base_test": summarize_difference(test_base_errors, test_pred_errors),
+        "gated_vs_base_test": summarize_difference(test_base_errors, test_final_errors),
+        "selected_vs_base_test": summarize_difference(test_base_errors, test_selected_errors),
         "base_core20_test": summarize(test_base_errors[:, CORE20]),
         "shape_prior_core20_test": summarize(test_pred_errors[:, CORE20]),
         "gated_core20_test": summarize(test_final_errors[:, CORE20]),
+        "selected_core20_test": summarize(test_selected_errors[:, CORE20]),
+        "bootstrap": bootstrap,
     }
     (output_dir / "metrics_shape_prior.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     config = {key: value for key, value in vars(args).items()}
@@ -400,8 +504,12 @@ def main():
     print(f"Base ALE: {metrics['base_test']['ale']:.4f}", flush=True)
     print(f"Shape-prior all-target ALE: {metrics['shape_prior_test']['ale']:.4f}", flush=True)
     print(f"Shape-prior gated ALE: {metrics['gated_test']['ale']:.4f}", flush=True)
-    print(f"Shape-prior gated median: {metrics['gated_test']['median']:.4f}", flush=True)
-    print(f"Core20 base/gated ALE: {metrics['base_core20_test']['ale']:.4f} -> {metrics['gated_core20_test']['ale']:.4f}", flush=True)
+    print(f"Selected policy ({args.final_policy}) ALE: {metrics['selected_test']['ale']:.4f}", flush=True)
+    print(f"Selected median: {metrics['selected_test']['median']:.4f}", flush=True)
+    print(f"Core20 base/selected ALE: {metrics['base_core20_test']['ale']:.4f} -> {metrics['selected_core20_test']['ale']:.4f}", flush=True)
+    ci = metrics["bootstrap"]["selected_vs_base"]["all23"]["delta_ale_ci95"]
+    prob = metrics["bootstrap"]["selected_vs_base"]["all23"]["probability_candidate_better"]
+    print(f"Selected ALE delta CI95: [{ci[0]:.4f}, {ci[1]:.4f}], P(improved)={prob:.3f}", flush=True)
     print(f"Best l2={best['l2']} shrinkage={best['shrinkage']}", flush=True)
     print(f"Enabled landmarks: {enabled}", flush=True)
     print(f"Results saved to: {output_dir}", flush=True)
