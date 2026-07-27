@@ -1,0 +1,6 @@
+runs/
+atlas_spnet_runs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+point_cache/
