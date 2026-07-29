@@ -16,7 +16,14 @@ Colab çalıştırma:
 
 ```bash
 cd /content/comparative-study/core20_shape_prior_refinement
+python -m pip install -q -r requirements.txt
 python -u colab_run_shape_prior.py
+```
+
+Runner seçilen AGH prediction klasöründe `refined_predictions_train.csv` bulamazsa önce bunu otomatik üretir. Bu, mevcut AGH Stage2 `best_refiner.pth` checkpoint'i ile train split inference yapar; yeniden model eğitimi başlatmaz. Bu davranışı kapatmak için:
+
+```bash
+python -u colab_run_shape_prior.py --skip-refined-train-export
 ```
 
 Yalnızca core20 düzeltmesi için:

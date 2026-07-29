@@ -27,7 +27,7 @@ aghformer_v6_stage2_raw_fine_refiner_p12000/refined_predictions_test.csv
 aghformer_v6_stage2_raw_fine_refiner_p12000/stage1_point_cache/
 ```
 
-Not: v6 klasöründe `refined_predictions_train.csv` olmadığı için train splitinde stage1 prediction kullanılır. Val/test tarafında stage2 refined prediction kullanılır. Daha adil bir koşu için ileride stage2 train prediction üretmek daha doğru olur.
+Not: v6 klasöründe `refined_predictions_train.csv` yoksa Colab runner bunu otomatik üretir. Böylece train/val/test tarafında aynı Stage2 refined tahmin seviyesi kullanılır. Bu adım yeniden eğitim değildir; mevcut `best_refiner.pth` checkpoint'i ile train split inference yapar.
 
 ## Hızlı Çalıştırma
 
@@ -91,13 +91,23 @@ Test oracle PCK@2mm:   ~90%
 
 Bu, sorunun mesh içinde doğru adayın olmaması değil, doğru adayın seçilememesi olduğunu gösterir. Bu nedenle specialist candidate-scoring yaklaşımı mühendislik olarak anlamlıdır.
 
-Mini CPU smoke koşusu yalnız teknik doğrulama içindir. v6 klasöründe `refined_predictions_train.csv` bulunmadığı için default train kaynağı `stage1_predictions_train.csv`, val/test kaynağı ise stage2 refined prediction dosyalarıdır. Bu dağılım farkı HardNet kazancını sınırlayabilir.
+Mini CPU smoke koşusu yalnız teknik doğrulama içindir. Güncel runner train/val/test dağılım farkını otomatik kapatır: v6 klasöründe `refined_predictions_train.csv` eksikse önce şu dosya oluşturulur:
+
+```text
+aghformer_v6_stage2_raw_fine_refiner_p12000/refined_predictions_train.csv
+```
+
+Bu hazırlığı bilinçli olarak atlamak için:
+
+```bash
+python -u colab_run_agh_hardnet.py --preset full --skip-refined-train-export
+```
 
 En doğru ana deney için önerilen sıra:
 
 ```text
 1. Oracle preset'i çalıştır ve candidate coverage'i doğrula.
-2. Mümkünse AGH Stage2 train predictions üret.
+2. AGH Stage2 train predictions dosyasının otomatik üretildiğini doğrula.
 3. Önce full preset ile hard3 ortak modelini çalıştır.
 4. Sonra trichion ve gonion specialist presetlerini ayrı çalıştır.
 5. Merged specialist sonucu ile full sonucunu validasyon/testte karşılaştır.

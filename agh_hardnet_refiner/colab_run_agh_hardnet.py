@@ -64,12 +64,42 @@ def main():
     parser.add_argument("--agh-run", type=Path, default=DEFAULT_AGH_RUN)
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--run-root", type=Path, default=RUN_ROOT)
+    parser.add_argument("--splits-json", type=Path, default=CODE_ROOT / "shared_splits" / "orthodontic_180_60_60_seed42.json")
+    parser.add_argument(
+        "--transformation-dir",
+        type=Path,
+        default=DRIVE_ROOT / "transforms" / "orthodontic_procrustes_rigid_20260627_143801",
+    )
+    parser.add_argument("--skip-refined-train-export", action="store_true")
     args = parser.parse_args()
 
     work_dir = CODE_ROOT / "agh_hardnet_refiner"
     args.agh_run = resolve_agh_run(args.agh_run)
     print("AGH_RUN:", args.agh_run, flush=True)
     refined_train_csv = args.agh_run / "refined_predictions_train.csv"
+    if args.preset != "oracle" and not refined_train_csv.exists() and not args.skip_refined_train_export:
+        export_script = CODE_ROOT / "agh_former_orthodontic_comparison" / "export_stage2_train_predictions.py"
+        export_cmd = [
+            sys.executable,
+            "-u",
+            str(export_script),
+            "--stage2-run-dir",
+            str(args.agh_run),
+            "--data-root",
+            str(args.data_root),
+            "--splits-json",
+            str(args.splits_json),
+            "--device",
+            "auto",
+            "--eval-batch-size",
+            "256",
+        ]
+        if args.transformation_dir.exists():
+            export_cmd += ["--transformation-dir", str(args.transformation_dir)]
+        print("refined_predictions_train.csv not found; exporting it first.", flush=True)
+        print("Running:", " ".join(export_cmd), flush=True)
+        subprocess.run(export_cmd, cwd=str(CODE_ROOT / "agh_former_orthodontic_comparison"), check=True)
+
     train_csv = refined_train_csv if refined_train_csv.exists() else args.agh_run / "stage1_predictions_train.csv"
     print("TRAIN_PRED_CSV:", train_csv, flush=True)
     val_csv = args.agh_run / "refined_predictions_val.csv"
