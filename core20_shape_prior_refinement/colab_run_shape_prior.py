@@ -34,6 +34,10 @@ def main():
     )
     parser.add_argument("--target-landmarks", default="all")
     parser.add_argument("--gate-landmarks", default="all")
+    parser.add_argument("--feature-mode", choices=["flat", "flat_meta", "full"], default="full")
+    parser.add_argument("--calibration-mode", choices=["global", "per_landmark"], default="global")
+    parser.add_argument("--l2-grid", default="0.01,0.03,0.1,0.3,1,3,10,30,100,300,1000")
+    parser.add_argument("--shrinkage-grid", default="0.05,0.1,0.15,0.2,0.3,0.4,0.5,0.6,0.75,0.9,1.0")
     parser.add_argument("--selection-metric", choices=["all", "core20", "target"], default="core20")
     parser.add_argument("--final-policy", choices=["shape_prior", "gated"], default="shape_prior")
     parser.add_argument("--min-val-improvement-mm", default="0.0")
@@ -80,6 +84,14 @@ def main():
         args.target_landmarks,
         "--gate-landmarks",
         args.gate_landmarks,
+        "--feature-mode",
+        args.feature_mode,
+        "--calibration-mode",
+        args.calibration_mode,
+        "--l2-grid",
+        args.l2_grid,
+        "--shrinkage-grid",
+        args.shrinkage_grid,
         "--selection-metric",
         args.selection_metric,
         "--final-policy",

@@ -121,13 +121,13 @@ def pairwise_distance_features(points, pairs):
     return np.stack(feats, axis=1)
 
 
-def build_features(split, normalizer=None):
+def build_features(split, normalizer=None, feature_mode="full"):
     points = split["base"]
     flat = points.reshape(len(points), -1)
     if normalizer is None:
         mean = flat.mean(axis=0)
         std = flat.std(axis=0) + 1e-6
-        normalizer = {"mean": mean, "std": std}
+        normalizer = {"mean": mean, "std": std, "feature_mode": feature_mode}
     flat_norm = (flat - normalizer["mean"]) / normalizer["std"]
     pairs = [
         (1, 2),
@@ -142,20 +142,134 @@ def build_features(split, normalizer=None):
         (19, 20),
         (21, 22),
     ]
-    distances = pairwise_distance_features(points, pairs)
-    if "distance_mean" not in normalizer:
-        normalizer["distance_mean"] = distances.mean(axis=0)
-        normalizer["distance_std"] = distances.std(axis=0) + 1e-6
-    distance_norm = (distances - normalizer["distance_mean"]) / normalizer["distance_std"]
-    meta = metadata_features(split["sample_ids"], split["metadata"])
     ones = np.ones((len(points), 1), dtype=np.float64)
-    return np.concatenate([ones, flat_norm, distance_norm, meta], axis=1), normalizer
+    parts = [ones, flat_norm]
+    if feature_mode == "full":
+        distances = pairwise_distance_features(points, pairs)
+        if "distance_mean" not in normalizer:
+            normalizer["distance_mean"] = distances.mean(axis=0)
+            normalizer["distance_std"] = distances.std(axis=0) + 1e-6
+        distance_norm = (distances - normalizer["distance_mean"]) / normalizer["distance_std"]
+        parts.append(distance_norm)
+    if feature_mode in {"full", "flat_meta"}:
+        meta = metadata_features(split["sample_ids"], split["metadata"])
+        parts.append(meta)
+    return np.concatenate(parts, axis=1), normalizer
 
 
 def ridge_fit(features, targets, l2):
     reg = float(l2) * np.eye(features.shape[1], dtype=np.float64)
     reg[0, 0] = 0.0
     return np.linalg.solve(features.T @ features + reg, features.T @ targets)
+
+
+def clipped_residual_prediction(base, residual, shrinkage, max_residual_mm):
+    residual_norm = np.linalg.norm(residual, axis=-1, keepdims=True)
+    scale = np.minimum(1.0, float(max_residual_mm) / np.maximum(residual_norm, 1e-8))
+    return base + float(shrinkage) * residual * scale
+
+
+def fit_global_calibration(
+    train_features,
+    val_features,
+    train,
+    val,
+    target_landmarks,
+    metric_landmarks,
+    l2_values,
+    shrinkage_values,
+    max_residual_mm,
+):
+    train_residual = train["expert"] - train["base"]
+    target_mask = np.zeros((23, 1), dtype=np.float64)
+    target_mask[target_landmarks] = 1.0
+    train_targets = (train_residual * target_mask[None]).reshape(len(train["base"]), -1)
+
+    best = None
+    sweep_rows = []
+    for l2 in l2_values:
+        weights = ridge_fit(train_features, train_targets, l2)
+        for shrinkage in shrinkage_values:
+            val_residual = (val_features @ weights).reshape(len(val["base"]), 23, 3)
+            val_residual = val_residual * target_mask[None]
+            val_pred = clipped_residual_prediction(val["base"], val_residual, shrinkage, max_residual_mm)
+            val_errors = np.linalg.norm(val_pred - val["expert"], axis=-1)
+            score = float(val_errors[:, metric_landmarks].mean())
+            sweep_rows.append({"landmark": "all", "l2": l2, "shrinkage": shrinkage, "validation_score": score})
+            if best is None or score < best["score"]:
+                best = {"score": score, "l2": float(l2), "shrinkage": float(shrinkage), "weights": weights}
+
+    def predict(split, features):
+        residual = (features @ best["weights"]).reshape(len(split["base"]), 23, 3)
+        residual = residual * target_mask[None]
+        return clipped_residual_prediction(split["base"], residual, best["shrinkage"], max_residual_mm)
+
+    return predict, best, sweep_rows
+
+
+def fit_per_landmark_calibration(train_features, val_features, train, val, target_landmarks, l2_values, shrinkage_values, max_residual_mm):
+    target_set = set(target_landmarks)
+    feature_dim = train_features.shape[1]
+    weights = np.zeros((23, feature_dim, 3), dtype=np.float64)
+    best_l2 = {}
+    best_shrinkage = {}
+    per_landmark_config = []
+    sweep_rows = []
+
+    for lm_idx in range(23):
+        if lm_idx not in target_set:
+            best_l2[lm_idx] = 0.0
+            best_shrinkage[lm_idx] = 0.0
+            per_landmark_config.append({"landmark": lm_idx, "l2": 0.0, "shrinkage": 0.0, "validation_score": None})
+            continue
+        train_target = train["expert"][:, lm_idx] - train["base"][:, lm_idx]
+        best = None
+        for l2 in l2_values:
+            lm_weights = ridge_fit(train_features, train_target, l2)
+            for shrinkage in shrinkage_values:
+                val_residual = val_features @ lm_weights
+                val_pred = clipped_residual_prediction(
+                    val["base"][:, lm_idx : lm_idx + 1],
+                    val_residual[:, None, :],
+                    shrinkage,
+                    max_residual_mm,
+                )[:, 0]
+                val_error = np.linalg.norm(val_pred - val["expert"][:, lm_idx], axis=-1)
+                score = float(val_error.mean())
+                sweep_rows.append({"landmark": lm_idx, "l2": l2, "shrinkage": shrinkage, "validation_score": score})
+                if best is None or score < best["score"]:
+                    best = {"score": score, "l2": float(l2), "shrinkage": float(shrinkage), "weights": lm_weights}
+        weights[lm_idx] = best["weights"]
+        best_l2[lm_idx] = best["l2"]
+        best_shrinkage[lm_idx] = best["shrinkage"]
+        per_landmark_config.append(
+            {
+                "landmark": lm_idx,
+                "l2": best["l2"],
+                "shrinkage": best["shrinkage"],
+                "validation_score": best["score"],
+            }
+        )
+
+    def predict(split, features):
+        pred = split["base"].copy()
+        for lm_idx in target_landmarks:
+            residual = features @ weights[lm_idx]
+            pred[:, lm_idx] = clipped_residual_prediction(
+                split["base"][:, lm_idx : lm_idx + 1],
+                residual[:, None, :],
+                best_shrinkage[lm_idx],
+                max_residual_mm,
+            )[:, 0]
+        return pred
+
+    best = {
+        "l2": {str(key): value for key, value in best_l2.items()},
+        "shrinkage": {str(key): value for key, value in best_shrinkage.items()},
+        "weights": weights,
+        "per_landmark_config": per_landmark_config,
+    }
+    return predict, best, sweep_rows
 
 
 def summarize(errors):
@@ -362,6 +476,8 @@ def main():
     parser.add_argument("--source-prefix", default="final")
     parser.add_argument("--target-landmarks", default="all")
     parser.add_argument("--gate-landmarks", default="all")
+    parser.add_argument("--feature-mode", choices=["flat", "flat_meta", "full"], default="full")
+    parser.add_argument("--calibration-mode", choices=["global", "per_landmark"], default="global")
     parser.add_argument("--l2-grid", default="0.01,0.03,0.1,0.3,1,3,10,30,100,300,1000")
     parser.add_argument("--shrinkage-grid", default="0.05,0.1,0.15,0.2,0.3,0.5,0.75,1.0")
     parser.add_argument("--selection-metric", choices=["all", "core20", "target"], default="core20")
@@ -380,6 +496,8 @@ def main():
     print(f"Prediction dir: {args.prediction_dir}", flush=True)
     print(f"Sources train/val/test: {train['path']} | {val['path']} | {test['path']}", flush=True)
     print(f"Coordinate prefix: {train['prefix']}", flush=True)
+    print(f"Feature mode: {args.feature_mode}", flush=True)
+    print(f"Calibration mode: {args.calibration_mode}", flush=True)
 
     target_landmarks = parse_ints(args.target_landmarks)
     gate_landmarks = parse_ints(args.gate_landmarks)
@@ -391,38 +509,33 @@ def main():
     l2_values = [float(value) for value in args.l2_grid.split(",") if value.strip()]
     shrinkage_values = [float(value) for value in args.shrinkage_grid.split(",") if value.strip()]
 
-    train_features, normalizer = build_features(train)
-    val_features, _ = build_features(val, normalizer)
-    test_features, _ = build_features(test, normalizer)
-    train_residual = train["expert"] - train["base"]
-    target_mask = np.zeros((23, 1), dtype=np.float64)
-    target_mask[target_landmarks] = 1.0
-    train_targets = (train_residual * target_mask[None]).reshape(len(train["base"]), -1)
+    train_features, normalizer = build_features(train, feature_mode=args.feature_mode)
+    val_features, _ = build_features(val, normalizer, feature_mode=args.feature_mode)
+    test_features, _ = build_features(test, normalizer, feature_mode=args.feature_mode)
 
-    best = None
-    sweep_rows = []
-    for l2 in l2_values:
-        weights = ridge_fit(train_features, train_targets, l2)
-        for shrinkage in shrinkage_values:
-            val_residual = (val_features @ weights).reshape(len(val["base"]), 23, 3)
-            residual_norm = np.linalg.norm(val_residual, axis=-1, keepdims=True)
-            scale = np.minimum(1.0, args.max_residual_mm / np.maximum(residual_norm, 1e-8))
-            val_pred = val["base"] + shrinkage * val_residual * scale
-            val_errors = np.linalg.norm(val_pred - val["expert"], axis=-1)
-            score = float(val_errors[:, metric_landmarks].mean())
-            row = {"l2": l2, "shrinkage": shrinkage, "validation_score": score}
-            sweep_rows.append(row)
-            if best is None or score < best["score"]:
-                best = {"score": score, "l2": l2, "shrinkage": shrinkage, "weights": weights}
-
-    weights = best["weights"]
-
-    def predict(split, features):
-        residual = (features @ weights).reshape(len(split["base"]), 23, 3)
-        residual = residual * target_mask[None]
-        residual_norm = np.linalg.norm(residual, axis=-1, keepdims=True)
-        scale = np.minimum(1.0, args.max_residual_mm / np.maximum(residual_norm, 1e-8))
-        return split["base"] + best["shrinkage"] * residual * scale
+    if args.calibration_mode == "global":
+        predict, best, sweep_rows = fit_global_calibration(
+            train_features,
+            val_features,
+            train,
+            val,
+            target_landmarks,
+            metric_landmarks,
+            l2_values,
+            shrinkage_values,
+            args.max_residual_mm,
+        )
+    else:
+        predict, best, sweep_rows = fit_per_landmark_calibration(
+            train_features,
+            val_features,
+            train,
+            val,
+            target_landmarks,
+            l2_values,
+            shrinkage_values,
+            args.max_residual_mm,
+        )
 
     val_pred = predict(val, val_features)
     test_pred = predict(test, test_features)
@@ -470,10 +583,13 @@ def main():
         "source_prefix": train["prefix"],
         "target_landmarks": target_landmarks,
         "gate_landmarks": gate_landmarks,
+        "feature_mode": args.feature_mode,
+        "calibration_mode": args.calibration_mode,
         "selection_metric": args.selection_metric,
         "final_policy": args.final_policy,
-        "best_l2": float(best["l2"]),
-        "best_shrinkage": float(best["shrinkage"]),
+        "best_l2": best["l2"],
+        "best_shrinkage": best["shrinkage"],
+        "per_landmark_config": best.get("per_landmark_config", []),
         "enabled_landmarks": enabled,
         "base_validation": summarize(val_base_errors),
         "shape_prior_validation": summarize(val_pred_errors),
