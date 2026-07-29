@@ -11,6 +11,12 @@ from torch.utils.data import Dataset
 
 HARD_LANDMARKS = (0, 21, 22)
 CORE20 = tuple(i for i in range(23) if i not in HARD_LANDMARKS)
+LANDMARK_SETS = {
+    "all": HARD_LANDMARKS,
+    "hard3": HARD_LANDMARKS,
+    "trichion": (0,),
+    "gonion": (21, 22),
+}
 NEIGHBORS = {
     0: (1, 2, 3, 4, 5),
     21: (17, 19, 13, 20, 22),
@@ -239,15 +245,26 @@ class HardLandmarkDataset(Dataset):
         patch_extra = extra[idxs]
         neigh = np.asarray(NEIGHBORS[lm], dtype=np.int64)
         neighbor_coords = sample.base[neigh].astype(np.float32)
+        midline = sample.base[:13].astype(np.float32)
+        midline_center = midline.mean(axis=0)
+        all_dist = np.linalg.norm(patch[:, None, :] - sample.base[None, :, :], axis=2) / 120.0
+        hard_dist = np.linalg.norm(patch[:, None, :] - sample.base[None, list(HARD_LANDMARKS), :], axis=2) / 120.0
         rel_center = (patch - center[None, :]) / max(radius, 1.0)
         dist_center = np.linalg.norm(patch - center[None, :], axis=1, keepdims=True) / max(radius, 1.0)
+        rel_midline = (patch - midline_center[None, :]) / 120.0
+        lateral_abs = np.abs(patch[:, :1] - midline_center[None, :1]) / 80.0
         neighbor_parts = []
         for coord in neighbor_coords:
             vec = (patch - coord[None, :]) / 80.0
             dist = np.linalg.norm(patch - coord[None, :], axis=1, keepdims=True) / 80.0
             neighbor_parts.extend([vec, dist])
-        cand_features = np.concatenate([rel_center, dist_center, patch_normals, patch_extra] + neighbor_parts, axis=1).astype(np.float32)
+        cand_features = np.concatenate(
+            [rel_center, dist_center, rel_midline, lateral_abs, all_dist, hard_dist, patch_normals, patch_extra]
+            + neighbor_parts,
+            axis=1,
+        ).astype(np.float32)
         dist_expert = np.linalg.norm(patch - expert[None, :], axis=1)
+        hard_target_idx = int(np.argmin(dist_expert))
         soft = np.exp(-(dist_expert**2) / (2.0 * self.sigma_mm**2)).astype(np.float32)
         if float(soft.sum()) <= 1e-12:
             soft[np.argmin(dist_expert)] = 1.0
@@ -255,7 +272,9 @@ class HardLandmarkDataset(Dataset):
         return {
             "candidate_features": torch.tensor(cand_features, dtype=torch.float32),
             "candidate_points": torch.tensor(patch.astype(np.float32), dtype=torch.float32),
+            "candidate_center_dist": torch.tensor(dist_center.squeeze(1).astype(np.float32), dtype=torch.float32),
             "soft_labels": torch.tensor(soft, dtype=torch.float32),
+            "hard_target_idx": torch.tensor(hard_target_idx, dtype=torch.long),
             "base": torch.tensor(center, dtype=torch.float32),
             "expert": torch.tensor(expert, dtype=torch.float32),
             "landmark": torch.tensor(lm, dtype=torch.long),

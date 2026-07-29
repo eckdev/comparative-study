@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import HARD_LANDMARKS, HardLandmarkDataset
+from .data import LANDMARK_SETS, HardLandmarkDataset
 from .metrics import combined_metrics
 from .model import AGHHardNet, hardnet_loss
 
@@ -38,6 +38,10 @@ def train_epoch(model, loader, optimizer, scaler, device, args):
                 batch["landmark"],
                 temperature=args.temperature,
                 topk=args.topk,
+                center_distance=batch["candidate_center_dist"],
+                center_prior_weight=args.center_prior_weight,
+                base=batch["base"],
+                candidate_blend=args.candidate_blend,
             )
             loss, parts = hardnet_loss(outputs, batch, args)
         scaler.scale(loss).backward()
@@ -70,6 +74,10 @@ def evaluate_hard(model, loader, device, args):
                 batch_device["landmark"],
                 temperature=args.temperature,
                 topk=args.topk,
+                center_distance=batch_device["candidate_center_dist"],
+                center_prior_weight=args.center_prior_weight,
+                base=batch_device["base"],
+                candidate_blend=args.candidate_blend,
             )
             loss, parts = hardnet_loss(outputs, batch_device, args)
         bsz = batch["landmark"].shape[0]
@@ -100,7 +108,7 @@ def build_loader(samples, args, split_name, shuffle=False):
         samples,
         data_root=args.data_root,
         point_cache_dir=args.point_cache_dir,
-        landmarks=HARD_LANDMARKS,
+        landmarks=LANDMARK_SETS[args.landmark_set],
         radius_mm=args.radius_mm,
         trichion_radius_mm=args.trichion_radius_mm,
         patch_points=args.patch_points,
@@ -136,7 +144,8 @@ def train_hardnet(train_samples, val_samples, args, output_dir):
     for epoch in range(1, args.epochs + 1):
         train_loss, train_parts = train_epoch(model, train_loader, optimizer, scaler, device, args)
         val_loss, val_parts, _ = evaluate_hard(model, val_loader, device, args)
-        val_error = float(val_parts.get("mean_error", val_loss))
+        monitor_key = "weighted_mean_error" if args.final_mode == "weighted" else "mean_error"
+        val_error = float(val_parts.get(monitor_key, val_loss))
         scheduler.step()
         row = {
             "epoch": epoch,

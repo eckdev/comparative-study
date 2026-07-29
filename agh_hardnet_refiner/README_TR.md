@@ -31,6 +31,12 @@ Not: v6 klasöründe `refined_predictions_train.csv` olmadığı için train spl
 
 ## Hızlı Çalıştırma
 
+Notebook ile çalıştırmak için:
+
+```text
+agh_hardnet_refiner/colab_agh_hardnet.ipynb
+```
+
 ```bash
 cd /content/comparative-study/agh_hardnet_refiner
 python -u colab_run_agh_hardnet.py --preset smoke
@@ -40,6 +46,22 @@ Ana koşu:
 
 ```bash
 python -u colab_run_agh_hardnet.py --preset full
+```
+
+LM0 ve Gonion noktalarını ayrı specialist olarak denemek için:
+
+```bash
+python -u colab_run_agh_hardnet.py --preset trichion
+python -u colab_run_agh_hardnet.py --preset gonion
+```
+
+İki specialist çıktıyı birleştirmek için:
+
+```bash
+python -u merge_specialist_predictions.py \
+  --base-dir /content/drive/MyDrive/orthodontic/hardnet_runs/agh_hardnet_trichion_candidate \
+  --specialist-dirs /content/drive/MyDrive/orthodontic/hardnet_runs/agh_hardnet_gonion_candidate \
+  --output-dir /content/drive/MyDrive/orthodontic/hardnet_runs/agh_hardnet_merged_specialists
 ```
 
 ## Çıktılar
@@ -76,6 +98,20 @@ En doğru ana deney için önerilen sıra:
 ```text
 1. Oracle preset'i çalıştır ve candidate coverage'i doğrula.
 2. Mümkünse AGH Stage2 train predictions üret.
-3. Train/val/test için aynı prediction seviyesini kullanarak full preset'i çalıştır.
-4. Final 23 sonucu Core20 sabit + LM0/21/22 HardNet olarak raporla.
+3. Önce full preset ile hard3 ortak modelini çalıştır.
+4. Sonra trichion ve gonion specialist presetlerini ayrı çalıştır.
+5. Merged specialist sonucu ile full sonucunu validasyon/testte karşılaştır.
+6. Final 23 sonucu Core20 sabit + LM0/21/22 HardNet olarak raporla.
 ```
+
+V2 geliştirmesi candidate-selection ağırlıklıdır:
+
+```text
+coarse center prior
+top-k candidate CE
+soft heatmap CE
+base + candidate_blend * candidate_delta
+küçük residual correction
+```
+
+Bu ayar, modelin kötü aday seçtiğinde AGH tahmininden kopmasını engeller ve oracle potansiyeline daha kontrollü yaklaşmasını hedefler.

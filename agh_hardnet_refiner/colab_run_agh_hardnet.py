@@ -60,7 +60,7 @@ def resolve_agh_run(requested):
 
 def main():
     parser = argparse.ArgumentParser(description="Colab runner for AGH-HardNet.")
-    parser.add_argument("--preset", choices=["smoke", "oracle", "full"], default="smoke")
+    parser.add_argument("--preset", choices=["smoke", "oracle", "full", "trichion", "gonion"], default="smoke")
     parser.add_argument("--agh-run", type=Path, default=DEFAULT_AGH_RUN)
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--run-root", type=Path, default=RUN_ROOT)
@@ -69,11 +69,18 @@ def main():
     work_dir = CODE_ROOT / "agh_hardnet_refiner"
     args.agh_run = resolve_agh_run(args.agh_run)
     print("AGH_RUN:", args.agh_run, flush=True)
-    train_csv = args.agh_run / "stage1_predictions_train.csv"
+    refined_train_csv = args.agh_run / "refined_predictions_train.csv"
+    train_csv = refined_train_csv if refined_train_csv.exists() else args.agh_run / "stage1_predictions_train.csv"
+    print("TRAIN_PRED_CSV:", train_csv, flush=True)
     val_csv = args.agh_run / "refined_predictions_val.csv"
     test_csv = args.agh_run / "refined_predictions_test.csv"
     cache_dir = args.agh_run / "stage1_point_cache"
-    output_dir = args.run_root / f"agh_hardnet_{args.preset}"
+    if args.preset == "trichion":
+        output_dir = args.run_root / "agh_hardnet_trichion_candidate"
+    elif args.preset == "gonion":
+        output_dir = args.run_root / "agh_hardnet_gonion_candidate"
+    else:
+        output_dir = args.run_root / f"agh_hardnet_{args.preset}"
 
     if not train_csv.exists() and args.preset != "oracle":
         raise FileNotFoundError(f"Missing train prediction file: {train_csv}")
@@ -84,8 +91,6 @@ def main():
         sys.executable,
         "-u",
         str(work_dir / "run_agh_hardnet_refiner.py"),
-        "--train-pred-csv",
-        str(train_csv),
         "--val-pred-csv",
         str(val_csv),
         "--test-pred-csv",
@@ -103,6 +108,7 @@ def main():
     if args.preset == "oracle":
         cmd += ["--oracle-only", "--oracle-patch-points", "2048", "--max-surface-points", "12000"]
     elif args.preset == "smoke":
+        cmd += ["--train-pred-csv", str(train_csv)]
         cmd += [
             "--epochs",
             "2",
@@ -123,11 +129,19 @@ def main():
             "--no-tqdm",
         ]
     else:
+        cmd += ["--train-pred-csv", str(train_csv)]
+        landmark_set = "hard3"
+        if args.preset == "trichion":
+            landmark_set = "trichion"
+        elif args.preset == "gonion":
+            landmark_set = "gonion"
         cmd += [
+            "--landmark-set",
+            landmark_set,
             "--epochs",
-            "120",
+            "160",
             "--patience",
-            "25",
+            "35",
             "--batch-size",
             "12",
             "--patch-points",
@@ -139,13 +153,37 @@ def main():
             "--hidden-dim",
             "192",
             "--radius-mm",
-            "45",
+            "40",
             "--trichion-radius-mm",
-            "55",
+            "45",
             "--sigma-mm",
-            "2.5",
+            "1.75",
             "--topk",
-            "20",
+            "12",
+            "--temperature",
+            "0.45",
+            "--final-mode",
+            "pred",
+            "--residual-limit-mm",
+            "0.5",
+            "--center-prior-weight",
+            "3.0",
+            "--candidate-blend",
+            "0.35",
+            "--coord-weight",
+            "0.25",
+            "--weighted-coord-weight",
+            "0.7",
+            "--heatmap-weight",
+            "0.8",
+            "--hard-ce-weight",
+            "0.8",
+            "--clinical-weight",
+            "0.25",
+            "--entropy-weight",
+            "0.002",
+            "--residual-reg-weight",
+            "0.02",
         ]
 
     env = os.environ.copy()

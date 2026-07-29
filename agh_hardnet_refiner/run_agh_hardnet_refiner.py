@@ -5,12 +5,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.data import HARD_LANDMARKS, oracle_rows, read_prediction_csv
+from src.data import HARD_LANDMARKS, LANDMARK_SETS, oracle_rows, read_prediction_csv
 from src.metrics import combined_metrics, ensure_dir, landmark_metrics, oracle_summary, write_csv, write_json
 from src.train import build_loader, combine_predictions, evaluate_hard, resolve_device, train_hardnet
 
 
-def prediction_rows(samples, pred, confidence):
+def prediction_rows(samples, pred, confidence, refined_landmarks):
     rows = []
     expert = np.stack([sample.expert for sample in samples], axis=0)
     base = np.stack([sample.base for sample in samples], axis=0)
@@ -25,7 +25,7 @@ def prediction_rows(samples, pred, confidence):
                     "gender": sample.gender,
                     "subject_id": sample.subject_id,
                     "landmark": lm,
-                    "is_hard_refined": lm in HARD_LANDMARKS,
+                    "is_hard_refined": lm in refined_landmarks,
                     "expert_x": float(expert[sample_idx, lm, 0]),
                     "expert_y": float(expert[sample_idx, lm, 1]),
                     "expert_z": float(expert[sample_idx, lm, 2]),
@@ -68,7 +68,7 @@ def evaluate_split(model, samples, args, split_name, output_dir):
     loader = build_loader(samples, args, split_name, shuffle=False)
     _, parts, hard_rows = evaluate_hard(model, loader, resolve_device(args.device), args)
     pred, expert, confidence, errors, metrics = combine_predictions(samples, hard_rows, mode=args.final_mode)
-    write_csv(output_dir / f"predictions_{split_name}.csv", prediction_rows(samples, pred, confidence))
+    write_csv(output_dir / f"predictions_{split_name}.csv", prediction_rows(samples, pred, confidence, set(LANDMARK_SETS[args.landmark_set])))
     write_csv(output_dir / f"landmark_metrics_{split_name}.csv", landmark_metrics(errors))
     return metrics, parts
 
@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--val-pred-csv", type=str, required=True)
     parser.add_argument("--test-pred-csv", type=str, required=True)
     parser.add_argument("--base-prefix", type=str, default="auto")
+    parser.add_argument("--landmark-set", choices=sorted(LANDMARK_SETS), default="hard3")
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--point-cache-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, required=True)
@@ -102,14 +103,18 @@ def main():
     parser.add_argument("--coord-beta-mm", type=float, default=1.0)
     parser.add_argument("--coord-weight", type=float, default=1.0)
     parser.add_argument("--heatmap-weight", type=float, default=0.35)
+    parser.add_argument("--hard-ce-weight", type=float, default=0.0)
     parser.add_argument("--weighted-coord-weight", type=float, default=0.2)
     parser.add_argument("--clinical-weight", type=float, default=0.15)
     parser.add_argument("--clinical-threshold-mm", type=float, default=2.0)
     parser.add_argument("--clinical-margin-mm", type=float, default=0.5)
     parser.add_argument("--nll-weight", type=float, default=0.01)
     parser.add_argument("--residual-reg-weight", type=float, default=0.002)
+    parser.add_argument("--entropy-weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--topk", type=int, default=20)
+    parser.add_argument("--center-prior-weight", type=float, default=0.0)
+    parser.add_argument("--candidate-blend", type=float, default=1.0)
     parser.add_argument("--final-mode", choices=["pred", "weighted"], default="pred")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--mixed-precision", action="store_true")
@@ -139,6 +144,7 @@ def main():
                 "test": len(test_samples),
             },
             "hard_landmarks": list(HARD_LANDMARKS),
+            "selected_landmarks": list(LANDMARK_SETS[args.landmark_set]),
         },
     )
 
