@@ -40,17 +40,13 @@ Per-landmark flat+metadata varyantı için:
 
 ```bash
 python -u colab_run_shape_prior.py \
+  --preset per_landmark_flat_meta \
   --prediction-dir /content/drive/MyDrive/orthodontic/diffusion_runs/aghformer_v6_stage2_raw_fine_refiner_p12000 \
-  --output-dir /content/drive/MyDrive/orthodontic/diffusion_runs/shape_prior_local_per_landmark_flat_meta \
-  --target-landmarks all \
-  --gate-landmarks all \
-  --feature-mode flat_meta \
-  --calibration-mode per_landmark \
-  --selection-metric core20 \
-  --final-policy shape_prior
+  --output-dir /content/drive/MyDrive/orthodontic/diffusion_runs/shape_prior_local_per_landmark_flat_meta
 ```
 
 Klasor adinin `per_landmark` olmasi tek basina yeterli degildir; bu varyant icin `--calibration-mode per_landmark` argumani mutlaka verilmelidir.
+Guncel runner'da bunu daha guvenli yapmak icin `--preset per_landmark_flat_meta` kullanilabilir.
 
 Runner base prediction kaynağını şu sırayla arar:
 

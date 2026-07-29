@@ -15,6 +15,30 @@ PREDICTION_CANDIDATES = [
 ]
 
 
+PRESETS = {
+    "global_full": {
+        "feature_mode": "full",
+        "calibration_mode": "global",
+        "output_name": "shape_prior_residual_refiner",
+    },
+    "per_landmark_flat": {
+        "feature_mode": "flat",
+        "calibration_mode": "per_landmark",
+        "output_name": "shape_prior_local_per_landmark_flat",
+    },
+    "per_landmark_flat_meta": {
+        "feature_mode": "flat_meta",
+        "calibration_mode": "per_landmark",
+        "output_name": "shape_prior_local_per_landmark_flat_meta",
+    },
+    "per_landmark_full": {
+        "feature_mode": "full",
+        "calibration_mode": "per_landmark",
+        "output_name": "shape_prior_local_per_landmark",
+    },
+}
+
+
 def choose_prediction_dir():
     for candidate in PREDICTION_CANDIDATES:
         if (candidate / "base_stage2_predictions_train.csv").exists() or (candidate / "refined_predictions_train.csv").exists():
@@ -24,6 +48,7 @@ def choose_prediction_dir():
 
 def main():
     parser = argparse.ArgumentParser(description="Colab runner for shape-prior residual refiner.")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default=None)
     parser.add_argument("--prediction-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--data-root", default=str(DATA_ROOT))
@@ -47,7 +72,21 @@ def main():
 
     work_dir = CODE_ROOT / "core20_shape_prior_refinement"
     prediction_dir = Path(args.prediction_dir) if args.prediction_dir else choose_prediction_dir()
-    output_dir = Path(args.output_dir) if args.output_dir else RUN_ROOT / "shape_prior_residual_refiner"
+    if args.preset:
+        preset = PRESETS[args.preset]
+        args.feature_mode = preset["feature_mode"]
+        args.calibration_mode = preset["calibration_mode"]
+        output_dir = Path(args.output_dir) if args.output_dir else RUN_ROOT / preset["output_name"]
+    else:
+        output_dir = Path(args.output_dir) if args.output_dir else RUN_ROOT / "shape_prior_residual_refiner"
+        output_name = output_dir.name.lower()
+        if args.feature_mode == "full" and "flat_meta" in output_name:
+            args.feature_mode = "flat_meta"
+        elif args.feature_mode == "full" and "flat" in output_name:
+            args.feature_mode = "flat"
+        if args.calibration_mode == "global" and "per_landmark" in output_name:
+            args.calibration_mode = "per_landmark"
+
     if not (prediction_dir / "refined_predictions_train.csv").exists() and not args.skip_refined_train_export:
         export_script = CODE_ROOT / "agh_former_orthodontic_comparison" / "export_stage2_train_predictions.py"
         export_cmd = [
@@ -103,6 +142,8 @@ def main():
     ]
     print("Prediction dir:", prediction_dir, flush=True)
     print("Output dir:", output_dir, flush=True)
+    print("Feature mode:", args.feature_mode, flush=True)
+    print("Calibration mode:", args.calibration_mode, flush=True)
     print("Running:", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=str(work_dir), check=True)
 
