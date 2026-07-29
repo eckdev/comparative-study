@@ -57,6 +57,26 @@ Ana çıktılar:
 - `group_metrics_test.csv`
 - `config_shape_prior.json`
 
+## Shape-Prior Stacker
+
+HardNet sonuclarinda LM0/21/22 icin kazanc cok sinirli kaldiginda, shape-prior varyantlarini validasyon uzerinden residual stacking ile birlestirmek daha kontrollu bir sonraki denemedir.
+
+Colab:
+
+```bash
+cd /content/comparative-study/core20_shape_prior_refinement
+python -m pip install -q -r requirements.txt
+python -u colab_run_shape_prior_stacker.py
+```
+
+Beklenen cikti klasoru:
+
+```text
+/content/drive/MyDrive/orthodontic/diffusion_runs/shape_prior_stacker
+```
+
+Bu kosu yeni derin model egitmez. Daha once uretilmis shape-prior prediction dosyalarindan validation-selected residual kombinasyonu ogrenir ve test setine kilitli uygular.
+
 Sağlamlaştırma çıktıları:
 
 - Hasta-bazlı bootstrap CI: `bootstrap_metrics.json`
