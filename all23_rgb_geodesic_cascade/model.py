@@ -16,13 +16,17 @@ from .anatomy import (
 
 def segment_softmax(scores, index, segment_count):
     """Softmax over sparse edges grouped by destination vertex."""
-    expanded = index[:, None].expand(-1, scores.shape[1])
-    maximum = scores.new_full((segment_count, scores.shape[1]), -torch.inf)
-    maximum.scatter_reduce_(0, expanded, scores, reduce="amax", include_self=True)
-    exponent = torch.exp(scores - maximum[index])
-    denominator = scores.new_zeros((segment_count, scores.shape[1]))
+    # CUDA scatter operations may promote exp() to float32 under autocast while
+    # new_zeros() remains float16. Accumulate the normalization in float32 for
+    # both dtype consistency and numerical stability, then restore score dtype.
+    work_scores = scores.float()
+    expanded = index[:, None].expand(-1, work_scores.shape[1])
+    maximum = work_scores.new_full((segment_count, work_scores.shape[1]), -torch.inf)
+    maximum.scatter_reduce_(0, expanded, work_scores, reduce="amax", include_self=True)
+    exponent = torch.exp(work_scores - maximum[index])
+    denominator = work_scores.new_zeros((segment_count, work_scores.shape[1]))
     denominator.index_add_(0, index, exponent)
-    return exponent / denominator[index].clamp_min(1e-12)
+    return (exponent / denominator[index].clamp_min(1e-12)).to(scores.dtype)
 
 
 def scatter_mean(values, index, count):

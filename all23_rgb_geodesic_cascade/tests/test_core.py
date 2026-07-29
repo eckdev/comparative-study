@@ -5,7 +5,7 @@ from all23_rgb_geodesic_cascade.alignment import apply_transform
 from all23_rgb_geodesic_cascade.anatomy import MIDLINE, SYMMETRY_PAIRS, graph_attention_mask, mirror_permutation
 from all23_rgb_geodesic_cascade.data import assert_disjoint_splits, collate_graphs
 from all23_rgb_geodesic_cascade.losses import LossWeights, compute_loss
-from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade
+from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade, segment_softmax
 
 
 def test_anatomical_contract():
@@ -95,3 +95,12 @@ def test_global_only_ablation_uses_all_landmarks():
     outputs = model(batch)
     assert outputs["local_logits"].shape == (1, 23, 8)
     assert outputs["final_coordinates"].shape == (1, 23, 3)
+
+
+def test_segment_softmax_supports_mixed_precision():
+    scores = torch.tensor([[1.0, 0.0], [2.0, 1.0], [0.5, 0.5]], dtype=torch.float16)
+    groups = torch.tensor([0, 0, 1], dtype=torch.long)
+    weights = segment_softmax(scores, groups, segment_count=2)
+    assert weights.dtype == torch.float16
+    assert torch.allclose(weights[:2].float().sum(dim=0), torch.ones(2), atol=1e-3)
+    assert torch.allclose(weights[2].float(), torch.ones(2), atol=1e-3)
