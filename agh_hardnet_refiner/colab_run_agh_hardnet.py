@@ -7,28 +7,78 @@ from pathlib import Path
 
 CODE_ROOT = Path("/content/comparative-study")
 DRIVE_ROOT = Path("/content/drive/MyDrive/orthodontic")
-AGH_RUN = DRIVE_ROOT / "diffusion_runs" / "aghformer_v6_stage2_raw_fine_refiner_p12000"
-if not AGH_RUN.exists():
-    AGH_RUN = CODE_ROOT / "agh_former_orthodontic_comparison" / "aghformer_v6_stage2_raw_fine_refiner_p12000"
+DEFAULT_AGH_RUN = DRIVE_ROOT / "diffusion_runs" / "aghformer_v6_stage2_raw_fine_refiner_p12000"
 
 DATA_ROOT = DRIVE_ROOT / "data" / "dataset"
 RUN_ROOT = DRIVE_ROOT / "hardnet_runs"
 
 
+def has_required_predictions(path):
+    path = Path(path)
+    return (path / "refined_predictions_val.csv").exists() and (path / "refined_predictions_test.csv").exists()
+
+
+def resolve_agh_run(requested):
+    requested = Path(requested)
+    if has_required_predictions(requested):
+        return requested
+
+    search_roots = [
+        DRIVE_ROOT / "diffusion_runs",
+        DRIVE_ROOT,
+        CODE_ROOT / "agh_former_orthodontic_comparison",
+    ]
+    candidates = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        candidates.extend(path.parent for path in root.rglob("refined_predictions_val.csv"))
+
+    valid = []
+    for candidate in candidates:
+        if has_required_predictions(candidate):
+            score = 0
+            name = candidate.name.lower()
+            if "aghformer_v6" in name:
+                score += 4
+            if "stage2" in name:
+                score += 2
+            if "raw_fine" in name:
+                score += 1
+            valid.append((score, candidate))
+    if valid:
+        valid.sort(key=lambda item: (-item[0], str(item[1])))
+        return valid[0][1]
+
+    raise FileNotFoundError(
+        "Could not find AGH run directory with refined_predictions_val.csv and "
+        "refined_predictions_test.csv. Pass it explicitly, for example:\n"
+        "python -u colab_run_agh_hardnet.py --preset oracle "
+        "--agh-run /content/drive/MyDrive/orthodontic/diffusion_runs/<aghformer_run_folder>"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Colab runner for AGH-HardNet.")
     parser.add_argument("--preset", choices=["smoke", "oracle", "full"], default="smoke")
-    parser.add_argument("--agh-run", type=Path, default=AGH_RUN)
+    parser.add_argument("--agh-run", type=Path, default=DEFAULT_AGH_RUN)
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--run-root", type=Path, default=RUN_ROOT)
     args = parser.parse_args()
 
     work_dir = CODE_ROOT / "agh_hardnet_refiner"
+    args.agh_run = resolve_agh_run(args.agh_run)
+    print("AGH_RUN:", args.agh_run, flush=True)
     train_csv = args.agh_run / "stage1_predictions_train.csv"
     val_csv = args.agh_run / "refined_predictions_val.csv"
     test_csv = args.agh_run / "refined_predictions_test.csv"
     cache_dir = args.agh_run / "stage1_point_cache"
     output_dir = args.run_root / f"agh_hardnet_{args.preset}"
+
+    if not train_csv.exists() and args.preset != "oracle":
+        raise FileNotFoundError(f"Missing train prediction file: {train_csv}")
+    if not cache_dir.exists():
+        print(f"Warning: point cache not found, falling back to --data-root meshes: {cache_dir}", flush=True)
 
     cmd = [
         sys.executable,
