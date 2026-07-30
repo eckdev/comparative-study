@@ -1,11 +1,25 @@
 """Label-free, scale-preserving mesh registration utilities."""
 
+import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+
+
+def mesh_source_fingerprint(samples):
+    digest = hashlib.sha1()
+    for sample in sorted(samples, key=lambda value: value.sample_id):
+        path = Path(sample.mesh_path)
+        stat = path.stat()
+        digest.update(
+            f"{sample.sample_id}|{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
 
 
 def apply_transform(points, matrix):
@@ -29,6 +43,19 @@ def deterministic_surface(mesh, count, seed):
     return vertices[rng.choice(len(vertices), count, replace=False)]
 
 
+def deterministic_surface_with_normals(mesh, count, seed):
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    if len(vertices) <= count:
+        indices = np.arange(len(vertices), dtype=np.int64)
+    else:
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(len(vertices), count, replace=False)
+    selected_normals = normals[indices]
+    selected_normals /= np.clip(np.linalg.norm(selected_normals, axis=1, keepdims=True), 1e-8, None)
+    return vertices[indices], selected_normals
+
+
 def mesh_descriptor(points):
     centered = points - np.median(points, axis=0, keepdims=True)
     covariance = centered.T @ centered / max(len(centered) - 1, 1)
@@ -37,7 +64,7 @@ def mesh_descriptor(points):
     return np.concatenate([np.sqrt(np.maximum(eigenvalues, 0)), np.sort(extents)[::-1]])
 
 
-def select_train_medoid(samples, mesh_loader, sample_points=2048, seed=42):
+def rank_train_medoid_candidates(samples, mesh_loader, sample_points=2048, seed=42):
     descriptors = []
     for offset, sample in enumerate(samples):
         mesh = mesh_loader(sample.mesh_path)
@@ -46,7 +73,11 @@ def select_train_medoid(samples, mesh_loader, sample_points=2048, seed=42):
     descriptors = np.asarray(descriptors, dtype=np.float64)
     scale = np.maximum(np.median(np.abs(descriptors - np.median(descriptors, axis=0)), axis=0), 1e-6)
     normalized = (descriptors - np.median(descriptors, axis=0)) / scale
-    return int(np.argmin(np.linalg.norm(normalized, axis=1)))
+    return np.argsort(np.linalg.norm(normalized, axis=1)).astype(np.int64)
+
+
+def select_train_medoid(samples, mesh_loader, sample_points=2048, seed=42):
+    return int(rank_train_medoid_candidates(samples, mesh_loader, sample_points, seed)[0])
 
 
 def _pca_basis(points):
@@ -142,6 +173,77 @@ def point_to_plane_icp(
     return matrix.astype(np.float32), history
 
 
+def build_robust_atlas(
+    train_samples,
+    mesh_loader,
+    sample_points=4096,
+    atlas_size=8,
+    atlas_iterations=2,
+    icp_iterations=30,
+    seed=42,
+    correspondence_limit_mm=20.0,
+):
+    """Build a topology-independent atlas from central train meshes only."""
+    ranking = rank_train_medoid_candidates(
+        train_samples,
+        mesh_loader,
+        min(int(sample_points), 2048),
+        seed,
+    )
+    selected = [train_samples[int(index)] for index in ranking[: max(1, int(atlas_size))]]
+    anchor = selected[0]
+    target, target_normals = deterministic_surface_with_normals(
+        mesh_loader(anchor.mesh_path), int(sample_points), seed
+    )
+    iteration_reports = []
+    for atlas_iteration in range(max(1, int(atlas_iterations))):
+        point_rows = [target.astype(np.float64)]
+        normal_rows = [target_normals.astype(np.float64)]
+        member_reports = []
+        for member_index, sample in enumerate(selected):
+            mesh = mesh_loader(sample.mesh_path)
+            source, source_normals = deterministic_surface_with_normals(
+                mesh,
+                int(sample_points),
+                seed + 50_000 + atlas_iteration * 10_000 + member_index,
+            )
+            initial = pca_initial_transform(source, target)
+            matrix, history = point_to_plane_icp(
+                source,
+                target,
+                target_normals,
+                initial,
+                iterations=icp_iterations,
+            )
+            moved = apply_transform(source, matrix).astype(np.float64)
+            moved_normals = rotate_vectors(source_normals, matrix).astype(np.float64)
+            distances, nearest = cKDTree(moved).query(target, k=1, workers=-1)
+            valid = distances <= float(correspondence_limit_mm)
+            corresponding_points = moved[nearest]
+            corresponding_normals = moved_normals[nearest]
+            corresponding_points[~valid] = np.nan
+            corresponding_normals[~valid] = np.nan
+            point_rows.append(corresponding_points)
+            normal_rows.append(corresponding_normals)
+            member_reports.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "median_correspondence_mm": float(np.median(distances)),
+                    "p95_correspondence_mm": float(np.percentile(distances, 95)),
+                    "valid_fraction": float(np.mean(valid)),
+                    "icp_iterations": len(history),
+                }
+            )
+        target = np.nanmedian(np.stack(point_rows), axis=0).astype(np.float32)
+        combined_normals = np.nanmean(np.stack(normal_rows), axis=0)
+        norm = np.linalg.norm(combined_normals, axis=1, keepdims=True)
+        invalid = ~np.isfinite(norm[:, 0]) | (norm[:, 0] < 1e-8)
+        combined_normals[invalid] = target_normals[invalid]
+        target_normals = (combined_normals / np.clip(np.linalg.norm(combined_normals, axis=1, keepdims=True), 1e-8, None)).astype(np.float32)
+        iteration_reports.append({"iteration": atlas_iteration + 1, "members": member_reports})
+    return target, target_normals, anchor, selected, iteration_reports
+
+
 def build_label_free_alignment(
     samples,
     train_ids,
@@ -149,6 +251,8 @@ def build_label_free_alignment(
     mesh_loader,
     sample_points=4096,
     icp_iterations=30,
+    atlas_size=8,
+    atlas_iterations=2,
     seed=42,
 ):
     """Fit the reference on train meshes and register every mesh without labels."""
@@ -156,23 +260,38 @@ def build_label_free_alignment(
     output_dir.mkdir(parents=True, exist_ok=True)
     transform_file = output_dir / "mesh_only_transforms.npz"
     report_file = output_dir / "alignment_report.json"
+    expected_config = {
+        "algorithm_version": 4,
+        "train_template_sample_ids": list(train_ids),
+        "mesh_source_fingerprint": mesh_source_fingerprint(samples),
+        "sample_points": int(sample_points),
+        "icp_iterations": int(icp_iterations),
+        "atlas_size": int(atlas_size),
+        "atlas_iterations": int(atlas_iterations),
+    }
     if transform_file.exists() and report_file.exists():
         report = json.loads(report_file.read_text(encoding="utf-8"))
-        if report.get("algorithm_version") == 3:
+        if all(report.get(key) == value for key, value in expected_config.items()):
             stored = np.load(transform_file)
             transforms = {key: stored[key].astype(np.float32) for key in stored.files}
             return transforms, report
 
     by_id = {sample.sample_id: sample for sample in samples}
     train_samples = [by_id[sample_id] for sample_id in train_ids]
-    medoid_position = select_train_medoid(train_samples, mesh_loader, min(sample_points, 2048), seed)
-    medoid = train_samples[medoid_position]
-    target_mesh = mesh_loader(medoid.mesh_path)
-    target = deterministic_surface(target_mesh, sample_points, seed)
-    target_normals_all = np.asarray(target_mesh.vertex_normals, dtype=np.float32)
-    target_vertices = np.asarray(target_mesh.vertices, dtype=np.float32)
-    normal_tree = cKDTree(target_vertices)
-    target_normals = target_normals_all[normal_tree.query(target, k=1, workers=-1)[1]]
+    target, target_normals, medoid, atlas_samples, atlas_report = build_robust_atlas(
+        train_samples,
+        mesh_loader,
+        sample_points=sample_points,
+        atlas_size=atlas_size,
+        atlas_iterations=atlas_iterations,
+        icp_iterations=icp_iterations,
+        seed=seed,
+    )
+    np.savez_compressed(
+        output_dir / "train_multimesh_atlas.npz",
+        points=target.astype(np.float32),
+        normals=target_normals.astype(np.float32),
+    )
 
     transforms = {}
     rows = []
@@ -200,13 +319,18 @@ def build_label_free_alignment(
         )
     np.savez_compressed(transform_file, **transforms)
     report = {
-        "algorithm_version": 3,
-        "method": "train_medoid_pca_point_to_plane_icp",
+        "algorithm_version": 4,
+        "method": "train_only_robust_multimesh_atlas_pca_point_to_plane_icp",
         "scale": False,
         "reflection": False,
         "uses_expert_landmarks": False,
         "train_medoid_sample_id": medoid.sample_id,
         "train_template_sample_ids": list(train_ids),
+        "mesh_source_fingerprint": expected_config["mesh_source_fingerprint"],
+        "atlas_sample_ids": [sample.sample_id for sample in atlas_samples],
+        "atlas_size": int(atlas_size),
+        "atlas_iterations": int(atlas_iterations),
+        "atlas_build_report": atlas_report,
         "sample_points": int(sample_points),
         "icp_iterations": int(icp_iterations),
         "samples": rows,

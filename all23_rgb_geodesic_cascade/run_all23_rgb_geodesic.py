@@ -28,6 +28,7 @@ if __package__ in (None, ""):
     from all23_rgb_geodesic_cascade.losses import LossWeights
     from all23_rgb_geodesic_cascade.metrics import calibrate_confidence, save_evaluation, write_csv
     from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade
+    from all23_rgb_geodesic_cascade.stage1 import generate_oof_stage1_predictions
     from all23_rgb_geodesic_cascade.train import collect_outputs, fit_model
 else:
     from .alignment import build_label_free_alignment
@@ -41,6 +42,7 @@ else:
     from .losses import LossWeights
     from .metrics import calibrate_confidence, save_evaluation, write_csv
     from .model import All23RGBGeodesicCascade
+    from .stage1 import generate_oof_stage1_predictions
     from .train import collect_outputs, fit_model
 
 
@@ -157,12 +159,23 @@ def legacy_transforms(samples, legacy_root):
     return {sample.sample_id: resolve_legacy_matrix(legacy_root, sample) for sample in samples}
 
 
-def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
+def oracle_gate_status(validation, args):
+    checks = {
+        "overall": validation["ale"] <= args.max_val_oracle_ale,
+        "hard3": validation["hard3_ale"] <= args.max_val_hard3_oracle_ale,
+        "p95": validation["p95"] <= args.max_val_oracle_p95,
+        "max": validation["max"] <= args.max_val_oracle_max,
+        "sample_max": validation["sample_ale_max"] <= args.max_val_sample_oracle_ale,
+    }
+    return {**checks, "passed": all(checks.values())}
+
+
+def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=True):
     assert_disjoint_splits(splits)
     by_id = {sample.sample_id: sample for sample in samples}
-    selected_ids = set(splits["train"] + splits["val"] + splits["test"])
-    selected_samples = [by_id[sample_id] for sample_id in selected_ids]
-    missing = selected_ids - set(by_id)
+    selected_ids = list(dict.fromkeys(splits["train"] + splits["val"] + splits["test"]))
+    selected_samples = [by_id[sample_id] for sample_id in selected_ids if sample_id in by_id]
+    missing = set(selected_ids) - set(by_id)
     if missing:
         raise ValueError(f"Split references missing dataset samples: {sorted(missing)[:5]}")
 
@@ -175,6 +188,8 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
             load_mesh,
             sample_points=args.icp_points,
             icp_iterations=args.icp_iterations,
+            atlas_size=args.atlas_size,
+            atlas_iterations=args.atlas_iterations,
             seed=args.seed,
         )
     else:
@@ -212,7 +227,22 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
     np.save(fold_dir / "train_template_landmarks.npy", train_template)
     coarse_target = {}
     coarse_sources = {"mode": args.coarse_source}
-    if args.coarse_source == "external":
+    if args.coarse_source == "stage1_oof":
+        coarse_target, stage1_report = generate_oof_stage1_predictions(
+            selected_samples,
+            splits,
+            records,
+            transforms,
+            normalizer,
+            fold_dir,
+            device,
+            args,
+        )
+        coarse_sources = {
+            "mode": "stage1_nested_oof",
+            "report": stage1_report,
+        }
+    elif args.coarse_source == "external":
         external, coarse_sources = load_coarse_predictions(
             args.base_prediction_dir,
             args.initial_prediction_dir,
@@ -237,7 +267,7 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
         coarse_target = {sample_id: train_template.copy() for sample_id in selected_ids}
         coarse_sources = {"mode": "train_template", "fit_sample_ids": list(splits["train"])}
 
-    if args.train_center_mode == "synthetic":
+    if args.train_center_mode == "synthetic" and args.coarse_source != "stage1_oof":
         for sample_id in splits["train"]:
             with np.load(records[sample_id]) as record:
                 expert = record["landmarks"].astype(np.float32)
@@ -260,6 +290,7 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
     precompute_samples = [sample for sample in selected_samples if sample.sample_id not in set(splits["test"])]
     print("Precomputing train/validation geodesic ROIs...", flush=True)
     oracle_by_split = {"train": [], "val": []}
+    oracle_samples = {"train": [], "val": []}
     for offset, sample in enumerate(tqdm(precompute_samples, desc="geodesic ROI", disable=args.no_tqdm)):
         roi_path = build_roi_cache(
             records[sample.sample_id],
@@ -272,7 +303,17 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
         )
         split_name = "train" if sample.sample_id in set(splits["train"]) else "val"
         with np.load(roi_path) as roi_record:
-            oracle_by_split[split_name].append(roi_record["oracle_error"].copy())
+            sample_oracle = roi_record["oracle_error"].copy()
+            oracle_by_split[split_name].append(sample_oracle)
+            oracle_samples[split_name].append(
+                {
+                    "split": split_name,
+                    "sample_id": sample.sample_id,
+                    "oracle_ale": float(sample_oracle.mean()),
+                    "oracle_p95": float(np.percentile(sample_oracle, 95)),
+                    "oracle_max": float(sample_oracle.max()),
+                }
+            )
         if args.no_tqdm and ((offset + 1) % 10 == 0 or offset + 1 == len(precompute_samples)):
             print(f"Geodesic ROI {offset + 1}/{len(precompute_samples)}", flush=True)
     oracle_report = {}
@@ -286,22 +327,38 @@ def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
             "max": float(values.max()) if values.size else None,
             "fraction_above_2mm": float(np.mean(values > 2.0)) if values.size else None,
             "per_landmark_ale": values.mean(axis=0).tolist() if values.size else None,
+            "sample_ale_p95": float(
+                np.percentile([row["oracle_ale"] for row in oracle_samples[split_name]], 95)
+            ) if values.size else None,
+            "sample_ale_max": float(
+                max(row["oracle_ale"] for row in oracle_samples[split_name])
+            ) if values.size else None,
+            "fraction_samples_above_limit": float(
+                np.mean(
+                    [
+                        row["oracle_ale"] > args.max_val_sample_oracle_ale
+                        for row in oracle_samples[split_name]
+                    ]
+                )
+            ) if values.size else None,
         }
+    write_csv(
+        fold_dir / "candidate_oracle_samples_pretrain.csv",
+        oracle_samples["train"] + oracle_samples["val"],
+    )
     (fold_dir / "candidate_oracle_pretrain.json").write_text(json.dumps(oracle_report, indent=2), encoding="utf-8")
     val_oracle = oracle_report["val"]["ale"]
     val_hard3_oracle = oracle_report["val"]["hard3_ale"]
-    oracle_gate_failed = (
-        (val_oracle is not None and val_oracle > args.max_val_oracle_ale)
-        or (
-            val_hard3_oracle is not None
-            and val_hard3_oracle > args.max_val_hard3_oracle_ale
-        )
-    )
-    if enforce_oracle_gate and oracle_gate_failed and not args.skip_oracle_gate:
+    gate = oracle_gate_status(oracle_report["val"], args)
+    if enforce_oracle_gate and not gate["passed"] and not args.skip_oracle_gate:
         raise RuntimeError(
             "Validation candidate oracle failed: "
             f"overall={val_oracle:.4f} (gate {args.max_val_oracle_ale:.4f}), "
-            f"hard3={val_hard3_oracle:.4f} (gate {args.max_val_hard3_oracle_ale:.4f}). "
+            f"hard3={val_hard3_oracle:.4f} (gate {args.max_val_hard3_oracle_ale:.4f}), "
+            f"p95={oracle_report['val']['p95']:.4f} (gate {args.max_val_oracle_p95:.4f}), "
+            f"max={oracle_report['val']['max']:.4f} (gate {args.max_val_oracle_max:.4f}), "
+            f"sample_max={oracle_report['val']['sample_ale_max']:.4f} "
+            f"(gate {args.max_val_sample_oracle_ale:.4f}). "
             "Increase ROI coverage before training."
         )
 
@@ -376,7 +433,7 @@ def fold_output_dir(output_dir, args, repeat, fold_index):
 
 def run_fold(samples, splits, args, fold_dir, device):
     fold_dir.mkdir(parents=True, exist_ok=True)
-    datasets, normalizer = prepare_fold(samples, splits, args, fold_dir)
+    datasets, normalizer = prepare_fold(samples, splits, args, fold_dir, device)
     loaders = {
         "train": make_loader(datasets["train"], args.batch_size, True, args),
         "val": make_loader(datasets["val"], args.eval_batch_size, False, args),
@@ -408,6 +465,11 @@ def run_fold(samples, splits, args, fold_dir, device):
         clinical=args.clinical_weight,
     )
     training = fit_model(model, loaders["train"], loaders["val"], device, args, loss_weights, normalizer, fold_dir)
+    if training["best_validation_ale"] > args.max_stage2_val_ale:
+        raise RuntimeError(
+            f"Stage 2 best validation ALE={training['best_validation_ale']:.4f} exceeds "
+            f"--max-stage2-val-ale={args.max_stage2_val_ale:.4f}. Test labels remain sealed."
+        )
     validation = collect_outputs(model, loaders["val"], device, args, normalizer, use_tta=args.tta)
     calibration = calibrate_confidence(validation["log_var"], validation["errors"])
     validation_metrics = save_evaluation(
@@ -445,7 +507,11 @@ def build_parser():
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--cv-repeats", type=int, default=1)
     parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--coarse-source", choices=("external", "train_template"), default="external")
+    parser.add_argument(
+        "--coarse-source",
+        choices=("external", "train_template", "stage1_oof"),
+        default="external",
+    )
     parser.add_argument("--base-prediction-dir", default=None)
     parser.add_argument("--initial-prediction-dir", default=None)
     parser.add_argument("--base-prefix", default="stage2_raw")
@@ -458,11 +524,16 @@ def build_parser():
     parser.add_argument("--legacy-transformation-dir", default=None)
     parser.add_argument("--icp-points", type=int, default=4096)
     parser.add_argument("--icp-iterations", type=int, default=30)
+    parser.add_argument("--atlas-size", type=int, default=8)
+    parser.add_argument("--atlas-iterations", type=int, default=2)
     parser.add_argument("--max-vertices", type=int, default=50000)
     parser.add_argument("--roi-points", type=int, default=512)
     parser.add_argument("--roi-radius-scale", type=float, default=1.0)
     parser.add_argument("--max-val-oracle-ale", type=float, default=1.5)
     parser.add_argument("--max-val-hard3-oracle-ale", type=float, default=2.5)
+    parser.add_argument("--max-val-oracle-p95", type=float, default=2.0)
+    parser.add_argument("--max-val-oracle-max", type=float, default=15.0)
+    parser.add_argument("--max-val-sample-oracle-ale", type=float, default=2.0)
     parser.add_argument("--skip-oracle-gate", action="store_true")
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--global-blocks", type=int, default=4)
@@ -470,7 +541,10 @@ def build_parser():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=35)
+    parser.add_argument("--min-epochs", type=int, default=80)
     parser.add_argument("--scheduler-patience", type=int, default=8)
+    parser.add_argument("--scheduler-start-epoch", type=int, default=60)
+    parser.add_argument("--lr-warmup-epochs", type=int, default=5)
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
@@ -502,6 +576,25 @@ def build_parser():
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--amp-dtype", choices=("auto", "float16", "bfloat16"), default="auto")
     parser.add_argument("--amp-init-scale", type=float, default=1024.0)
+    parser.add_argument("--stage1-oof-folds", type=int, default=3)
+    parser.add_argument("--stage1-inner-val-fraction", type=float, default=0.2)
+    parser.add_argument("--stage1-width", type=int, default=96)
+    parser.add_argument("--stage1-blocks", type=int, default=3)
+    parser.add_argument("--stage1-topk", type=int, default=50)
+    parser.add_argument("--stage1-temperature", type=float, default=0.75)
+    parser.add_argument("--stage1-epochs", type=int, default=100)
+    parser.add_argument("--stage1-min-epochs", type=int, default=60)
+    parser.add_argument("--stage1-patience", type=int, default=20)
+    parser.add_argument("--stage1-scheduler-patience", type=int, default=8)
+    parser.add_argument("--stage1-scheduler-start-epoch", type=int, default=40)
+    parser.add_argument("--stage1-lr-warmup-epochs", type=int, default=5)
+    parser.add_argument("--stage1-lr", type=float, default=3e-4)
+    parser.add_argument("--stage1-batch-size", type=int, default=1)
+    parser.add_argument("--stage1-eval-batch-size", type=int, default=1)
+    parser.add_argument("--stage1-rotation-degrees", type=float, default=8.0)
+    parser.add_argument("--max-stage1-val-ale", type=float, default=12.0)
+    parser.add_argument("--max-stage1-oof-ale", type=float, default=15.0)
+    parser.add_argument("--max-stage2-val-ale", type=float, default=5.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--no-memory-cache", action="store_true")
@@ -561,10 +654,16 @@ def main():
             fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
             fold_dir.mkdir(parents=True, exist_ok=True)
             print(f"\nPreflight {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index}", flush=True)
-            prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=False)
+            prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=False)
             oracle = json.loads((fold_dir / "candidate_oracle_pretrain.json").read_text(encoding="utf-8"))
-            overall_pass = oracle["val"]["ale"] <= args.max_val_oracle_ale
-            hard3_pass = oracle["val"]["hard3_ale"] <= args.max_val_hard3_oracle_ale
+            stage1_metrics = None
+            if args.coarse_source == "stage1_oof":
+                stage1_metrics = json.loads(
+                    (fold_dir / "stage1_global_coarse" / "metrics_train_val.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            gate = oracle_gate_status(oracle["val"], args)
             reports.append(
                 {
                     "repeat": repeat,
@@ -575,15 +674,30 @@ def main():
                     "validation_hard3_oracle_ale": oracle["val"]["hard3_ale"],
                     "validation_oracle_p95": oracle["val"]["p95"],
                     "validation_oracle_max": oracle["val"]["max"],
-                    "overall_gate_pass": overall_pass,
-                    "hard3_gate_pass": hard3_pass,
-                    "passed": overall_pass and hard3_pass,
+                    "validation_sample_oracle_p95": oracle["val"]["sample_ale_p95"],
+                    "validation_sample_oracle_max": oracle["val"]["sample_ale_max"],
+                    "stage1_train_oof_ale": (
+                        stage1_metrics["train_oof"]["overall_ale"] if stage1_metrics else None
+                    ),
+                    "stage1_validation_ale": (
+                        stage1_metrics["validation"]["overall_ale"] if stage1_metrics else None
+                    ),
+                    "overall_gate_pass": gate["overall"],
+                    "hard3_gate_pass": gate["hard3"],
+                    "tail_gate_pass": gate["p95"] and gate["max"] and gate["sample_max"],
+                    "passed": gate["passed"],
                 }
+            )
+            stage1_text = (
+                f"stage1_val={stage1_metrics['validation']['overall_ale']:.4f}, "
+                if stage1_metrics else ""
             )
             print(
                 f"Fold {fold_index} candidate oracle: overall={oracle['val']['ale']:.4f}, "
                 f"core20={oracle['val']['core20_ale']:.4f}, hard3={oracle['val']['hard3_ale']:.4f}, "
-                f"passed={overall_pass and hard3_pass}",
+                f"{stage1_text}"
+                f"sample_max={oracle['val']['sample_ale_max']:.4f}, "
+                f"passed={gate['passed']}",
                 flush=True,
             )
         write_csv(output_dir / "preflight_oracle_summary.csv", reports)
@@ -593,7 +707,7 @@ def main():
         )
         print(
             f"\nPreflight completed for {len(reports)} folds; passed={all_passed}. "
-            "No training was started.",
+            "Stage 1 was trained/cached; Stage 2 training was not started.",
             flush=True,
         )
         if not all_passed and not args.skip_oracle_gate:
@@ -631,12 +745,18 @@ def main():
         "fold_ale_std": float(np.std([row["ale"] for row in summaries])),
         "total_seconds": float(time.time() - started),
         "publication_safe_alignment": args.alignment == "mesh_icp",
-        "publication_safe_pipeline": args.alignment == "mesh_icp" and args.coarse_source == "train_template",
+        "publication_safe_pipeline": args.alignment == "mesh_icp"
+        and args.coarse_source in ("train_template", "stage1_oof"),
         "publication_safety_note": (
             "External AGH/stacker centers inherit their original expert-landmark Procrustes preprocessing; "
             "use train_template CV for the primary publication result."
             if args.coarse_source == "external"
-            else "No validation/test expert landmark is used for alignment or coarse-center construction."
+            else (
+                "Train centers are nested OOF Stage 1 predictions; validation/test centers come "
+                "from the outer-train-only Stage 1 model. No test expert landmark is used."
+                if args.coarse_source == "stage1_oof"
+                else "No validation/test expert landmark is used for alignment or coarse-center construction."
+            )
         ),
         "primary_target_met": float(np.mean([row["ale"] for row in summaries])) < 2.0,
     }

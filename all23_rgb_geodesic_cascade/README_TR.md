@@ -8,16 +8,19 @@ yeni deney hattıdır.
 
 - Landmark sözleşmesi sabittir: orta hat `LM0..LM12`, bilateral çiftler
   `(13,16), (14,15), (17,18), (19,20), (21,22)`.
-- Varsayılan kayıt `mesh_icp` seçeneğidir. Sadece train meshlerinden medoid seçer; PCA ve
-  point-to-plane ICP sırasında hiçbir expert landmark kullanmaz ve ölçek değiştirmez.
+- Varsayılan kayıt `mesh_icp` seçeneğidir. Yalnız train meshlerinden seçilen sekiz merkezi yüzün
+  robust karşılık medyanıyla çoklu-mesh atlas kurar; PCA ve point-to-plane ICP sırasında hiçbir
+  expert landmark kullanmaz ve ölçek değiştirmez.
 - RGB atılmaz. Girdi sırası `XYZ, RGB, lokal RGB kontrastı, normal, yoğunluk, eğrilik`tir.
 - Global encoder mesh edge'leri üzerinde seyrek Point Transformer uygular.
-- Her landmark için anatomik yarıçaplı geodezik ROI ve ortak/specialized refinement head vardır.
+- Ayrı Stage 1 global coarse ağı, outer-train için nested OOF tahmin üretir. Validation/test
+  merkezleri yalnız outer-train modelinden gelir.
+- Her landmark için Stage 1 tahmini çevresinde dinamik, anatomik yarıçaplı geodezik ROI ve
+  ortak/specialized refinement head vardır.
 - Point dropout vertexleri edge, softmax ve loss dışında bırakır.
 - Checkpoint seçimi doğrudan all-23 validation ALE ile yapılır.
 - Test seti checkpoint, postprocess ve confidence calibration kilitlendikten sonra okunur.
-- Eğitim başlamadan validation candidate-oracle ALE hesaplanır; varsayılan `1.5 mm` sınırı
-  aşılırsa yetersiz ROI kapsamıyla pahalı koşu başlatılmaz.
+- Stage 2 başlamadan overall/Hard3/p95/max/sample-level candidate-oracle kapıları uygulanır.
 
 ## Colab Kurulumu
 
@@ -52,17 +55,36 @@ A100 sabit-split geliştirme deneyi:
 !python -u colab_run_all23_rgb_geodesic.py --preset a100 --seed 42
 ```
 
-Leakage-free 5-fold koşusundan önce tüm foldların ROI kapsamını doğrulayın. Bu komut eğitim
-başlatmaz; train-only template, mesh-ICP, normalizasyon ve geodezik ROI cache'lerini hazırlar:
+Leakage-free 5-fold koşusundan önce tüm foldların Stage 1 ve ROI kapsamını doğrulayın. Bu komut
+Stage 2 eğitimini başlatmaz; train-only çoklu atlası, nested OOF Stage 1 modellerini ve geodezik
+ROI cache'lerini hazırlar. İlk kullanım uzun sürebilir; ana koşu aynı Stage 1 checkpoint/cache'lerini
+yeniden kullanır. Beş outer foldun her birinde üç inner OOF model ve bir outer-train model olmak
+üzere toplam `20` küçük Stage 1 modeli eğitilir; bu nedenle preflight birkaç saat sürebilir:
 
 ```python
 %cd /content/comparative-study/all23_rgb_geodesic_cascade
 !python -u colab_run_all23_rgb_geodesic.py --preset cv_preflight --seed 42
 ```
 
-`preflight_oracle_summary.csv` içinde beş foldun da `validation_oracle_ale <= 1.5 mm` ve
-`validation_hard3_oracle_ale <= 2.5 mm` koşullarını sağlaması gerekir. Kontrol geçtikten sonra
-leakage-free 5-fold yayın koşusu:
+`preflight_oracle_summary.csv` içinde beş foldun da aşağıdaki koşulları sağlaması gerekir:
+
+```text
+validation_oracle_ale <= 1.5 mm
+validation_hard3_oracle_ale <= 2.5 mm
+validation_oracle_p95 <= 2.0 mm
+validation_oracle_max <= 15.0 mm
+validation_sample_oracle_max <= 2.0 mm
+```
+
+Aynı tabloda `stage1_train_oof_ale` ve `stage1_validation_ale` bulunur. Bu iki değer coarse
+model kalitesini, oracle sütunları ise dinamik ROI'nin uzman noktasını gerçekten kapsayıp
+kapsamadığını ayırarak gösterir. Stage 1 tamamlandıktan sonra kalite kapısı başarısız olsa bile
+checkpoint ve tahminler silinmez; eşik/ROI ayarı düzeltilerek yeniden çağrıldığında pahalı Stage 1
+eğitimi cache'den yüklenir.
+Preflight bağlantısı bir outer foldun ortasında kesilirse tamamlanmış inner Stage 1 modelleri de
+`training_complete.json` imzaları üzerinden yeniden kullanılır; yalnız eksik model devam ettirilir.
+
+Kontrol geçtikten sonra leakage-free 5-fold yayın koşusu:
 
 ```python
 %cd /content/comparative-study/all23_rgb_geodesic_cascade
@@ -75,10 +97,12 @@ Pipeline kilitlendikten sonraki tekrarlı 5-fold nihai koşu:
 !python -u colab_run_all23_rgb_geodesic.py --preset cv_repeated --seed 42
 ```
 
-`cv` presetinde train/val/test coarse center yalnız ilgili foldun train landmark ortalamasından
-üretilir. Böylece refiner eğitim ve değerlendirmede aynı coarse-center dağılımını görür. Eğitimde
-template merkezlerine yalnız `1 mm` jitter uygulanır; ROI noktası `1024`, anatomik ROI yarıçapı
-çarpanı `1.5` olarak kullanılır. Tüm loss hesapları AMP dışında float32 yapılır ve sonlu olmayan
+`cv` presetinde outer-train merkezleri üç inner modelin gerçek OOF tahminlerinden üretilir. Her OOF
+örneği hem model fitinden hem checkpoint validation grubundan dışlanır. Outer validation/test
+merkezleri yalnız outer-train modelinden gelir. Her inner modelde train-only template ile model
+tahmini arasındaki blend katsayısı yalnız inner-validation üzerinde seçilir; test etiketi kullanılmaz.
+ROI noktası `1024`, anatomik ROI yarıçapı çarpanı `1.5` olarak kullanılır. Tüm loss hesapları AMP
+dışında float32 yapılır ve sonlu olmayan
 batch oranı `%1` değerini aşarsa koşu açık bir hata ile durur. A100 koşuları attention geri
 yayılımındaki FP16 taşmalarını önlemek için BF16 AMP kullanır. FP16 fallback durumunda dinamik
 loss-scaler taşmaları gerçek `NaN` batchlerden ayrı kaydedilir. Sabit
@@ -86,12 +110,18 @@ split `a100` koşusunda val/test için mevcut stacker coarse tahminleri kullanı
 expert noktalarına yalnız train içinde deterministik sentetik coarse hata eklenerek üretilir. Böylece
 in-sample prediction dağılımı kaldırılır. Bununla birlikte mevcut AGH/stacker tahminleri ilk
 üretilirken expert-Procrustes kullanıldığı için sabit-split sonuç keşif/ablation niteliğindedir;
-makalenin ana sonucu `cv` presetinden alınmalıdır.
+makalenin ana sonucu `cv` presetinden alınmalıdır. Stage 2 en az `80` epoch çalışır; scheduler
+epoch `60` öncesinde devreye girmez ve ilk `5` epoch lineer LR warmup kullanır.
+
+Mesh veya landmark dosyasının boyutu/değişiklik zamanı, kayıt cache kimliğine dahildir. Bir veri
+dosyası değiştiğinde ilgili mesh kaydı, train-only atlas, normalizasyon ve Stage 1 tahminleri eski
+cache ile karışmadan yeniden oluşturulur.
 
 Eski `publication_cv_seed*` sonuçlarında train merkezi `expert + synthetic error`, val/test merkezi
 ise train template idi. Bu dağılım kayması ve bazı foldlarda görülen `NaN` nedeniyle eski CV klasörü
-bilimsel sonuç olarak kullanılmamalıdır. Düzeltilmiş preset sonuçları `publication_cv_v2_seed*`
-altına yazar.
+bilimsel sonuç olarak kullanılmamalıdır. Train-template kullanan `publication_cv_v2_seed*` koşusu
+da coarse merkez ablation'ıdır. Yeni nested-OOF sonuçları `publication_cv_stage1_v3_seed*` altına
+yazar.
 
 Log başlangıcında `Precision: AMP bfloat16` görülmelidir. `Precision: AMP float16` görülüyorsa
 çalışılan GPU BF16 desteklemiyordur; preset FP16 için düşük başlangıç scale'i (`1024`) ve ayrı
@@ -137,7 +167,13 @@ best_model.pth
 history.json
 normalization.json
 alignment/alignment_report.json
+alignment/train_multimesh_atlas.npz
 split_and_leakage_report.json
+candidate_oracle_samples_pretrain.csv
+stage1_global_coarse/complete.json
+stage1_global_coarse/metrics_train_val.json
+stage1_global_coarse/oof_predictions_train.csv
+stage1_global_coarse/predictions_{val,test}.csv
 metrics_val.json
 metrics_test.json
 landmark_metrics_{val,test}.csv

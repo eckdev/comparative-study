@@ -231,8 +231,25 @@ def prepare_mesh_record(sample, matrix, cache_dir, max_vertices=50000, include_l
     cache_dir.mkdir(parents=True, exist_ok=True)
     matrix_hash = hashlib.sha1(np.asarray(matrix, dtype=np.float32).tobytes()).hexdigest()[:10]
     label_tag = "labels" if include_landmarks else "geometry"
-    path = cache_dir / f"{sample.sample_id}.{matrix_hash}.{label_tag}.npz"
+    source_digest = hashlib.sha1()
+    source_paths = [Path(sample.mesh_path)]
+    if include_landmarks:
+        source_paths.append(Path(sample.landmark_path))
+    for source_path in source_paths:
+        stat = source_path.stat()
+        source_digest.update(
+            f"{source_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+        )
+    source_hash = source_digest.hexdigest()[:10]
+    path = cache_dir / f"{sample.sample_id}.{matrix_hash}.{source_hash}.{label_tag}.npz"
     if path.exists():
+        with np.load(path) as cached:
+            cached_vertex_count = len(cached["points"])
+        if cached_vertex_count > int(max_vertices):
+            raise ValueError(
+                f"{sample.sample_id} has {cached_vertex_count} cached vertices, above "
+                f"--max-vertices={max_vertices}."
+            )
         return path
     mesh = load_mesh(sample.mesh_path)
     points_raw = np.asarray(mesh.vertices, dtype=np.float32)
@@ -269,7 +286,14 @@ def prepare_mesh_record(sample, matrix, cache_dir, max_vertices=50000, include_l
 def fit_feature_normalizer(samples, records, train_ids, output_path, cap_per_mesh=4096, seed=42):
     output_path = Path(output_path)
     if output_path.exists():
-        return json.loads(output_path.read_text(encoding="utf-8"))
+        cached = json.loads(output_path.read_text(encoding="utf-8"))
+        expected_records = {sample_id: Path(records[sample_id]).name for sample_id in train_ids}
+        if (
+            cached.get("normalizer_version") == 2
+            and cached.get("fit_sample_ids") == list(train_ids)
+            and cached.get("fit_record_files") == expected_records
+        ):
+            return cached
     by_id = {sample.sample_id: sample for sample in samples}
     chunks = []
     rng = np.random.default_rng(seed)
@@ -287,9 +311,11 @@ def fit_feature_normalizer(samples, records, train_ids, output_path, cap_per_mes
     mean[9:12] = 0.0
     std[9:12] = 1.0
     payload = {
+        "normalizer_version": 2,
         "mean": mean.astype(float).tolist(),
         "std": std.astype(float).tolist(),
         "fit_sample_ids": list(train_ids),
+        "fit_record_files": {sample_id: Path(records[sample_id]).name for sample_id in train_ids},
         "feature_order": [
             "x", "y", "z", "r", "g", "b", "local_dr", "local_dg", "local_db",
             "nx", "ny", "nz", "density", "curvature",
@@ -421,6 +447,148 @@ def build_roi_cache(
         oracle_error=np.asarray(oracles, dtype=np.float32),
     )
     return path
+
+
+class GlobalSurfaceDataset(Dataset):
+    """Full-mesh dataset for the label-safe Stage 1 coarse model."""
+
+    def __init__(
+        self,
+        samples,
+        sample_ids,
+        records,
+        transforms,
+        normalizer,
+        training=False,
+        include_expert=True,
+        rotation_degrees=0.0,
+        point_noise_mm=0.0,
+        rgb_noise=0.0,
+        point_dropout=0.0,
+        use_rgb=True,
+        memory_cache=True,
+        seed=42,
+    ):
+        by_id = {sample.sample_id: sample for sample in samples}
+        self.samples = [by_id[sample_id] for sample_id in sample_ids]
+        self.records = records
+        self.transforms = transforms
+        self.mean = np.asarray(normalizer["mean"], dtype=np.float32)
+        self.std = np.asarray(normalizer["std"], dtype=np.float32)
+        self.training = bool(training)
+        self.include_expert = bool(include_expert)
+        self.rotation_degrees = float(rotation_degrees)
+        self.point_noise_mm = float(point_noise_mm)
+        self.rgb_noise = float(rgb_noise)
+        self.point_dropout = float(point_dropout)
+        self.use_rgb = bool(use_rgb)
+        self.memory_cache = bool(memory_cache)
+        self.seed = int(seed)
+        self.epoch = 0
+        self._record_memory = {}
+
+    def __len__(self):
+        return len(self.samples)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        if sample.sample_id not in self._record_memory:
+            with np.load(self.records[sample.sample_id]) as stored:
+                record = {
+                    "points": stored["points"].astype(np.float32),
+                    "features": stored["features"].astype(np.float32),
+                    "edge_index": stored["edge_index"].astype(np.int64),
+                    "landmarks": stored["landmarks"].astype(np.float32) if "landmarks" in stored.files else None,
+                }
+            if self.memory_cache:
+                self._record_memory[sample.sample_id] = record
+        else:
+            record = self._record_memory[sample.sample_id]
+        points = record["points"].copy()
+        raw_features = record["features"].copy()
+        edge_index = record["edge_index"]
+        expert = None
+        if self.include_expert:
+            if record["landmarks"] is None:
+                expert = apply_transform(
+                    read_landmarks(sample.landmark_path), self.transforms[sample.sample_id]
+                ).astype(np.float32)
+            else:
+                expert = record["landmarks"].copy()
+        rng = np.random.default_rng(self.seed + index + self.epoch * 100_003)
+        if self.training and self.rotation_degrees > 0:
+            from scipy.spatial.transform import Rotation
+
+            angles = rng.uniform(-self.rotation_degrees, self.rotation_degrees, size=3)
+            rotation = Rotation.from_euler("xyz", angles, degrees=True).as_matrix().astype(np.float32)
+            center = self.mean[:3]
+            points = (points - center) @ rotation.T + center
+            if expert is not None:
+                expert = (expert - center) @ rotation.T + center
+            raw_features[:, :3] = points
+            raw_features[:, 9:12] = raw_features[:, 9:12] @ rotation.T
+        if self.training and self.point_noise_mm > 0:
+            points += rng.normal(0.0, self.point_noise_mm, size=points.shape).astype(np.float32)
+            raw_features[:, :3] = points
+        if self.training and self.rgb_noise > 0:
+            raw_features[:, 3:6] = np.clip(
+                raw_features[:, 3:6]
+                + rng.normal(0.0, self.rgb_noise, size=raw_features[:, 3:6].shape),
+                0.0,
+                1.0,
+            )
+        if not self.use_rgb:
+            raw_features[:, 3:9] = 0.0
+        vertex_mask = np.ones(len(points), dtype=np.bool_)
+        if self.training and self.point_dropout > 0:
+            vertex_mask = rng.random(len(points)) >= self.point_dropout
+            if not np.any(vertex_mask):
+                vertex_mask[0] = True
+        result = {
+            "sample_id": sample.sample_id,
+            "class": sample.class_name,
+            "gender": sample.gender,
+            "subject_id": sample.subject_id,
+            "points": torch.from_numpy(points),
+            "features": torch.from_numpy(((raw_features - self.mean) / self.std).astype(np.float32)),
+            "edge_index": torch.from_numpy(edge_index),
+            "vertex_mask": torch.from_numpy(vertex_mask),
+        }
+        if expert is not None:
+            result["expert"] = torch.from_numpy(expert)
+        return result
+
+
+def collate_surface_graphs(items):
+    points, features, batches, edges, masks = [], [], [], [], []
+    offset = 0
+    for batch_index, item in enumerate(items):
+        active = item["vertex_mask"]
+        edge_index = item["edge_index"]
+        edge_keep = active[edge_index[0]] & active[edge_index[1]]
+        points.append(item["points"])
+        features.append(item["features"])
+        batches.append(torch.full((len(item["points"]),), batch_index, dtype=torch.long))
+        edges.append(edge_index[:, edge_keep] + offset)
+        masks.append(active)
+        offset += len(item["points"])
+    batch = {
+        "sample_id": [item["sample_id"] for item in items],
+        "class": [item["class"] for item in items],
+        "gender": [item["gender"] for item in items],
+        "subject_id": torch.tensor([item["subject_id"] for item in items], dtype=torch.long),
+        "points": torch.cat(points, dim=0),
+        "features": torch.cat(features, dim=0),
+        "batch": torch.cat(batches, dim=0),
+        "edge_index": torch.cat(edges, dim=1),
+        "vertex_mask": torch.cat(masks, dim=0),
+    }
+    if all("expert" in item for item in items):
+        batch["expert"] = torch.stack([item["expert"] for item in items])
+    return batch
 
 
 class RGBGeodesicDataset(Dataset):

@@ -109,6 +109,85 @@ def mse_over_mesh_coordinate(logits, candidates, mask, sigmas):
     return torch.gather(candidates, 2, selected[..., None, None].expand(-1, -1, 1, 3)).squeeze(2)
 
 
+class GlobalCoarseNetwork(nn.Module):
+    """Stage 1 full-surface network used to center dynamic Stage 2 ROIs."""
+
+    def __init__(
+        self,
+        input_dim=14,
+        width=96,
+        global_blocks=3,
+        heads=4,
+        dropout=0.1,
+        coordinate_topk=50,
+        coordinate_temperature=0.75,
+    ):
+        super().__init__()
+        self.width = int(width)
+        self.coordinate_topk = int(coordinate_topk)
+        self.coordinate_temperature = float(coordinate_temperature)
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, width),
+            nn.LayerNorm(width),
+            nn.GELU(),
+            nn.Linear(width, width),
+        )
+        self.global_blocks = nn.ModuleList(
+            [SparsePointTransformerBlock(width, heads, dropout) for _ in range(int(global_blocks))]
+        )
+        self.landmark_embedding = nn.Parameter(torch.randn(NUM_LANDMARKS, width) * 0.02)
+        self.global_context = nn.Sequential(
+            nn.Linear(width * 2, width), nn.GELU(), nn.Linear(width, width)
+        )
+        self.point_key = nn.Linear(width, width, bias=False)
+        self.token_query = nn.Linear(width, width, bias=False)
+        self.confidence_head = nn.Sequential(
+            nn.Linear(width, width // 2), nn.GELU(), nn.Linear(width // 2, 1)
+        )
+
+    def forward(self, batch):
+        points = batch["points"]
+        graph_batch = batch["batch"]
+        batch_count = len(batch["sample_id"])
+        encoded = self.input_projection(batch["features"])
+        for block in self.global_blocks:
+            encoded = block(encoded, points, batch["edge_index"])
+        pooled = torch.cat(
+            [
+                scatter_mean(encoded, graph_batch, batch_count),
+                scatter_max(encoded, graph_batch, batch_count),
+            ],
+            dim=-1,
+        )
+        tokens = self.global_context(pooled)[:, None, :] + self.landmark_embedding[None, :, :]
+        point_keys = self.point_key(encoded)
+        token_queries = self.token_query(tokens)
+        logits = torch.sum(point_keys[:, None, :] * token_queries[graph_batch], dim=-1)
+        logits = logits / math.sqrt(self.width)
+        coordinates = []
+        for batch_index in range(batch_count):
+            selected = graph_batch == batch_index
+            local_logits = logits[selected].transpose(0, 1)[None]
+            local_points = points[selected][None, None].expand(1, NUM_LANDMARKS, -1, 3)
+            local_mask = batch["vertex_mask"][selected][None, None].expand(
+                1, NUM_LANDMARKS, -1
+            )
+            coordinates.append(
+                topk_soft_coordinate(
+                    local_logits,
+                    local_points,
+                    local_mask,
+                    self.coordinate_topk,
+                    self.coordinate_temperature,
+                )[0]
+            )
+        return {
+            "coarse_logits": logits,
+            "coordinates": torch.stack(coordinates),
+            "log_var": self.confidence_head(tokens).squeeze(-1).clamp(-6.0, 6.0),
+        }
+
+
 class All23RGBGeodesicCascade(nn.Module):
     def __init__(
         self,

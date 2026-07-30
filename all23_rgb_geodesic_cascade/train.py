@@ -249,6 +249,11 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
     history = []
     started = time.time()
     for epoch in range(1, args.epochs + 1):
+        if args.lr_warmup_epochs > 0 and epoch <= args.lr_warmup_epochs:
+            fraction = epoch / max(int(args.lr_warmup_epochs), 1)
+            warmup_lr = float(args.lr) * (0.2 + 0.8 * fraction)
+            for group in optimizer.param_groups:
+                group["lr"] = warmup_lr
         if hasattr(train_loader.dataset, "set_epoch"):
             train_loader.dataset.set_epoch(epoch)
         components, per_landmark = train_epoch(
@@ -256,7 +261,8 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
         )
         validation = collect_outputs(model, val_loader, device, args, normalizer, use_tta=args.tta_validation)
         score = float(validation["errors"].mean())
-        scheduler.step(score)
+        if epoch >= args.scheduler_start_epoch:
+            scheduler.step(score)
         row = {
             "epoch": epoch,
             "validation_ale": score,
@@ -283,10 +289,12 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
                 },
                 checkpoint_path,
             )
-        else:
+        elif epoch >= args.min_epochs:
             stale += 1
+        else:
+            stale = 0
         (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-        if stale >= args.patience:
+        if epoch >= args.min_epochs and stale >= args.patience:
             print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}", flush=True)
             break
     try:
