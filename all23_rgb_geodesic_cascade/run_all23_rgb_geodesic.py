@@ -60,6 +60,27 @@ def resolve_device(requested):
     return torch.device(requested)
 
 
+def resolve_precision(args, device):
+    args.mixed_precision = bool(args.mixed_precision and device.type == "cuda")
+    if not args.mixed_precision:
+        args.amp_dtype = "float32"
+        return
+    if args.amp_dtype == "auto":
+        supports_bfloat16 = bool(
+            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        )
+        args.amp_dtype = "bfloat16" if supports_bfloat16 else "float16"
+    if args.amp_dtype == "bfloat16":
+        supports_bfloat16 = bool(
+            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        )
+        if not supports_bfloat16:
+            raise RuntimeError(
+                "--amp-dtype=bfloat16 was requested, but this CUDA device does not support BF16. "
+                "Use --amp-dtype=float16 or disable --mixed-precision."
+            )
+
+
 def make_cv_splits(samples, folds, val_fraction, seed):
     ids = np.asarray([sample.sample_id for sample in samples])
     strata = np.asarray([f"{sample.class_name}_{sample.gender}" for sample in samples])
@@ -457,6 +478,7 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-nonfinite-fraction", type=float, default=0.02)
+    parser.add_argument("--max-amp-overflow-fraction", type=float, default=0.10)
     parser.add_argument("--coordinate-mode", choices=("topk", "mse_over_mesh"), default="topk")
     parser.add_argument("--coordinate-topk", type=int, default=30)
     parser.add_argument("--coordinate-temperature", type=float, default=0.75)
@@ -478,6 +500,8 @@ def build_parser():
     parser.add_argument("--tta", action="store_true")
     parser.add_argument("--tta-validation", action="store_true")
     parser.add_argument("--mixed-precision", action="store_true")
+    parser.add_argument("--amp-dtype", choices=("auto", "float16", "bfloat16"), default="auto")
+    parser.add_argument("--amp-init-scale", type=float, default=1024.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--no-memory-cache", action="store_true")
@@ -494,11 +518,15 @@ def main():
     set_seed(args.seed)
     stage = experiment_settings(args)
     device = resolve_device(args.device)
-    args.mixed_precision = bool(args.mixed_precision and device.type == "cuda")
+    resolve_precision(args, device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     samples = discover_samples(args.data_root)
     print(f"Device: {device}; samples={len(samples)}; experiment=E{stage}", flush=True)
+    print(
+        f"Precision: {'AMP ' + args.amp_dtype if args.mixed_precision else 'float32'}",
+        flush=True,
+    )
     print(f"Alignment: {args.alignment}; coarse source: {args.coarse_source}", flush=True)
 
     anatomy = {

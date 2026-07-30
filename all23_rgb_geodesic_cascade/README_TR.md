@@ -79,7 +79,9 @@ Pipeline kilitlendikten sonraki tekrarlı 5-fold nihai koşu:
 üretilir. Böylece refiner eğitim ve değerlendirmede aynı coarse-center dağılımını görür. Eğitimde
 template merkezlerine yalnız `1 mm` jitter uygulanır; ROI noktası `1024`, anatomik ROI yarıçapı
 çarpanı `1.5` olarak kullanılır. Tüm loss hesapları AMP dışında float32 yapılır ve sonlu olmayan
-batch oranı `%1` değerini aşarsa koşu açık bir hata ile durur. Sabit
+batch oranı `%1` değerini aşarsa koşu açık bir hata ile durur. A100 koşuları attention geri
+yayılımındaki FP16 taşmalarını önlemek için BF16 AMP kullanır. FP16 fallback durumunda dinamik
+loss-scaler taşmaları gerçek `NaN` batchlerden ayrı kaydedilir. Sabit
 split `a100` koşusunda val/test için mevcut stacker coarse tahminleri kullanılır; train merkezleri
 expert noktalarına yalnız train içinde deterministik sentetik coarse hata eklenerek üretilir. Böylece
 in-sample prediction dağılımı kaldırılır. Bununla birlikte mevcut AGH/stacker tahminleri ilk
@@ -90,6 +92,10 @@ Eski `publication_cv_seed*` sonuçlarında train merkezi `expert + synthetic err
 ise train template idi. Bu dağılım kayması ve bazı foldlarda görülen `NaN` nedeniyle eski CV klasörü
 bilimsel sonuç olarak kullanılmamalıdır. Düzeltilmiş preset sonuçları `publication_cv_v2_seed*`
 altına yazar.
+
+Log başlangıcında `Precision: AMP bfloat16` görülmelidir. `Precision: AMP float16` görülüyorsa
+çalışılan GPU BF16 desteklemiyordur; preset FP16 için düşük başlangıç scale'i (`1024`) ve ayrı
+overflow denetimi kullanır.
 
 ## Kontrollü Ablation
 

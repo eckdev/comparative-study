@@ -73,6 +73,7 @@ def command_for(preset, seed):
         ]
     if preset == "a100":
         return fixed_external(f"full_fixed_seed{seed}", "FULL") + [
+            "--amp-dtype", "bfloat16",
             "--roi-points", "512",
             "--width", "128",
             "--global-blocks", "4",
@@ -100,6 +101,8 @@ def command_for(preset, seed):
             "--patience", "35",
             "--lr", "0.0003",
             "--max-nonfinite-fraction", "0.01",
+            "--max-amp-overflow-fraction", "0.10",
+            "--amp-dtype", "bfloat16",
             "--seed", str(seed),
         ]
         if preset == "cv_preflight":

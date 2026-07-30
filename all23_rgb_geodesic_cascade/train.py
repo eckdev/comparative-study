@@ -14,15 +14,30 @@ from .losses import compute_loss
 from .model import mse_over_mesh_coordinate, topk_soft_coordinate
 
 
-def autocast_context(device, enabled):
-    return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled and device.type == "cuda")
+def amp_torch_dtype(name):
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    raise ValueError(f"Unsupported AMP dtype: {name}")
 
 
-def grad_scaler(enabled):
+def autocast_context(device, enabled, amp_dtype):
+    dtype = amp_torch_dtype(amp_dtype) if enabled else torch.float16
+    return torch.autocast(
+        device_type=device.type,
+        dtype=dtype,
+        enabled=enabled and device.type == "cuda",
+    )
+
+
+def grad_scaler(enabled, amp_dtype, init_scale):
+    # BF16 has FP32-like exponent range and does not need dynamic loss scaling.
+    scaler_enabled = bool(enabled and amp_dtype == "float16")
     try:
-        return torch.amp.GradScaler("cuda", enabled=enabled)
+        return torch.amp.GradScaler("cuda", enabled=scaler_enabled, init_scale=float(init_scale))
     except TypeError:
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+        return torch.cuda.amp.GradScaler(enabled=scaler_enabled, init_scale=float(init_scale))
 
 
 def move_batch(batch, device):
@@ -36,12 +51,13 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
     landmark_sum = np.zeros(NUM_LANDMARKS, dtype=np.float64)
     landmark_count = 0
     skipped_nonfinite = 0
+    amp_overflows = 0
     total_batches = 0
     for batch in tqdm(loader, desc="train", leave=False, disable=args.no_tqdm):
         total_batches += 1
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, args.mixed_precision):
+        with autocast_context(device, args.mixed_precision, args.amp_dtype):
             outputs = model(batch, coordinate_mode=args.coordinate_mode)
         loss, errors, components = compute_loss(outputs, batch, loss_weights, args.region_positive_weight)
         if not torch.isfinite(loss):
@@ -57,12 +73,24 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
         grad_limit = args.grad_clip if args.grad_clip > 0 else float("inf")
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_limit)
         if not torch.isfinite(grad_norm):
-            skipped_nonfinite += 1
             if scaler.is_enabled():
+                amp_overflows += 1
+                previous_scale = scaler.get_scale()
                 scaler.step(optimizer)  # GradScaler records the overflow and skips the update.
                 scaler.update()
+                current_scale = scaler.get_scale()
+                print(
+                    f"Warning: AMP overflow batch {amp_overflows}; "
+                    f"scale {previous_scale:g}->{current_scale:g}",
+                    flush=True,
+                )
+            else:
+                skipped_nonfinite += 1
+                print(
+                    f"Warning: skipped non-finite gradient batch {skipped_nonfinite}",
+                    flush=True,
+                )
             optimizer.zero_grad(set_to_none=True)
-            print(f"Warning: skipped non-finite gradient batch {skipped_nonfinite}", flush=True)
             continue
         scaler.step(optimizer)
         scaler.update()
@@ -75,16 +103,31 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
     if count == 0:
         raise RuntimeError("Every training batch was non-finite; no optimizer update was applied")
     nonfinite_fraction = skipped_nonfinite / max(total_batches, 1)
+    amp_overflow_fraction = amp_overflows / max(total_batches, 1)
     if nonfinite_fraction > args.max_nonfinite_fraction:
         raise RuntimeError(
             f"Non-finite batch fraction {nonfinite_fraction:.3f} exceeds "
             f"--max-nonfinite-fraction={args.max_nonfinite_fraction:.3f}"
         )
+    if amp_overflow_fraction > args.max_amp_overflow_fraction:
+        raise RuntimeError(
+            f"AMP overflow fraction {amp_overflow_fraction:.3f} exceeds "
+            f"--max-amp-overflow-fraction={args.max_amp_overflow_fraction:.3f}"
+        )
     running["skipped_nonfinite_batches"] = float(skipped_nonfinite)
     running["nonfinite_batch_fraction"] = float(nonfinite_fraction)
+    running["amp_overflow_batches"] = float(amp_overflows)
+    running["amp_overflow_fraction"] = float(amp_overflow_fraction)
     return (
         {
-            name: value if name in ("skipped_nonfinite_batches", "nonfinite_batch_fraction") else value / max(count, 1)
+            name: value
+            if name in (
+                "skipped_nonfinite_batches",
+                "nonfinite_batch_fraction",
+                "amp_overflow_batches",
+                "amp_overflow_fraction",
+            )
+            else value / max(count, 1)
             for name, value in running.items()
         },
         (landmark_sum / max(landmark_count, 1)).tolist(),
@@ -151,7 +194,7 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
         heatmaps, variances = [], []
         for angle, mirror in variants:
             variant, rotation, center = transform_batch(batch, normalizer, angle, mirror)
-            with autocast_context(device, args.mixed_precision):
+            with autocast_context(device, args.mixed_precision, args.amp_dtype):
                 outputs = model(variant, coordinate_mode=args.coordinate_mode)
             logits = outputs["local_logits"].float()
             log_var = outputs["log_var"].float()
@@ -200,7 +243,7 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=args.scheduler_patience, min_lr=1e-6
     )
-    scaler = grad_scaler(args.mixed_precision)
+    scaler = grad_scaler(args.mixed_precision, args.amp_dtype, args.amp_init_scale)
     checkpoint_path = output_dir / "best_model.pth"
     best_score, best_epoch, stale = float("inf"), 0, 0
     history = []

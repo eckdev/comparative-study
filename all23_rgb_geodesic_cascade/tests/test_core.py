@@ -8,6 +8,7 @@ from all23_rgb_geodesic_cascade.losses import (
     LossWeights, adaptive_wing_loss, compute_loss, region_loss,
 )
 from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade, segment_softmax
+from all23_rgb_geodesic_cascade.train import amp_torch_dtype
 
 
 def test_anatomical_contract():
@@ -138,3 +139,8 @@ def test_roi_radius_scale_is_applied_consistently_in_model():
     )
     assert torch.isclose(model.roi_radii[0], torch.tensor(52.5))
     assert torch.isclose(model.roi_radii[21], torch.tensor(67.5))
+
+
+def test_amp_dtype_mapping():
+    assert amp_torch_dtype("float16") == torch.float16
+    assert amp_torch_dtype("bfloat16") == torch.bfloat16
