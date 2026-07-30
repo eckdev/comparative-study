@@ -80,22 +80,31 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    if preset in ("cv", "cv_repeated"):
+    if preset in ("cv", "cv_repeated", "cv_preflight"):
         repeats = "3" if preset == "cv_repeated" else "1"
-        return common(f"publication_{preset}_seed{seed}") + [
+        output_preset = "cv" if preset == "cv_preflight" else preset
+        command = common(f"publication_{output_preset}_v2_seed{seed}") + [
             "--protocol", "cv",
             "--folds", "5",
             "--cv-repeats", repeats,
             "--coarse-source", "train_template",
+            "--train-center-mode", "template",
+            "--center-jitter-mm", "1.0",
             "--alignment", "mesh_icp",
             "--experiment", "FULL",
-            "--roi-points", "512",
+            "--roi-points", "1024",
+            "--roi-radius-scale", "1.5",
             "--width", "128",
             "--global-blocks", "4",
             "--epochs", "200",
             "--patience", "35",
+            "--lr", "0.0003",
+            "--max-nonfinite-fraction", "0.01",
             "--seed", str(seed),
         ]
+        if preset == "cv_preflight":
+            command.append("--preflight-only")
+        return command
     if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 7:
         experiment = preset.upper()
         return fixed_external(f"ablation_{preset}_seed{seed}", experiment) + [
@@ -106,7 +115,7 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    raise ValueError("Preset must be smoke, a100, cv, cv_repeated, or e0..e7")
+    raise ValueError("Preset must be smoke, a100, cv_preflight, cv, cv_repeated, or e0..e7")
 
 
 def validate_paths(preset):
@@ -114,7 +123,7 @@ def validate_paths(preset):
         required = [INITIAL_RUN]
     else:
         required = [DATA_ROOT]
-    if preset not in ("cv", "cv_repeated", "smoke", "e0"):
+    if preset not in ("cv", "cv_repeated", "cv_preflight", "smoke", "e0"):
         required.extend([SPLITS_JSON, TRANSFORM_DIR, BASE_RUN, INITIAL_RUN])
     elif preset == "smoke":
         required.append(SPLITS_JSON)

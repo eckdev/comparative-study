@@ -344,9 +344,20 @@ def _select_roi(indices, distances, point_count, seed):
     return selected.astype(np.int64), np.ones(point_count, dtype=np.bool_)
 
 
-def build_roi_cache(record_path, coarse, roi_points, cache_dir, sample_id, seed, landmarks=None):
-    digest = hashlib.sha1(np.asarray(coarse, dtype=np.float32).tobytes()).hexdigest()[:10]
-    path = Path(cache_dir) / f"{sample_id}.v2.{roi_points}.{digest}.npz"
+def build_roi_cache(
+    record_path,
+    coarse,
+    roi_points,
+    cache_dir,
+    sample_id,
+    seed,
+    landmarks=None,
+    radius_scale=1.0,
+):
+    radius_scale = float(radius_scale)
+    digest_source = np.asarray(coarse, dtype=np.float32).tobytes() + np.float32(radius_scale).tobytes()
+    digest = hashlib.sha1(digest_source).hexdigest()[:10]
+    path = Path(cache_dir) / f"{sample_id}.v3.{roi_points}.r{radius_scale:g}.{digest}.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return path
@@ -367,15 +378,16 @@ def build_roi_cache(record_path, coarse, roi_points, cache_dir, sample_id, seed,
     graph = csr_matrix((edge_weights, (src, dst)), shape=(len(points), len(points)))
     coarse_seeds = tree.query(coarse, k=1)[1].astype(np.int64)
     expert_seeds = tree.query(landmarks, k=1)[1].astype(np.int64)
+    max_radius = max(roi_radius_mm(index) for index in range(NUM_LANDMARKS)) * radius_scale
     distance_matrix = dijkstra(
         graph,
         directed=False,
         indices=np.concatenate([coarse_seeds, expert_seeds]),
-        limit=90.0,
+        limit=max(90.0, max_radius * 2.0),
     ).astype(np.float32)
     roi_indices, roi_masks, targets, regions, oracles = [], [], [], [], []
     for landmark in range(NUM_LANDMARKS):
-        radius = roi_radius_mm(landmark)
+        radius = roi_radius_mm(landmark) * radius_scale
         coarse_distances = distance_matrix[landmark]
         candidates = np.flatnonzero(np.isfinite(coarse_distances) & (coarse_distances <= radius))
         geodesic = coarse_distances[candidates]
@@ -423,6 +435,7 @@ class RGBGeodesicDataset(Dataset):
         normalizer,
         cache_dir,
         roi_points=512,
+        roi_radius_scale=1.0,
         training=False,
         rotation_degrees=0.0,
         point_noise_mm=0.0,
@@ -444,6 +457,7 @@ class RGBGeodesicDataset(Dataset):
         self.std = np.asarray(normalizer["std"], dtype=np.float32)
         self.cache_dir = Path(cache_dir)
         self.roi_points = int(roi_points)
+        self.roi_radius_scale = float(roi_radius_scale)
         self.training = bool(training)
         self.rotation_degrees = float(rotation_degrees)
         self.point_noise_mm = float(point_noise_mm)
@@ -500,6 +514,7 @@ class RGBGeodesicDataset(Dataset):
             self.records[sample.sample_id], coarse, self.roi_points,
             self.cache_dir / "roi", sample.sample_id, self.seed,
             landmarks=expert,
+            radius_scale=self.roi_radius_scale,
         )
         if sample.sample_id not in self._roi_memory:
             with np.load(roi_path) as stored:
@@ -563,7 +578,7 @@ class RGBGeodesicDataset(Dataset):
 
 def collate_graphs(items):
     points, features, batches, edges = [], [], [], []
-    roi_indices = []
+    roi_indices, roi_masks = [], []
     offset = 0
     for batch_index, item in enumerate(items):
         active = item["vertex_mask"]
@@ -574,6 +589,7 @@ def collate_graphs(items):
         batches.append(torch.full((len(item["points"]),), batch_index, dtype=torch.long))
         edges.append(edge_index[:, edge_keep] + offset)
         roi_indices.append(item["roi_index"] + offset)
+        roi_masks.append(item["roi_mask"] & active[item["roi_index"]])
         offset += len(item["points"])
     return {
         "sample_id": [item["sample_id"] for item in items],
@@ -588,7 +604,7 @@ def collate_graphs(items):
         "coarse": torch.stack([item["coarse"] for item in items]),
         "expert": torch.stack([item["expert"] for item in items]),
         "roi_index": torch.stack(roi_indices),
-        "roi_mask": torch.stack([item["roi_mask"] for item in items]),
+        "roi_mask": torch.stack(roi_masks),
         "heatmap_target": torch.stack([item["heatmap_target"] for item in items]),
         "region_target": torch.stack([item["region_target"] for item in items]),
         "oracle_error": torch.stack([item["oracle_error"] for item in items]),

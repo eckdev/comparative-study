@@ -4,7 +4,9 @@ import torch
 from all23_rgb_geodesic_cascade.alignment import apply_transform
 from all23_rgb_geodesic_cascade.anatomy import MIDLINE, SYMMETRY_PAIRS, graph_attention_mask, mirror_permutation
 from all23_rgb_geodesic_cascade.data import assert_disjoint_splits, collate_graphs
-from all23_rgb_geodesic_cascade.losses import LossWeights, compute_loss
+from all23_rgb_geodesic_cascade.losses import (
+    LossWeights, adaptive_wing_loss, compute_loss, region_loss,
+)
 from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade, segment_softmax
 
 
@@ -64,13 +66,16 @@ def synthetic_item(vertex_count=48, roi_points=8):
         "region_target": target,
         "oracle_error": torch.zeros(23),
     }
-    item["vertex_mask"][17] = False
+    item["vertex_mask"][[3, 17]] = False
     return item
 
 
 def test_dropout_vertices_are_removed_from_edges():
     batch = collate_graphs([synthetic_item()])
     assert not torch.any(batch["edge_index"] == 17)
+    dropped_roi_positions = batch["roi_index"] == 3
+    assert torch.any(dropped_roi_positions)
+    assert not torch.any(batch["roi_mask"][dropped_roi_positions])
 
 
 def test_model_forward_and_backward_are_finite():
@@ -104,3 +109,32 @@ def test_segment_softmax_supports_mixed_precision():
     assert weights.dtype == torch.float16
     assert torch.allclose(weights[:2].float().sum(dim=0), torch.ones(2), atol=1e-3)
     assert torch.allclose(weights[2].float(), torch.ones(2), atol=1e-3)
+
+
+def test_heatmap_losses_promote_half_precision_inputs_to_float32():
+    logits = torch.tensor(
+        [[[80.0, -80.0, 0.0], [-40.0, 40.0, 0.0]]], dtype=torch.float16
+    )
+    target = torch.tensor(
+        [[[1.0, 0.0, 0.5], [0.0, 1.0, 0.5]]], dtype=torch.float16
+    )
+    mask = torch.ones_like(target, dtype=torch.bool)
+    heatmap = adaptive_wing_loss(logits, target, mask)
+    region = region_loss(logits, target, mask)
+    assert heatmap.dtype == torch.float32
+    assert region.dtype == torch.float32
+    assert torch.isfinite(heatmap)
+    assert torch.isfinite(region)
+
+
+def test_roi_radius_scale_is_applied_consistently_in_model():
+    model = All23RGBGeodesicCascade(
+        input_dim=14,
+        width=32,
+        global_blocks=1,
+        heads=4,
+        dropout=0.0,
+        roi_radius_scale=1.5,
+    )
+    assert torch.isclose(model.roi_radii[0], torch.tensor(52.5))
+    assert torch.isclose(model.roi_radii[21], torch.tensor(67.5))

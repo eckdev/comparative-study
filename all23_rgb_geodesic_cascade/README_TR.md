@@ -52,7 +52,17 @@ A100 sabit-split geliştirme deneyi:
 !python -u colab_run_all23_rgb_geodesic.py --preset a100 --seed 42
 ```
 
-Leakage-free 5-fold yayın koşusu:
+Leakage-free 5-fold koşusundan önce tüm foldların ROI kapsamını doğrulayın. Bu komut eğitim
+başlatmaz; train-only template, mesh-ICP, normalizasyon ve geodezik ROI cache'lerini hazırlar:
+
+```python
+%cd /content/comparative-study/all23_rgb_geodesic_cascade
+!python -u colab_run_all23_rgb_geodesic.py --preset cv_preflight --seed 42
+```
+
+`preflight_oracle_summary.csv` içinde beş foldun da `validation_oracle_ale <= 1.5 mm` ve
+`validation_hard3_oracle_ale <= 2.5 mm` koşullarını sağlaması gerekir. Kontrol geçtikten sonra
+leakage-free 5-fold yayın koşusu:
 
 ```python
 %cd /content/comparative-study/all23_rgb_geodesic_cascade
@@ -65,13 +75,21 @@ Pipeline kilitlendikten sonraki tekrarlı 5-fold nihai koşu:
 !python -u colab_run_all23_rgb_geodesic.py --preset cv_repeated --seed 42
 ```
 
-`cv` presetinde val/test coarse center yalnız ilgili foldun train landmark ortalamasından; train
-merkezleri ise yalnız o foldun train etiketlerine sentetik hata eklenerek üretilir. Sabit
+`cv` presetinde train/val/test coarse center yalnız ilgili foldun train landmark ortalamasından
+üretilir. Böylece refiner eğitim ve değerlendirmede aynı coarse-center dağılımını görür. Eğitimde
+template merkezlerine yalnız `1 mm` jitter uygulanır; ROI noktası `1024`, anatomik ROI yarıçapı
+çarpanı `1.5` olarak kullanılır. Tüm loss hesapları AMP dışında float32 yapılır ve sonlu olmayan
+batch oranı `%1` değerini aşarsa koşu açık bir hata ile durur. Sabit
 split `a100` koşusunda val/test için mevcut stacker coarse tahminleri kullanılır; train merkezleri
 expert noktalarına yalnız train içinde deterministik sentetik coarse hata eklenerek üretilir. Böylece
 in-sample prediction dağılımı kaldırılır. Bununla birlikte mevcut AGH/stacker tahminleri ilk
 üretilirken expert-Procrustes kullanıldığı için sabit-split sonuç keşif/ablation niteliğindedir;
 makalenin ana sonucu `cv` presetinden alınmalıdır.
+
+Eski `publication_cv_seed*` sonuçlarında train merkezi `expert + synthetic error`, val/test merkezi
+ise train template idi. Bu dağılım kayması ve bazı foldlarda görülen `NaN` nedeniyle eski CV klasörü
+bilimsel sonuç olarak kullanılmamalıdır. Düzeltilmiş preset sonuçları `publication_cv_v2_seed*`
+altına yazar.
 
 ## Kontrollü Ablation
 

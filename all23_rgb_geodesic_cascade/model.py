@@ -122,6 +122,7 @@ class All23RGBGeodesicCascade(nn.Module):
         use_anatomical_attention=True,
         use_specialized_heads=True,
         use_local_refiner=True,
+        roi_radius_scale=1.0,
     ):
         super().__init__()
         self.width = int(width)
@@ -130,6 +131,7 @@ class All23RGBGeodesicCascade(nn.Module):
         self.use_anatomical_attention = bool(use_anatomical_attention)
         self.use_specialized_heads = bool(use_specialized_heads)
         self.use_local_refiner = bool(use_local_refiner)
+        self.roi_radius_scale = float(roi_radius_scale)
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, width)
         )
@@ -159,7 +161,9 @@ class All23RGBGeodesicCascade(nn.Module):
         self.confidence_head = nn.Sequential(nn.Linear(width, width // 2), nn.GELU(), nn.Linear(width // 2, 1))
         self.register_buffer("anatomical_attention_mask", graph_attention_mask(), persistent=False)
         self.register_buffer(
-            "roi_radii", torch.tensor([roi_radius_mm(index) for index in range(NUM_LANDMARKS)]), persistent=False
+            "roi_radii",
+            torch.tensor([roi_radius_mm(index) * self.roi_radius_scale for index in range(NUM_LANDMARKS)]),
+            persistent=False,
         )
         self.register_buffer(
             "heatmap_sigmas", torch.tensor([heatmap_sigma_mm(index) for index in range(NUM_LANDMARKS)]), persistent=False

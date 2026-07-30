@@ -35,16 +35,35 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
     count = 0
     landmark_sum = np.zeros(NUM_LANDMARKS, dtype=np.float64)
     landmark_count = 0
+    skipped_nonfinite = 0
+    total_batches = 0
     for batch in tqdm(loader, desc="train", leave=False, disable=args.no_tqdm):
+        total_batches += 1
         batch = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, args.mixed_precision):
             outputs = model(batch, coordinate_mode=args.coordinate_mode)
-            loss, errors, components = compute_loss(outputs, batch, loss_weights, args.region_positive_weight)
+        loss, errors, components = compute_loss(outputs, batch, loss_weights, args.region_positive_weight)
+        if not torch.isfinite(loss):
+            skipped_nonfinite += 1
+            bad = [name for name, value in components.items() if not torch.isfinite(value)]
+            print(
+                f"Warning: skipped non-finite loss batch {skipped_nonfinite}; components={bad}",
+                flush=True,
+            )
+            continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        if args.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_limit = args.grad_clip if args.grad_clip > 0 else float("inf")
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_limit)
+        if not torch.isfinite(grad_norm):
+            skipped_nonfinite += 1
+            if scaler.is_enabled():
+                scaler.step(optimizer)  # GradScaler records the overflow and skips the update.
+                scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            print(f"Warning: skipped non-finite gradient batch {skipped_nonfinite}", flush=True)
+            continue
         scaler.step(optimizer)
         scaler.update()
         batch_size = len(batch["sample_id"])
@@ -53,8 +72,21 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
             running[name] = running.get(name, 0.0) + float(value.detach()) * batch_size
         landmark_sum += errors.detach().sum(dim=0).cpu().numpy()
         landmark_count += batch_size
+    if count == 0:
+        raise RuntimeError("Every training batch was non-finite; no optimizer update was applied")
+    nonfinite_fraction = skipped_nonfinite / max(total_batches, 1)
+    if nonfinite_fraction > args.max_nonfinite_fraction:
+        raise RuntimeError(
+            f"Non-finite batch fraction {nonfinite_fraction:.3f} exceeds "
+            f"--max-nonfinite-fraction={args.max_nonfinite_fraction:.3f}"
+        )
+    running["skipped_nonfinite_batches"] = float(skipped_nonfinite)
+    running["nonfinite_batch_fraction"] = float(nonfinite_fraction)
     return (
-        {name: value / max(count, 1) for name, value in running.items()},
+        {
+            name: value if name in ("skipped_nonfinite_batches", "nonfinite_batch_fraction") else value / max(count, 1)
+            for name, value in running.items()
+        },
         (landmark_sum / max(landmark_count, 1)).tolist(),
     )
 

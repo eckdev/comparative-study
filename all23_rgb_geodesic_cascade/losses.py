@@ -19,6 +19,8 @@ class LossWeights:
 
 
 def adaptive_wing_loss(logits, target, mask, omega=14.0, theta=0.5, epsilon=1.0, alpha=2.1):
+    logits = logits.float()
+    target = target.float()
     prediction = torch.sigmoid(logits.masked_fill(~mask, 0.0))
     difference = torch.abs(target - prediction)
     exponent = alpha - target
@@ -35,6 +37,8 @@ def adaptive_wing_loss(logits, target, mask, omega=14.0, theta=0.5, epsilon=1.0,
 
 
 def region_loss(logits, target, mask, positive_weight=20.0):
+    logits = logits.float()
+    target = target.float()
     weight = torch.where(target > 0.5, target.new_tensor(positive_weight), target.new_tensor(1.0))
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     bce = (bce * weight * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
@@ -46,6 +50,8 @@ def region_loss(logits, target, mask, positive_weight=20.0):
 
 
 def pairwise_anatomy_loss(prediction, expert):
+    prediction = prediction.float()
+    expert = expert.float()
     losses = []
     for left, right in ANATOMICAL_EDGES:
         predicted_distance = torch.linalg.norm(prediction[:, left] - prediction[:, right], dim=-1)
@@ -56,6 +62,7 @@ def pairwise_anatomy_loss(prediction, expert):
 
 
 def symmetry_loss(prediction):
+    prediction = prediction.float()
     midline_x = prediction[:, MIDLINE, 0].mean(dim=1)
     terms = []
     for left, right in SYMMETRY_PAIRS:
@@ -67,6 +74,8 @@ def symmetry_loss(prediction):
 
 
 def coarse_nearest_loss(coarse_logits, batch, expert):
+    coarse_logits = coarse_logits.float()
+    expert = expert.float()
     losses = []
     for batch_index in range(expert.shape[0]):
         selected = (batch["batch"] == batch_index) & batch["vertex_mask"]
@@ -78,19 +87,19 @@ def coarse_nearest_loss(coarse_logits, batch, expert):
 
 
 def compute_loss(outputs, batch, weights, positive_weight=20.0):
-    expert = batch["expert"]
-    prediction = outputs["final_coordinates"]
+    expert = batch["expert"].float()
+    prediction = outputs["final_coordinates"].float()
     heatmap = adaptive_wing_loss(outputs["local_logits"], batch["heatmap_target"], batch["roi_mask"])
     region = region_loss(outputs["region_logits"], batch["region_target"], batch["roi_mask"], positive_weight)
     coordinate_per_axis = F.smooth_l1_loss(prediction, expert, beta=1.0, reduction="none")
     coordinate = coordinate_per_axis.mean()
-    coarse_coordinate = F.smooth_l1_loss(outputs["coarse_coordinates"], expert, beta=2.0)
+    coarse_coordinate = F.smooth_l1_loss(outputs["coarse_coordinates"].float(), expert, beta=2.0)
     coarse_ce = coarse_nearest_loss(outputs["coarse_logits"], batch, expert)
     coarse = coarse_coordinate + 0.1 * coarse_ce
     anatomy = pairwise_anatomy_loss(prediction, expert)
     symmetric = symmetry_loss(prediction)
     euclidean = torch.linalg.norm(prediction - expert, dim=-1)
-    log_var = outputs["log_var"]
+    log_var = outputs["log_var"].float().clamp(-6.0, 6.0)
     uncertainty = (0.5 * torch.exp(-log_var) * euclidean.pow(2) + 0.5 * log_var).mean()
     clinical = F.softplus((euclidean - 2.0) / 0.5).mean()
     total = (

@@ -17,7 +17,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from all23_rgb_geodesic_cascade.alignment import build_label_free_alignment
     from all23_rgb_geodesic_cascade.anatomy import (
-        ANATOMICAL_EDGES, LANDMARK_NAMES, MIDLINE, SYMMETRY_PAIRS,
+        ANATOMICAL_EDGES, CORE20, HARD3, LANDMARK_NAMES, MIDLINE, SYMMETRY_PAIRS,
     )
     from all23_rgb_geodesic_cascade.data import (
         RGBGeodesicDataset, assert_disjoint_splits, collate_graphs, discover_samples,
@@ -31,7 +31,7 @@ if __package__ in (None, ""):
     from all23_rgb_geodesic_cascade.train import collect_outputs, fit_model
 else:
     from .alignment import build_label_free_alignment
-    from .anatomy import ANATOMICAL_EDGES, LANDMARK_NAMES, MIDLINE, SYMMETRY_PAIRS
+    from .anatomy import ANATOMICAL_EDGES, CORE20, HARD3, LANDMARK_NAMES, MIDLINE, SYMMETRY_PAIRS
     from .data import (
         RGBGeodesicDataset, assert_disjoint_splits, collate_graphs, discover_samples,
         fit_feature_normalizer, load_coarse_predictions, load_mesh, load_split_file,
@@ -136,7 +136,7 @@ def legacy_transforms(samples, legacy_root):
     return {sample.sample_id: resolve_legacy_matrix(legacy_root, sample) for sample in samples}
 
 
-def prepare_fold(samples, splits, args, fold_dir):
+def prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=True):
     assert_disjoint_splits(splits)
     by_id = {sample.sample_id: sample for sample in samples}
     selected_ids = set(splits["train"] + splits["val"] + splits["test"])
@@ -247,6 +247,7 @@ def prepare_fold(samples, splits, args, fold_dir):
             fold_dir / "cache" / "roi",
             sample.sample_id,
             args.seed,
+            radius_scale=args.roi_radius_scale,
         )
         split_name = "train" if sample.sample_id in set(splits["train"]) else "val"
         with np.load(roi_path) as roi_record:
@@ -258,20 +259,29 @@ def prepare_fold(samples, splits, args, fold_dir):
         values = np.stack(rows) if rows else np.empty((0, 23), dtype=np.float32)
         oracle_report[split_name] = {
             "ale": float(values.mean()) if values.size else None,
+            "core20_ale": float(values[:, CORE20].mean()) if values.size else None,
+            "hard3_ale": float(values[:, HARD3].mean()) if values.size else None,
             "p95": float(np.percentile(values, 95)) if values.size else None,
             "max": float(values.max()) if values.size else None,
             "fraction_above_2mm": float(np.mean(values > 2.0)) if values.size else None,
+            "per_landmark_ale": values.mean(axis=0).tolist() if values.size else None,
         }
     (fold_dir / "candidate_oracle_pretrain.json").write_text(json.dumps(oracle_report, indent=2), encoding="utf-8")
     val_oracle = oracle_report["val"]["ale"]
-    if (
-        val_oracle is not None
-        and val_oracle > args.max_val_oracle_ale
-        and not args.skip_oracle_gate
-    ):
+    val_hard3_oracle = oracle_report["val"]["hard3_ale"]
+    oracle_gate_failed = (
+        (val_oracle is not None and val_oracle > args.max_val_oracle_ale)
+        or (
+            val_hard3_oracle is not None
+            and val_hard3_oracle > args.max_val_hard3_oracle_ale
+        )
+    )
+    if enforce_oracle_gate and oracle_gate_failed and not args.skip_oracle_gate:
         raise RuntimeError(
-            f"Validation candidate oracle ALE={val_oracle:.4f} exceeds the gate "
-            f"{args.max_val_oracle_ale:.4f}. Increase ROI coverage before training."
+            "Validation candidate oracle failed: "
+            f"overall={val_oracle:.4f} (gate {args.max_val_oracle_ale:.4f}), "
+            f"hard3={val_hard3_oracle:.4f} (gate {args.max_val_hard3_oracle_ale:.4f}). "
+            "Increase ROI coverage before training."
         )
 
     common = {
@@ -283,6 +293,7 @@ def prepare_fold(samples, splits, args, fold_dir):
         "normalizer": normalizer,
         "cache_dir": fold_dir / "cache",
         "roi_points": args.roi_points,
+        "roi_radius_scale": args.roi_radius_scale,
         "use_rgb": args.use_rgb,
         "coarse_in_target_space": True,
         "memory_cache": not args.no_memory_cache,
@@ -334,6 +345,14 @@ def make_loader(dataset, batch_size, shuffle, args):
     )
 
 
+def fold_output_dir(output_dir, args, repeat, fold_index):
+    if args.protocol == "fixed":
+        return output_dir
+    if args.cv_repeats == 1:
+        return output_dir / f"fold_{fold_index}"
+    return output_dir / f"repeat_{repeat}" / f"fold_{fold_index}"
+
+
 def run_fold(samples, splits, args, fold_dir, device):
     fold_dir.mkdir(parents=True, exist_ok=True)
     datasets, normalizer = prepare_fold(samples, splits, args, fold_dir)
@@ -353,6 +372,7 @@ def run_fold(samples, splits, args, fold_dir, device):
         use_anatomical_attention=args.use_anatomical_attention,
         use_specialized_heads=args.use_specialized_heads,
         use_local_refiner=args.use_local_refiner,
+        roi_radius_scale=args.roi_radius_scale,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"Parameters: {parameter_count:,}", flush=True)
@@ -419,7 +439,9 @@ def build_parser():
     parser.add_argument("--icp-iterations", type=int, default=30)
     parser.add_argument("--max-vertices", type=int, default=50000)
     parser.add_argument("--roi-points", type=int, default=512)
+    parser.add_argument("--roi-radius-scale", type=float, default=1.0)
     parser.add_argument("--max-val-oracle-ale", type=float, default=1.5)
+    parser.add_argument("--max-val-hard3-oracle-ale", type=float, default=2.5)
     parser.add_argument("--skip-oracle-gate", action="store_true")
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--global-blocks", type=int, default=4)
@@ -434,6 +456,7 @@ def build_parser():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--max-nonfinite-fraction", type=float, default=0.02)
     parser.add_argument("--coordinate-mode", choices=("topk", "mse_over_mesh"), default="topk")
     parser.add_argument("--coordinate-topk", type=int, default=30)
     parser.add_argument("--coordinate-temperature", type=float, default=0.75)
@@ -458,6 +481,7 @@ def build_parser():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--no-memory-cache", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--bootstrap-iters", type=int, default=2000)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -503,13 +527,55 @@ def main():
 
     summaries = []
     started = time.time()
+    if args.preflight_only:
+        reports = []
+        for run_index, (repeat, fold_index, splits) in enumerate(fold_specs, start=1):
+            fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\nPreflight {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index}", flush=True)
+            prepare_fold(samples, splits, args, fold_dir, enforce_oracle_gate=False)
+            oracle = json.loads((fold_dir / "candidate_oracle_pretrain.json").read_text(encoding="utf-8"))
+            overall_pass = oracle["val"]["ale"] <= args.max_val_oracle_ale
+            hard3_pass = oracle["val"]["hard3_ale"] <= args.max_val_hard3_oracle_ale
+            reports.append(
+                {
+                    "repeat": repeat,
+                    "fold": fold_index,
+                    "train_oracle_ale": oracle["train"]["ale"],
+                    "validation_oracle_ale": oracle["val"]["ale"],
+                    "validation_core20_oracle_ale": oracle["val"]["core20_ale"],
+                    "validation_hard3_oracle_ale": oracle["val"]["hard3_ale"],
+                    "validation_oracle_p95": oracle["val"]["p95"],
+                    "validation_oracle_max": oracle["val"]["max"],
+                    "overall_gate_pass": overall_pass,
+                    "hard3_gate_pass": hard3_pass,
+                    "passed": overall_pass and hard3_pass,
+                }
+            )
+            print(
+                f"Fold {fold_index} candidate oracle: overall={oracle['val']['ale']:.4f}, "
+                f"core20={oracle['val']['core20_ale']:.4f}, hard3={oracle['val']['hard3_ale']:.4f}, "
+                f"passed={overall_pass and hard3_pass}",
+                flush=True,
+            )
+        write_csv(output_dir / "preflight_oracle_summary.csv", reports)
+        all_passed = all(report["passed"] for report in reports)
+        (output_dir / "preflight_complete.json").write_text(
+            json.dumps({"complete": all_passed, "folds": reports}, indent=2), encoding="utf-8"
+        )
+        print(
+            f"\nPreflight completed for {len(reports)} folds; passed={all_passed}. "
+            "No training was started.",
+            flush=True,
+        )
+        if not all_passed and not args.skip_oracle_gate:
+            raise RuntimeError(
+                "CV preflight failed. Inspect preflight_oracle_summary.csv and increase ROI "
+                "coverage before starting training."
+            )
+        return
     for run_index, (repeat, fold_index, splits) in enumerate(fold_specs, start=1):
-        if args.protocol == "fixed":
-            fold_dir = output_dir
-        elif args.cv_repeats == 1:
-            fold_dir = output_dir / f"fold_{fold_index}"
-        else:
-            fold_dir = output_dir / f"repeat_{repeat}" / f"fold_{fold_index}"
+        fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
         print(
             f"\nRun {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index} train/val/test="
             f"{len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}",
