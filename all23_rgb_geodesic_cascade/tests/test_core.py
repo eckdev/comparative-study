@@ -16,7 +16,10 @@ from all23_rgb_geodesic_cascade.model import (
     All23RGBGeodesicCascade, GlobalCoarseNetwork, segment_softmax,
 )
 from all23_rgb_geodesic_cascade.stage1 import (
+    _calibrate_oof_template_blend,
+    _configured_template_alpha,
     _inner_partitions,
+    _set_fixed_oof_lr,
     _stage1_quality_status,
     stage1_loss,
 )
@@ -260,6 +263,34 @@ def test_stage1_quality_gate_uses_absolute_oof_validation_gap():
     assert status["signed_gap_mm"] == -2.0
     assert not status["oof_validation_gap"]
     assert not status["passed"]
+
+
+def test_fixed_oof_lr_keeps_base_rate_until_late_tail():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=3e-4)
+    _set_fixed_oof_lr(optimizer, 3e-4, 60, 120, 5)
+    assert optimizer.param_groups[0]["lr"] == 3e-4
+    _set_fixed_oof_lr(optimizer, 3e-4, 120, 120, 5)
+    assert optimizer.param_groups[0]["lr"] < 2e-5
+
+
+def test_oof_template_alpha_is_fit_from_training_predictions(tmp_path):
+    sample_ids = ["A", "B"]
+    records = {}
+    predictions = {}
+    templates = {}
+    for sample_id in sample_ids:
+        path = tmp_path / f"{sample_id}.npz"
+        np.savez(path, landmarks=np.ones((23, 3), dtype=np.float32))
+        records[sample_id] = path
+        predictions[sample_id] = np.full((23, 3), 2.0, dtype=np.float32)
+        templates[sample_id] = np.zeros((23, 3), dtype=np.float32)
+    alpha, candidates = _calibrate_oof_template_blend(
+        predictions, templates, sample_ids, records
+    )
+    assert alpha == 0.5
+    assert len(candidates) == 41
+    assert _configured_template_alpha("auto") is None
 
 
 def test_robust_atlas_uses_multiple_train_meshes():

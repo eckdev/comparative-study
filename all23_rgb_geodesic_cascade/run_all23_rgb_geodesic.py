@@ -659,8 +659,12 @@ def build_parser():
         choices=("fixed_epoch", "nested_early_stop"),
         default="fixed_epoch",
     )
-    parser.add_argument("--stage1-oof-fixed-epochs", type=int, default=90)
-    parser.add_argument("--stage1-oof-template-alpha", type=float, default=1.0)
+    parser.add_argument("--stage1-oof-fixed-epochs", type=int, default=120)
+    parser.add_argument(
+        "--stage1-oof-template-alpha",
+        default="auto",
+        help="auto fits one shared alpha on outer-train OOF labels; otherwise use [0,1]",
+    )
     parser.add_argument("--stage1-inner-val-fraction", type=float, default=0.2)
     parser.add_argument("--stage1-width", type=int, default=96)
     parser.add_argument("--stage1-blocks", type=int, default=3)

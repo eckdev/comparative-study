@@ -106,9 +106,12 @@ Pipeline kilitlendikten sonraki tekrarlı 5-fold nihai koşu:
 ```
 
 `cv` presetinde outer-train merkezleri beş inner modelin gerçek OOF tahminlerinden üretilir. Her OOF
-örneği model fitinden dışlanır. Inner modeller `90` sabit epoch çalışır ve ayrıca validation ayırmadığı
-için yaklaşık `153-154` örnek kullanır. OOF template katsayısı önceden sabittir; holdout etiketiyle
-seçilmez. Outer validation/test merkezleri yalnız outer-train modelinden gelir.
+örneği model fitinden dışlanır. Inner modeller `120` sabit epoch çalışır ve ayrıca validation
+ayırmadığı için yaklaşık `153-154` örnek kullanır. Tek global template katsayısı outer-train OOF
+tahminleri üzerinde kalibre edilir ve aynı katsayı outer validation/test tahminlerine uygulanır;
+outer validation/test etiketleri bu seçimde kullanılmaz. Sabit-epoch eğitim öğrenme oranını ilk
+yüzde 80 boyunca korur ve yalnız son yüzde 20'de cosine decay uygular. Outer validation/test
+merkezleri yalnız outer-train modelinden gelir.
 ROI noktası `1024`, anatomik ROI yarıçapı çarpanı `1.5` olarak kullanılır. Tüm loss hesapları AMP
 dışında float32 yapılır ve sonlu olmayan
 batch oranı `%1` değerini aşarsa koşu açık bir hata ile durur. A100 koşuları attention geri

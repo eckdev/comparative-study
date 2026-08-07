@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import math
 import time
 from collections import Counter
 from pathlib import Path
@@ -107,6 +108,24 @@ def _set_warmup_lr(optimizer, base_lr, epoch, warmup_epochs):
         group["lr"] = lr
 
 
+def _set_fixed_oof_lr(optimizer, base_lr, epoch, total_epochs, warmup_epochs):
+    """Keep OOF optimization active, then use a short label-free cosine tail."""
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        fraction = epoch / max(int(warmup_epochs), 1)
+        lr = float(base_lr) * (0.2 + 0.8 * fraction)
+    else:
+        decay_start = max(int(warmup_epochs) + 1, int(round(total_epochs * 0.8)))
+        if epoch <= decay_start:
+            lr = float(base_lr)
+        else:
+            progress = (epoch - decay_start) / max(total_epochs - decay_start, 1)
+            minimum = max(float(base_lr) * 0.05, 1e-6)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr = minimum + (float(base_lr) - minimum) * cosine
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
 def train_stage1_model(
     train_dataset,
     val_dataset,
@@ -127,6 +146,7 @@ def train_stage1_model(
         torch.cuda.manual_seed_all(int(seed))
     train_loader = _loader(train_dataset, args.stage1_batch_size, True, args, seed)
     fixed_mode = fixed_epochs is not None
+    total_epochs = int(fixed_epochs) if fixed_mode else int(args.stage1_epochs)
     val_loader = (
         None
         if fixed_mode
@@ -164,11 +184,7 @@ def train_stage1_model(
         model.parameters(), lr=args.stage1_lr, weight_decay=args.weight_decay
     )
     scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(int(fixed_epochs or 1) - int(args.stage1_lr_warmup_epochs), 1),
-            eta_min=1e-6,
-        )
+        None
         if fixed_mode
         else torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -182,10 +198,20 @@ def train_stage1_model(
     best_score, best_epoch, stale = float("inf"), 0, 0
     history = []
     started = time.time()
-    total_epochs = int(fixed_epochs) if fixed_mode else int(args.stage1_epochs)
     for epoch in range(1, total_epochs + 1):
         train_dataset.set_epoch(epoch)
-        _set_warmup_lr(optimizer, args.stage1_lr, epoch, args.stage1_lr_warmup_epochs)
+        if fixed_mode:
+            _set_fixed_oof_lr(
+                optimizer,
+                args.stage1_lr,
+                epoch,
+                total_epochs,
+                args.stage1_lr_warmup_epochs,
+            )
+        else:
+            _set_warmup_lr(
+                optimizer, args.stage1_lr, epoch, args.stage1_lr_warmup_epochs
+            )
         model.train()
         totals = {}
         count = 0
@@ -217,8 +243,6 @@ def train_stage1_model(
             raise RuntimeError("Stage 1 completed an epoch without an optimizer update")
         if fixed_mode:
             score = None
-            if epoch > args.stage1_lr_warmup_epochs:
-                scheduler.step()
             row = {
                 "epoch": epoch,
                 "training_mode": "fixed_epoch_oof",
@@ -259,6 +283,7 @@ def train_stage1_model(
                             "blocks": args.stage1_blocks,
                             "topk": args.stage1_topk,
                             "training_mode": "fixed_epoch_oof",
+                            "lr_schedule": "constant_then_final_20pct_cosine",
                         },
                     },
                     checkpoint_path,
@@ -311,6 +336,11 @@ def train_stage1_model(
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "loaded_from_cache": False,
         "training_mode": "fixed_epoch_oof" if fixed_mode else "validation_early_stop",
+        "lr_schedule": (
+            "constant_then_final_20pct_cosine"
+            if fixed_mode
+            else "validation_reduce_on_plateau"
+        ),
         "fit_sample_count": len(train_dataset),
     }
     (output_dir / "training_report.json").write_text(
@@ -447,9 +477,55 @@ def _calibrate_template_blend(predictions, validation_ids, template, records):
     return float(best["alpha"]), candidates
 
 
+def _configured_template_alpha(value):
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    alpha = float(value)
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("--stage1-oof-template-alpha must be auto or a value in [0, 1]")
+    return alpha
+
+
+def _calibrate_oof_template_blend(predictions, templates, train_ids, records):
+    """Fit one coarse calibration parameter using outer-train OOF labels only."""
+    expert = []
+    predicted = []
+    template_rows = []
+    for sample_id in train_ids:
+        with np.load(records[sample_id]) as stored:
+            expert.append(stored["landmarks"].astype(np.float32))
+        predicted.append(predictions[sample_id])
+        template_rows.append(templates[sample_id])
+    expert = np.stack(expert)
+    predicted = np.stack(predicted)
+    template_rows = np.stack(template_rows)
+    candidates = []
+    for alpha in np.linspace(0.0, 1.0, 41):
+        blended = template_rows + float(alpha) * (predicted - template_rows)
+        errors = np.linalg.norm(blended - expert, axis=-1)
+        candidates.append(
+            {
+                "alpha": float(alpha),
+                "oof_ale": float(errors.mean()),
+                "oof_p95": float(np.percentile(errors, 95)),
+            }
+        )
+    best = min(candidates, key=lambda row: (row["oof_ale"], row["oof_p95"]))
+    return float(best["alpha"]), candidates
+
+
 def _apply_template_blend(predictions, template, alpha):
     return {
         sample_id: (template + alpha * (values - template)).astype(np.float32)
+        for sample_id, values in predictions.items()
+    }
+
+
+def _apply_sample_template_blend(predictions, templates, alpha):
+    return {
+        sample_id: (
+            templates[sample_id] + alpha * (values - templates[sample_id])
+        ).astype(np.float32)
         for sample_id, values in predictions.items()
     }
 
@@ -497,7 +573,7 @@ def _stage1_cache_key(splits, records, transforms, args):
         transform_digest.update(sample_id.encode("utf-8"))
         transform_digest.update(np.asarray(transforms[sample_id], dtype=np.float32).tobytes())
     payload = {
-        "pipeline_version": 5,
+        "pipeline_version": 6,
         "splits": splits,
         "record_files": {
             sample_id: Path(records[sample_id]).name
@@ -675,6 +751,7 @@ def generate_oof_stage1_predictions(
         fixed_training=args.stage1_oof_mode == "fixed_epoch",
     )
     oof_predictions = {}
+    oof_templates = {}
     provenance = {}
     inner_reports = []
     for partition in partitions:
@@ -740,14 +817,14 @@ def generate_oof_stage1_predictions(
         )
         template = _train_template(partition["train"], records)
         if args.stage1_oof_mode == "fixed_epoch":
-            alpha = float(args.stage1_oof_template_alpha)
-            candidates = [
-                {
-                    "alpha": alpha,
-                    "validation_ale": None,
-                    "selection": "preconfigured_without_holdout_labels",
-                }
-            ]
+            alpha = _configured_template_alpha(args.stage1_oof_template_alpha)
+            candidates = []
+            raw_predicted = _predict(
+                model, holdout_dataset, device, args, args.seed
+            )
+            predicted = raw_predicted
+            for sample_id in partition["holdout"]:
+                oof_templates[sample_id] = template
         else:
             calibration_dataset = _dataset(
                 samples,
@@ -766,9 +843,11 @@ def generate_oof_stage1_predictions(
             alpha, candidates = _calibrate_template_blend(
                 calibration_prediction, partition["val"], template, records
             )
-        predicted = _apply_template_blend(
-            _predict(model, holdout_dataset, device, args, args.seed), template, alpha
-        )
+            predicted = _apply_template_blend(
+                _predict(model, holdout_dataset, device, args, args.seed),
+                template,
+                alpha,
+            )
         overlap = set(oof_predictions) & set(predicted)
         if overlap:
             raise RuntimeError(f"Duplicate Stage 1 OOF predictions: {sorted(overlap)[:5]}")
@@ -788,6 +867,44 @@ def generate_oof_stage1_predictions(
     if set(oof_predictions) != set(splits["train"]):
         missing = set(splits["train"]) - set(oof_predictions)
         raise RuntimeError(f"Stage 1 OOF coverage is incomplete: {sorted(missing)[:5]}")
+
+    oof_blend_report = None
+    if args.stage1_oof_mode == "fixed_epoch":
+        configured_alpha = _configured_template_alpha(args.stage1_oof_template_alpha)
+        if configured_alpha is None:
+            oof_alpha, oof_candidates = _calibrate_oof_template_blend(
+                oof_predictions,
+                oof_templates,
+                splits["train"],
+                records,
+            )
+            selection = "outer_train_oof_labels_only"
+        else:
+            oof_alpha = configured_alpha
+            oof_candidates = [
+                {
+                    "alpha": oof_alpha,
+                    "oof_ale": None,
+                    "oof_p95": None,
+                }
+            ]
+            selection = "preconfigured_without_prediction_labels"
+        oof_predictions = _apply_sample_template_blend(
+            oof_predictions, oof_templates, oof_alpha
+        )
+        oof_blend_report = {
+            "alpha": oof_alpha,
+            "selection": selection,
+            "candidates": oof_candidates,
+        }
+        for report in inner_reports:
+            report["template_blend"] = {
+                "alpha": oof_alpha,
+                "selection": selection,
+                "scope": "shared_across_outer_train_oof_predictions",
+            }
+        for sample_id in provenance:
+            provenance[sample_id] += f"_template_blend_alpha_{oof_alpha:g}"
 
     final_dir = stage1_dir / "outer_train_model"
     final_train = _dataset(
@@ -848,12 +965,12 @@ def generate_oof_stage1_predictions(
     test_predictions = _predict(final_model, test_dataset, device, args, args.seed)
     outer_template = _train_template(splits["train"], records)
     if args.stage1_oof_mode == "fixed_epoch":
-        outer_alpha = float(args.stage1_oof_template_alpha)
+        outer_alpha = oof_blend_report["alpha"]
         outer_candidates = [
             {
                 "alpha": outer_alpha,
                 "validation_ale": None,
-                "selection": "matched_to_fixed_oof_without_validation_blend_fit",
+                "selection": "matched_to_outer_train_oof_calibration",
             }
         ]
     else:
@@ -885,6 +1002,7 @@ def generate_oof_stage1_predictions(
         "cache_key": cache_key,
         "config": config,
         "inner_models": inner_reports,
+        "oof_template_blend": oof_blend_report,
         "outer_train_model": {
             **final_report,
             "template_blend": {
@@ -895,8 +1013,9 @@ def generate_oof_stage1_predictions(
         "metrics": stage1_metrics,
         "provenance": {
             "train": (
-                "fixed-epoch out-of-fold; each sample excluded from model fit and no holdout "
-                "label used for checkpoint or blend selection"
+                "fixed-epoch out-of-fold; each sample excluded from model fit; one shared "
+                "template blend is calibrated on outer-train OOF labels only, with no outer "
+                "validation or test label use"
                 if args.stage1_oof_mode == "fixed_epoch"
                 else "nested out-of-fold; each sample excluded from model fit and checkpoint validation"
             ),
