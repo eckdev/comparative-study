@@ -133,7 +133,7 @@ def experiment_settings(args):
     level = args.experiment.upper()
     order = {f"E{index}": index for index in range(1, 9)}
     if level == "FULL":
-        level = "E7"
+        level = "E8"
     if level not in order:
         raise ValueError("--experiment must be E1..E8 or FULL")
     stage = order[level]
@@ -141,6 +141,7 @@ def experiment_settings(args):
     args.use_local_refiner = stage >= 4
     args.use_anatomical_attention = stage >= 5
     args.use_specialized_heads = stage >= 6
+    args.use_refinement_gate = stage >= 8
     if stage < 3:
         args.global_blocks = 1
     if stage < 5:
@@ -170,6 +171,45 @@ def oracle_gate_status(validation, args):
     return {**checks, "passed": all(checks.values())}
 
 
+def label_free_registration_roi_scales(alignment_report, train_ids, max_expansion=0.5):
+    """Expand uncertain ROIs using a threshold fitted only on train registrations."""
+    rows = alignment_report.get("samples", [])
+    if not rows or max_expansion <= 0:
+        return {row.get("sample_id"): 1.0 for row in rows}, {
+            "enabled": False,
+            "fit_sample_ids": list(train_ids),
+        }
+    by_id = {row["sample_id"]: row for row in rows}
+    train_values = np.asarray(
+        [by_id[sample_id]["robust_symmetric_median_mm"] for sample_id in train_ids],
+        dtype=np.float64,
+    )
+    center = float(np.median(train_values))
+    mad = float(np.median(np.abs(train_values - center)))
+    robust_sigma = max(1.4826 * mad, 0.25)
+    threshold = center + 4.0 * robust_sigma
+    scales = {}
+    flagged = []
+    for sample_id, row in by_id.items():
+        residual = float(row["robust_symmetric_median_mm"])
+        excess = max(0.0, residual - threshold) / max(threshold, 1e-6)
+        scale = 1.0 + min(float(max_expansion), excess)
+        scales[sample_id] = scale
+        row["adaptive_roi_scale"] = scale
+        row["registration_outlier"] = bool(scale > 1.0)
+        if scale > 1.0:
+            flagged.append(sample_id)
+    return scales, {
+        "enabled": True,
+        "fit_sample_ids": list(train_ids),
+        "train_median_mm": center,
+        "train_mad_mm": mad,
+        "threshold_mm": threshold,
+        "max_expansion": float(max_expansion),
+        "flagged_sample_ids": sorted(flagged),
+    }
+
+
 def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=True):
     assert_disjoint_splits(splits)
     by_id = {sample.sample_id: sample for sample in samples}
@@ -190,6 +230,9 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
             icp_iterations=args.icp_iterations,
             atlas_size=args.atlas_size,
             atlas_iterations=args.atlas_iterations,
+            registration_candidates=args.registration_candidates,
+            registration_restarts=args.registration_restarts,
+            registration_trim_quantile=args.registration_trim_quantile,
             seed=args.seed,
         )
     else:
@@ -201,6 +244,17 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         }
         alignment_dir.mkdir(parents=True, exist_ok=True)
         (alignment_dir / "alignment_report.json").write_text(json.dumps(alignment_report, indent=2), encoding="utf-8")
+
+    registration_radius_scales, registration_scale_report = label_free_registration_roi_scales(
+        alignment_report,
+        splits["train"],
+        args.registration_roi_expansion,
+    )
+    alignment_report["adaptive_roi"] = registration_scale_report
+    if args.alignment == "mesh_icp":
+        (alignment_dir / "alignment_report.json").write_text(
+            json.dumps(alignment_report, indent=2), encoding="utf-8"
+        )
 
     records = {}
     for sample in tqdm(selected_samples, desc="mesh cache", disable=args.no_tqdm):
@@ -299,7 +353,13 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
             fold_dir / "cache" / "roi",
             sample.sample_id,
             args.seed,
-            radius_scale=args.roi_radius_scale,
+            radius_scale=(
+                args.roi_radius_scale
+                * registration_radius_scales.get(sample.sample_id, 1.0)
+            ),
+            roi_mode=args.roi_mode,
+            euclidean_radius_scale=args.roi_euclidean_scale,
+            multi_seed_count=args.roi_multi_seeds,
         )
         split_name = "train" if sample.sample_id in set(splits["train"]) else "val"
         with np.load(roi_path) as roi_record:
@@ -372,6 +432,10 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         "cache_dir": fold_dir / "cache",
         "roi_points": args.roi_points,
         "roi_radius_scale": args.roi_radius_scale,
+        "roi_mode": args.roi_mode,
+        "roi_euclidean_scale": args.roi_euclidean_scale,
+        "roi_multi_seeds": args.roi_multi_seeds,
+        "sample_radius_scales": registration_radius_scales,
         "use_rgb": args.use_rgb,
         "coarse_in_target_space": True,
         "memory_cache": not args.no_memory_cache,
@@ -450,6 +514,7 @@ def run_fold(samples, splits, args, fold_dir, device):
         use_anatomical_attention=args.use_anatomical_attention,
         use_specialized_heads=args.use_specialized_heads,
         use_local_refiner=args.use_local_refiner,
+        use_refinement_gate=args.use_refinement_gate,
         roi_radius_scale=args.roi_radius_scale,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -463,6 +528,8 @@ def run_fold(samples, splits, args, fold_dir, device):
         symmetry=args.symmetry_weight,
         uncertainty=args.uncertainty_weight,
         clinical=args.clinical_weight,
+        gate=args.gate_weight,
+        hard_landmark=args.hard_landmark_weight,
     )
     training = fit_model(model, loaders["train"], loaders["val"], device, args, loss_weights, normalizer, fold_dir)
     if training["best_validation_ale"] > args.max_stage2_val_ale:
@@ -526,9 +593,16 @@ def build_parser():
     parser.add_argument("--icp-iterations", type=int, default=30)
     parser.add_argument("--atlas-size", type=int, default=8)
     parser.add_argument("--atlas-iterations", type=int, default=2)
+    parser.add_argument("--registration-candidates", type=int, default=3)
+    parser.add_argument("--registration-restarts", type=int, default=2)
+    parser.add_argument("--registration-trim-quantile", type=float, default=0.8)
+    parser.add_argument("--registration-roi-expansion", type=float, default=0.5)
     parser.add_argument("--max-vertices", type=int, default=50000)
     parser.add_argument("--roi-points", type=int, default=512)
     parser.add_argument("--roi-radius-scale", type=float, default=1.0)
+    parser.add_argument("--roi-mode", choices=("geodesic", "hybrid"), default="hybrid")
+    parser.add_argument("--roi-euclidean-scale", type=float, default=1.25)
+    parser.add_argument("--roi-multi-seeds", type=int, default=3)
     parser.add_argument("--max-val-oracle-ale", type=float, default=1.5)
     parser.add_argument("--max-val-hard3-oracle-ale", type=float, default=2.5)
     parser.add_argument("--max-val-oracle-p95", type=float, default=2.0)
@@ -570,13 +644,23 @@ def build_parser():
     parser.add_argument("--symmetry-weight", type=float, default=0.04)
     parser.add_argument("--uncertainty-weight", type=float, default=0.02)
     parser.add_argument("--clinical-weight", type=float, default=0.05)
+    parser.add_argument("--gate-weight", type=float, default=0.10)
+    parser.add_argument("--gate-warmup-epochs", type=int, default=30)
+    parser.add_argument("--hard-landmark-weight", type=float, default=1.5)
     parser.add_argument("--experiment", default="FULL")
     parser.add_argument("--tta", action="store_true")
     parser.add_argument("--tta-validation", action="store_true")
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--amp-dtype", choices=("auto", "float16", "bfloat16"), default="auto")
     parser.add_argument("--amp-init-scale", type=float, default=1024.0)
-    parser.add_argument("--stage1-oof-folds", type=int, default=3)
+    parser.add_argument("--stage1-oof-folds", type=int, default=5)
+    parser.add_argument(
+        "--stage1-oof-mode",
+        choices=("fixed_epoch", "nested_early_stop"),
+        default="fixed_epoch",
+    )
+    parser.add_argument("--stage1-oof-fixed-epochs", type=int, default=90)
+    parser.add_argument("--stage1-oof-template-alpha", type=float, default=1.0)
     parser.add_argument("--stage1-inner-val-fraction", type=float, default=0.2)
     parser.add_argument("--stage1-width", type=int, default=96)
     parser.add_argument("--stage1-blocks", type=int, default=3)
@@ -592,8 +676,10 @@ def build_parser():
     parser.add_argument("--stage1-batch-size", type=int, default=1)
     parser.add_argument("--stage1-eval-batch-size", type=int, default=1)
     parser.add_argument("--stage1-rotation-degrees", type=float, default=8.0)
-    parser.add_argument("--max-stage1-val-ale", type=float, default=12.0)
-    parser.add_argument("--max-stage1-oof-ale", type=float, default=15.0)
+    parser.add_argument("--max-stage1-val-ale", type=float, default=6.0)
+    parser.add_argument("--max-stage1-oof-ale", type=float, default=6.0)
+    parser.add_argument("--max-stage1-oof-p95", type=float, default=12.0)
+    parser.add_argument("--max-stage1-oof-val-gap", type=float, default=1.5)
     parser.add_argument("--max-stage2-val-ale", type=float, default=5.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -656,6 +742,12 @@ def main():
             print(f"\nPreflight {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index}", flush=True)
             prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=False)
             oracle = json.loads((fold_dir / "candidate_oracle_pretrain.json").read_text(encoding="utf-8"))
+            alignment = json.loads(
+                (fold_dir / "alignment" / "alignment_report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            adaptive_roi = alignment.get("adaptive_roi", {})
             stage1_metrics = None
             if args.coarse_source == "stage1_oof":
                 stage1_metrics = json.loads(
@@ -681,6 +773,27 @@ def main():
                     ),
                     "stage1_validation_ale": (
                         stage1_metrics["validation"]["overall_ale"] if stage1_metrics else None
+                    ),
+                    "stage1_oof_p95": (
+                        stage1_metrics["train_oof"]["p95"] if stage1_metrics else None
+                    ),
+                    "stage1_oof_validation_gap": (
+                        abs(
+                            stage1_metrics["train_oof"]["overall_ale"]
+                            - stage1_metrics["validation"]["overall_ale"]
+                        )
+                        if stage1_metrics else None
+                    ),
+                    "stage1_oof_validation_signed_gap": (
+                        stage1_metrics["train_oof"]["overall_ale"]
+                        - stage1_metrics["validation"]["overall_ale"]
+                        if stage1_metrics else None
+                    ),
+                    "registration_outlier_count": len(
+                        adaptive_roi.get("flagged_sample_ids", [])
+                    ),
+                    "registration_train_median_mm": adaptive_roi.get(
+                        "train_median_mm"
                     ),
                     "overall_gate_pass": gate["overall"],
                     "hard3_gate_pass": gate["hard3"],

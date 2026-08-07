@@ -59,6 +59,13 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, args.mixed_precision, args.amp_dtype):
             outputs = model(batch, coordinate_mode=args.coordinate_mode)
+        if (
+            getattr(model, "use_refinement_gate", False)
+            and getattr(loader.dataset, "epoch", 0) <= args.gate_warmup_epochs
+        ):
+            # Let the local heatmap/refiner learn before alpha can attenuate its
+            # coordinate gradient. The gate loss still trains in parallel.
+            outputs["final_coordinates"] = outputs["refined_coordinates"]
         loss, errors, components = compute_loss(outputs, batch, loss_weights, args.region_positive_weight)
         if not torch.isfinite(loss):
             skipped_nonfinite += 1
@@ -184,40 +191,51 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
     model.eval()
     collected = {
         "sample_ids": [], "classes": [], "genders": [], "subject_ids": [],
-        "prediction": [], "expert": [], "coarse": [], "log_var": [], "oracle": [],
+        "prediction": [], "refined": [], "expert": [], "coarse": [],
+        "log_var": [], "refinement_alpha": [], "oracle": [],
     }
     variants = [(0.0, False)]
     if use_tta:
         variants.extend([(-5.0, False), (5.0, False), (0.0, True)])
     for raw_batch in tqdm(loader, desc="eval", leave=False, disable=args.no_tqdm):
         batch = move_batch(raw_batch, device)
-        heatmaps, variances = [], []
+        heatmaps, variances, refinement_alphas = [], [], []
         for angle, mirror in variants:
             variant, rotation, center = transform_batch(batch, normalizer, angle, mirror)
             with autocast_context(device, args.mixed_precision, args.amp_dtype):
                 outputs = model(variant, coordinate_mode=args.coordinate_mode)
             logits = outputs["local_logits"].float()
             log_var = outputs["log_var"].float()
+            refinement_alpha = outputs["refinement_alpha"].float()
             if mirror:
                 permutation = torch.tensor(mirror_permutation(), device=device)
                 logits = logits[:, permutation]
                 log_var = log_var[:, permutation]
+                refinement_alpha = refinement_alpha[:, permutation]
             heatmaps.append(logits)
             variances.append(log_var)
+            refinement_alphas.append(refinement_alpha)
         averaged_heatmap = torch.stack(heatmaps).mean(dim=0)
         candidates = batch["points"][batch["roi_index"]]
         if args.coordinate_mode == "mse_over_mesh":
-            prediction = mse_over_mesh_coordinate(
+            refined = mse_over_mesh_coordinate(
                 averaged_heatmap, candidates, batch["roi_mask"], model.heatmap_sigmas
             )
         else:
-            prediction = topk_soft_coordinate(
+            refined = topk_soft_coordinate(
                 averaged_heatmap,
                 candidates,
                 batch["roi_mask"],
                 args.coordinate_topk,
                 args.coordinate_temperature,
             )
+        refinement_alpha = torch.stack(refinement_alphas).mean(dim=0)
+        prediction = (
+            batch["coarse"]
+            + refinement_alpha[..., None] * (refined - batch["coarse"])
+            if model.use_refinement_gate
+            else refined
+        )
         log_var = torch.logsumexp(torch.stack(variances), dim=0) - math.log(len(variances))
         expert = batch["expert"]
         errors = torch.linalg.norm(prediction - expert, dim=-1)
@@ -226,14 +244,22 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
         collected["genders"].extend(raw_batch["gender"])
         collected["subject_ids"].extend(raw_batch["subject_id"].numpy().tolist())
         for name, value in (
-            ("prediction", prediction), ("expert", expert), ("coarse", batch["coarse"]),
-            ("log_var", log_var), ("oracle", batch["oracle_error"]),
+            ("prediction", prediction), ("refined", refined),
+            ("expert", expert), ("coarse", batch["coarse"]),
+            ("log_var", log_var), ("refinement_alpha", refinement_alpha),
+            ("oracle", batch["oracle_error"]),
         ):
             collected[name].append(value.detach().cpu().numpy())
-    for name in ("prediction", "expert", "coarse", "log_var", "oracle"):
+    for name in (
+        "prediction", "refined", "expert", "coarse", "log_var",
+        "refinement_alpha", "oracle",
+    ):
         collected[name] = np.concatenate(collected[name], axis=0)
     collected["subject_ids"] = np.asarray(collected["subject_ids"], dtype=np.int64)
     collected["errors"] = np.linalg.norm(collected["prediction"] - collected["expert"], axis=-1)
+    collected["refined_errors"] = np.linalg.norm(
+        collected["refined"] - collected["expert"], axis=-1
+    )
     return collected
 
 

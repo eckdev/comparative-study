@@ -379,11 +379,27 @@ def build_roi_cache(
     seed,
     landmarks=None,
     radius_scale=1.0,
+    roi_mode="hybrid",
+    euclidean_radius_scale=1.25,
+    multi_seed_count=3,
 ):
     radius_scale = float(radius_scale)
-    digest_source = np.asarray(coarse, dtype=np.float32).tobytes() + np.float32(radius_scale).tobytes()
+    roi_mode = str(roi_mode)
+    if roi_mode not in ("geodesic", "hybrid"):
+        raise ValueError(f"Unsupported ROI mode: {roi_mode}")
+    euclidean_radius_scale = float(euclidean_radius_scale)
+    multi_seed_count = max(1, int(multi_seed_count))
+    digest_source = b"|".join(
+        [
+            np.asarray(coarse, dtype=np.float32).tobytes(),
+            np.float32(radius_scale).tobytes(),
+            roi_mode.encode("ascii"),
+            np.float32(euclidean_radius_scale).tobytes(),
+            str(multi_seed_count).encode("ascii"),
+        ]
+    )
     digest = hashlib.sha1(digest_source).hexdigest()[:10]
-    path = Path(cache_dir) / f"{sample_id}.v3.{roi_points}.r{radius_scale:g}.{digest}.npz"
+    path = Path(cache_dir) / f"{sample_id}.v4.{roi_points}.r{radius_scale:g}.{digest}.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return path
@@ -402,27 +418,63 @@ def build_roi_cache(
     src, dst = edge_index
     edge_weights = np.linalg.norm(points[src] - points[dst], axis=1)
     graph = csr_matrix((edge_weights, (src, dst)), shape=(len(points), len(points)))
-    coarse_seeds = tree.query(coarse, k=1)[1].astype(np.int64)
+    seed_count = min(multi_seed_count, len(points))
+    coarse_seeds = np.asarray(tree.query(coarse, k=seed_count)[1], dtype=np.int64)
+    if coarse_seeds.ndim == 1:
+        coarse_seeds = coarse_seeds[:, None]
     expert_seeds = tree.query(landmarks, k=1)[1].astype(np.int64)
     max_radius = max(roi_radius_mm(index) for index in range(NUM_LANDMARKS)) * radius_scale
     distance_matrix = dijkstra(
         graph,
         directed=False,
-        indices=np.concatenate([coarse_seeds, expert_seeds]),
+        indices=np.concatenate([coarse_seeds.reshape(-1), expert_seeds]),
         limit=max(90.0, max_radius * 2.0),
     ).astype(np.float32)
     roi_indices, roi_masks, targets, regions, oracles = [], [], [], [], []
+    geodesic_counts, euclidean_counts = [], []
     for landmark in range(NUM_LANDMARKS):
         radius = roi_radius_mm(landmark) * radius_scale
-        coarse_distances = distance_matrix[landmark]
-        candidates = np.flatnonzero(np.isfinite(coarse_distances) & (coarse_distances <= radius))
-        geodesic = coarse_distances[candidates]
+        seed_start = landmark * seed_count
+        seed_stop = seed_start + seed_count
+        coarse_distances = np.min(distance_matrix[seed_start:seed_stop], axis=0)
+        geodesic_candidates = np.flatnonzero(
+            np.isfinite(coarse_distances) & (coarse_distances <= radius)
+        )
+        geodesic_counts.append(int(len(geodesic_candidates)))
+        candidates = geodesic_candidates
+        if roi_mode == "hybrid":
+            euclidean_radius = radius * max(euclidean_radius_scale, 1.0)
+            euclidean_candidates = np.asarray(
+                tree.query_ball_point(coarse[landmark], r=euclidean_radius),
+                dtype=np.int64,
+            )
+            euclidean_counts.append(int(len(euclidean_candidates)))
+            candidates = np.union1d(geodesic_candidates, euclidean_candidates)
+        else:
+            euclidean_counts.append(0)
+        if len(candidates):
+            euclidean_distance = np.linalg.norm(
+                points[candidates] - coarse[landmark], axis=1
+            ).astype(np.float32)
+            geodesic = coarse_distances[candidates]
+            # Euclidean-only vertices remain slightly less preferred than a
+            # connected surface path at the same physical distance.
+            ranking_distance = np.minimum(
+                geodesic,
+                euclidean_distance * np.float32(1.1),
+            )
         if len(candidates) == 0:
-            candidates = np.asarray([coarse_seeds[landmark]], dtype=np.int64)
-            geodesic = np.asarray([0.0], dtype=np.float32)
-        selected, mask = _select_roi(candidates, geodesic, roi_points, seed + landmark * 997)
+            candidates = np.asarray([coarse_seeds[landmark, 0]], dtype=np.int64)
+            ranking_distance = np.asarray([0.0], dtype=np.float32)
+        selected, mask = _select_roi(
+            candidates,
+            ranking_distance,
+            roi_points,
+            seed + landmark * 997,
+        )
         # Expert-distance heatmaps use mesh geodesics where connected, Euclidean fallback otherwise.
-        selected_distances = distance_matrix[NUM_LANDMARKS + landmark, selected]
+        expert_offset = NUM_LANDMARKS * seed_count
+        selected_distances = distance_matrix[expert_offset + landmark, selected]
         missing = ~np.isfinite(selected_distances)
         if np.any(missing):
             selected_distances[missing] = np.linalg.norm(
@@ -445,6 +497,8 @@ def build_roi_cache(
         heatmap_target=np.stack(targets),
         region_target=np.stack(regions),
         oracle_error=np.asarray(oracles, dtype=np.float32),
+        geodesic_candidate_count=np.asarray(geodesic_counts, dtype=np.int32),
+        euclidean_candidate_count=np.asarray(euclidean_counts, dtype=np.int32),
     )
     return path
 
@@ -604,6 +658,9 @@ class RGBGeodesicDataset(Dataset):
         cache_dir,
         roi_points=512,
         roi_radius_scale=1.0,
+        roi_mode="hybrid",
+        roi_euclidean_scale=1.25,
+        roi_multi_seeds=3,
         training=False,
         rotation_degrees=0.0,
         point_noise_mm=0.0,
@@ -612,6 +669,7 @@ class RGBGeodesicDataset(Dataset):
         center_jitter_mm=0.0,
         use_rgb=True,
         coarse_in_target_space=False,
+        sample_radius_scales=None,
         memory_cache=True,
         seed=42,
     ):
@@ -626,6 +684,9 @@ class RGBGeodesicDataset(Dataset):
         self.cache_dir = Path(cache_dir)
         self.roi_points = int(roi_points)
         self.roi_radius_scale = float(roi_radius_scale)
+        self.roi_mode = str(roi_mode)
+        self.roi_euclidean_scale = float(roi_euclidean_scale)
+        self.roi_multi_seeds = int(roi_multi_seeds)
         self.training = bool(training)
         self.rotation_degrees = float(rotation_degrees)
         self.point_noise_mm = float(point_noise_mm)
@@ -634,6 +695,9 @@ class RGBGeodesicDataset(Dataset):
         self.center_jitter_mm = float(center_jitter_mm)
         self.use_rgb = bool(use_rgb)
         self.coarse_in_target_space = bool(coarse_in_target_space)
+        self.sample_radius_scales = {
+            str(key): float(value) for key, value in (sample_radius_scales or {}).items()
+        }
         self.memory_cache = bool(memory_cache)
         self._record_memory = {}
         self._roi_memory = {}
@@ -678,11 +742,18 @@ class RGBGeodesicDataset(Dataset):
         else:
             expert = record["landmarks"].copy()
         coarse = self._coarse(sample)
+        sample_radius_scale = self.sample_radius_scales.get(sample.sample_id, 1.0)
         roi_path = build_roi_cache(
             self.records[sample.sample_id], coarse, self.roi_points,
             self.cache_dir / "roi", sample.sample_id, self.seed,
             landmarks=expert,
-            radius_scale=self.roi_radius_scale,
+            radius_scale=(
+                self.roi_radius_scale
+                * sample_radius_scale
+            ),
+            roi_mode=self.roi_mode,
+            euclidean_radius_scale=self.roi_euclidean_scale,
+            multi_seed_count=self.roi_multi_seeds,
         )
         if sample.sample_id not in self._roi_memory:
             with np.load(roi_path) as stored:
@@ -741,6 +812,7 @@ class RGBGeodesicDataset(Dataset):
             "heatmap_target": torch.from_numpy(roi["heatmap_target"].astype(np.float32)),
             "region_target": torch.from_numpy(roi["region_target"].astype(np.float32)),
             "oracle_error": torch.from_numpy(roi["oracle_error"].astype(np.float32)),
+            "sample_radius_scale": torch.tensor(sample_radius_scale, dtype=torch.float32),
         }
 
 
@@ -776,4 +848,7 @@ def collate_graphs(items):
         "heatmap_target": torch.stack([item["heatmap_target"] for item in items]),
         "region_target": torch.stack([item["region_target"] for item in items]),
         "oracle_error": torch.stack([item["oracle_error"] for item in items]),
+        "sample_radius_scale": torch.stack(
+            [item.get("sample_radius_scale", torch.tensor(1.0)) for item in items]
+        ),
     }

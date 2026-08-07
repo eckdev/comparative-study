@@ -89,7 +89,8 @@ def _pca_basis(points):
     return basis
 
 
-def pca_initial_transform(source, target, max_rotation_degrees=30.0):
+def pca_initial_transforms(source, target, max_rotation_degrees=30.0):
+    """Return deterministic rigid starts ordered by label-free surface fit."""
     source_center = np.median(source, axis=0)
     target_center = np.median(target, axis=0)
     source_basis = _pca_basis(source)
@@ -100,11 +101,14 @@ def pca_initial_transform(source, target, max_rotation_degrees=30.0):
     identity_rotation = np.eye(3, dtype=np.float64)
     identity_translation = target_center - source_center
     identity_moved = source + identity_translation
-    best = (
-        float(np.median(target_tree.query(identity_moved, k=1, workers=-1)[0])),
-        identity_rotation,
-        identity_translation,
-    )
+    candidates = [
+        (
+            float(np.median(target_tree.query(identity_moved, k=1, workers=-1)[0])),
+            identity_rotation,
+            identity_translation,
+            "center_only",
+        )
+    ]
     for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)):
         signed = source_basis @ np.diag(signs)
         rotation = target_basis @ signed.T
@@ -116,12 +120,51 @@ def pca_initial_transform(source, target, max_rotation_degrees=30.0):
         transformed = source @ rotation.T + translation
         distances = target_tree.query(transformed, k=1, workers=-1)[0]
         score = float(np.median(distances))
-        if best is None or score < best[0]:
-            best = (score, rotation, translation)
-    matrix = np.eye(4, dtype=np.float32)
-    matrix[:3, :3] = best[1].astype(np.float32)
-    matrix[:3, 3] = best[2].astype(np.float32)
-    return matrix
+        candidates.append((score, rotation, translation, f"pca_{''.join(map(str, signs))}"))
+    ordered = []
+    seen = set()
+    for score, rotation, translation, name in sorted(candidates, key=lambda row: row[0]):
+        signature = np.round(np.concatenate([rotation.reshape(-1), translation]), 5).tobytes()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :3] = rotation.astype(np.float32)
+        matrix[:3, 3] = translation.astype(np.float32)
+        ordered.append({"name": name, "initial_score": score, "matrix": matrix})
+    return ordered
+
+
+def pca_initial_transform(source, target, max_rotation_degrees=30.0):
+    return pca_initial_transforms(source, target, max_rotation_degrees)[0]["matrix"]
+
+
+def robust_symmetric_surface_score(source, target, trim_quantile=0.8):
+    """Score a rigid fit without labels while reducing crop/boundary influence."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source_to_target = cKDTree(target).query(source, k=1, workers=-1)[0]
+    target_to_source = cKDTree(source).query(target, k=1, workers=-1)[0]
+    distances = np.concatenate([source_to_target, target_to_source])
+    distances = distances[np.isfinite(distances)]
+    if not len(distances):
+        return {
+            "score": float("inf"),
+            "median_mm": float("inf"),
+            "trimmed_mean_mm": float("inf"),
+            "p90_mm": float("inf"),
+        }
+    quantile = float(np.clip(trim_quantile, 0.5, 1.0))
+    cutoff = float(np.quantile(distances, quantile))
+    trimmed = distances[distances <= cutoff]
+    median = float(np.median(distances))
+    trimmed_mean = float(np.mean(trimmed))
+    return {
+        "score": float(0.5 * median + 0.5 * trimmed_mean),
+        "median_mm": median,
+        "trimmed_mean_mm": trimmed_mean,
+        "p90_mm": float(np.percentile(distances, 90)),
+    }
 
 
 def point_to_plane_icp(
@@ -253,6 +296,9 @@ def build_label_free_alignment(
     icp_iterations=30,
     atlas_size=8,
     atlas_iterations=2,
+    registration_candidates=3,
+    registration_restarts=2,
+    registration_trim_quantile=0.8,
     seed=42,
 ):
     """Fit the reference on train meshes and register every mesh without labels."""
@@ -261,13 +307,16 @@ def build_label_free_alignment(
     transform_file = output_dir / "mesh_only_transforms.npz"
     report_file = output_dir / "alignment_report.json"
     expected_config = {
-        "algorithm_version": 4,
+        "algorithm_version": 5,
         "train_template_sample_ids": list(train_ids),
         "mesh_source_fingerprint": mesh_source_fingerprint(samples),
         "sample_points": int(sample_points),
         "icp_iterations": int(icp_iterations),
         "atlas_size": int(atlas_size),
         "atlas_iterations": int(atlas_iterations),
+        "registration_candidates": int(registration_candidates),
+        "registration_restarts": int(registration_restarts),
+        "registration_trim_quantile": float(registration_trim_quantile),
     }
     if transform_file.exists() and report_file.exists():
         report = json.loads(report_file.read_text(encoding="utf-8"))
@@ -293,19 +342,84 @@ def build_label_free_alignment(
         normals=target_normals.astype(np.float32),
     )
 
+    # Keep several train-only atlas members in the same canonical frame. A scan
+    # can then avoid a poor local optimum against the fused atlas without using
+    # validation/test landmarks to select its transform.
+    references = [
+        {
+            "reference_id": "fused_atlas",
+            "points": target.astype(np.float32),
+            "normals": target_normals.astype(np.float32),
+        }
+    ]
+    for member_index, atlas_sample in enumerate(atlas_samples):
+        mesh = mesh_loader(atlas_sample.mesh_path)
+        member_points, member_normals = deterministic_surface_with_normals(
+            mesh,
+            sample_points,
+            seed + 70_000 + member_index,
+        )
+        starts = pca_initial_transforms(member_points, target)
+        member_matrix, _ = point_to_plane_icp(
+            member_points,
+            target,
+            target_normals,
+            starts[0]["matrix"],
+            iterations=icp_iterations,
+        )
+        references.append(
+            {
+                "reference_id": atlas_sample.sample_id,
+                "points": apply_transform(member_points, member_matrix),
+                "normals": rotate_vectors(member_normals, member_matrix),
+            }
+        )
+
     transforms = {}
     rows = []
     for offset, sample in enumerate(samples):
         mesh = mesh_loader(sample.mesh_path)
         source = deterministic_surface(mesh, sample_points, seed + 10_000 + offset)
-        initial = pca_initial_transform(source, target)
-        matrix, history = point_to_plane_icp(
-            source,
-            target,
-            target_normals,
-            initial,
-            iterations=icp_iterations,
-        )
+        ranked_references = []
+        for reference in references:
+            starts = pca_initial_transforms(source, reference["points"])
+            moved = apply_transform(source, starts[0]["matrix"])
+            initial_score = robust_symmetric_surface_score(
+                moved,
+                reference["points"],
+                registration_trim_quantile,
+            )["score"]
+            ranked_references.append((initial_score, reference, starts))
+        ranked_references.sort(key=lambda row: row[0])
+        selected_references = ranked_references[: max(1, int(registration_candidates))]
+        candidate_rows = []
+        for _, reference, starts in selected_references:
+            for start in starts[: max(1, int(registration_restarts))]:
+                candidate_matrix, candidate_history = point_to_plane_icp(
+                    source,
+                    reference["points"],
+                    reference["normals"],
+                    start["matrix"],
+                    iterations=icp_iterations,
+                )
+                candidate_moved = apply_transform(source, candidate_matrix)
+                candidate_score = robust_symmetric_surface_score(
+                    candidate_moved,
+                    reference["points"],
+                    registration_trim_quantile,
+                )
+                candidate_rows.append(
+                    {
+                        "reference_id": reference["reference_id"],
+                        "initialization": start["name"],
+                        "matrix": candidate_matrix,
+                        "history": candidate_history,
+                        **candidate_score,
+                    }
+                )
+        best = min(candidate_rows, key=lambda row: row["score"])
+        matrix = best["matrix"]
+        history = best["history"]
         moved = apply_transform(source, matrix)
         residual = cKDTree(target).query(moved, k=1, workers=-1)[0]
         transforms[sample.sample_id] = matrix
@@ -314,13 +428,25 @@ def build_label_free_alignment(
                 "sample_id": sample.sample_id,
                 "median_surface_residual_mm": float(np.median(residual)),
                 "p95_surface_residual_mm": float(np.percentile(residual, 95)),
+                "robust_symmetric_score": float(best["score"]),
+                "robust_symmetric_median_mm": float(best["median_mm"]),
+                "selected_reference_id": best["reference_id"],
+                "selected_initialization": best["initialization"],
                 "icp_iterations": len(history),
+                "candidates": [
+                    {
+                        key: value
+                        for key, value in candidate.items()
+                        if key not in ("matrix", "history")
+                    }
+                    for candidate in sorted(candidate_rows, key=lambda row: row["score"])
+                ],
             }
         )
     np.savez_compressed(transform_file, **transforms)
     report = {
-        "algorithm_version": 4,
-        "method": "train_only_robust_multimesh_atlas_pca_point_to_plane_icp",
+        "algorithm_version": 5,
+        "method": "train_only_multi_reference_robust_pca_point_to_plane_icp",
         "scale": False,
         "reflection": False,
         "uses_expert_landmarks": False,
@@ -330,6 +456,9 @@ def build_label_free_alignment(
         "atlas_sample_ids": [sample.sample_id for sample in atlas_samples],
         "atlas_size": int(atlas_size),
         "atlas_iterations": int(atlas_iterations),
+        "registration_candidates": int(registration_candidates),
+        "registration_restarts": int(registration_restarts),
+        "registration_trim_quantile": float(registration_trim_quantile),
         "atlas_build_report": atlas_report,
         "sample_points": int(sample_points),
         "icp_iterations": int(icp_iterations),

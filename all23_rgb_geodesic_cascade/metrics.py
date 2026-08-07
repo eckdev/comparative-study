@@ -139,11 +139,14 @@ def prediction_rows(outputs, confidence):
                 "landmark": landmark,
                 "landmark_name": LANDMARK_NAMES[landmark],
             }
-            for name in ("expert", "coarse", "prediction"):
+            for name in ("expert", "coarse", "refined", "prediction"):
                 for axis_index, axis in enumerate(("x", "y", "z")):
                     row[f"{name}_{axis}"] = float(outputs[name][sample_index, landmark, axis_index])
             row["error"] = float(outputs["errors"][sample_index, landmark])
             row["confidence"] = float(confidence[sample_index, landmark])
+            row["refinement_alpha"] = float(
+                outputs["refinement_alpha"][sample_index, landmark]
+            )
             row["oracle_error"] = float(outputs["oracle"][sample_index, landmark])
             rows.append(row)
     return rows
@@ -152,16 +155,28 @@ def prediction_rows(outputs, confidence):
 def save_evaluation(output_dir, split_name, outputs, calibration, bootstrap_iterations=2000, seed=42):
     output_dir = Path(output_dir)
     errors = outputs["errors"]
+    refined_errors = outputs["refined_errors"]
     coarse_errors = localization_errors(outputs["coarse"], outputs["expert"])
     confidence = confidence_scores(outputs["log_var"], calibration)
     metrics = {
         "overall": summarize(errors),
         "core20": summarize(errors[:, CORE20]),
         "hard3": summarize(errors[:, HARD3]),
+        "ungated_refined_overall": summarize(refined_errors),
+        "ungated_refined_core20": summarize(refined_errors[:, CORE20]),
+        "ungated_refined_hard3": summarize(refined_errors[:, HARD3]),
         "coarse_overall": summarize(coarse_errors),
         "oracle_overall": summarize(outputs["oracle"]),
         "bootstrap_ale": bootstrap_ci(errors, bootstrap_iterations, seed),
         "bootstrap_vs_coarse": bootstrap_delta(coarse_errors, errors, bootstrap_iterations, seed),
+        "bootstrap_vs_ungated_refined": bootstrap_delta(
+            refined_errors, errors, bootstrap_iterations, seed
+        ),
+        "refinement_gate": {
+            "mean_alpha": float(np.mean(outputs["refinement_alpha"])),
+            "core20_mean_alpha": float(np.mean(outputs["refinement_alpha"][:, CORE20])),
+            "hard3_mean_alpha": float(np.mean(outputs["refinement_alpha"][:, HARD3])),
+        },
         "confidence_calibration": calibration,
     }
     (output_dir / f"metrics_{split_name}.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")

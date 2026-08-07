@@ -65,7 +65,11 @@ def command_for(preset, seed):
             "--icp-iterations", "2",
             "--atlas-size", "2",
             "--atlas-iterations", "1",
+            "--registration-candidates", "1",
+            "--registration-restarts", "1",
             "--roi-points", "32",
+            "--roi-mode", "hybrid",
+            "--roi-multi-seeds", "2",
             "--width", "32",
             "--global-blocks", "1",
             "--epochs", "2",
@@ -74,6 +78,8 @@ def command_for(preset, seed):
             "--scheduler-start-epoch", "1",
             "--lr-warmup-epochs", "0",
             "--stage1-oof-folds", "2",
+            "--stage1-oof-mode", "fixed_epoch",
+            "--stage1-oof-fixed-epochs", "2",
             "--stage1-width", "32",
             "--stage1-blocks", "1",
             "--stage1-topk", "10",
@@ -84,13 +90,15 @@ def command_for(preset, seed):
             "--stage1-lr-warmup-epochs", "0",
             "--max-stage1-val-ale", "100",
             "--max-stage1-oof-ale", "100",
+            "--max-stage1-oof-p95", "100",
+            "--max-stage1-oof-val-gap", "100",
             "--max-stage2-val-ale", "100",
             "--bootstrap-iters", "50",
             "--skip-oracle-gate",
             "--seed", str(seed),
         ]
     if preset == "a100":
-        return fixed_external(f"full_fixed_seed{seed}", "FULL") + [
+        return fixed_external(f"full_fixed_v4_seed{seed}", "FULL") + [
             "--amp-dtype", "bfloat16",
             "--roi-points", "512",
             "--width", "128",
@@ -102,7 +110,7 @@ def command_for(preset, seed):
     if preset in ("cv", "cv_repeated", "cv_preflight"):
         repeats = "3" if preset == "cv_repeated" else "1"
         output_preset = "cv" if preset == "cv_preflight" else preset
-        command = common(f"publication_{output_preset}_stage1_v3_seed{seed}") + [
+        command = common(f"publication_{output_preset}_stage1_v4_seed{seed}") + [
             "--protocol", "cv",
             "--folds", "5",
             "--cv-repeats", repeats,
@@ -112,9 +120,16 @@ def command_for(preset, seed):
             "--alignment", "mesh_icp",
             "--atlas-size", "8",
             "--atlas-iterations", "2",
+            "--registration-candidates", "3",
+            "--registration-restarts", "2",
+            "--registration-trim-quantile", "0.8",
+            "--registration-roi-expansion", "0.75",
             "--experiment", "FULL",
             "--roi-points", "1024",
             "--roi-radius-scale", "1.5",
+            "--roi-mode", "hybrid",
+            "--roi-euclidean-scale", "1.25",
+            "--roi-multi-seeds", "3",
             "--width", "128",
             "--global-blocks", "4",
             "--epochs", "220",
@@ -123,7 +138,10 @@ def command_for(preset, seed):
             "--scheduler-start-epoch", "60",
             "--lr-warmup-epochs", "5",
             "--lr", "0.0003",
-            "--stage1-oof-folds", "3",
+            "--stage1-oof-folds", "5",
+            "--stage1-oof-mode", "fixed_epoch",
+            "--stage1-oof-fixed-epochs", "90",
+            "--stage1-oof-template-alpha", "1.0",
             "--stage1-width", "96",
             "--stage1-blocks", "3",
             "--stage1-epochs", "100",
@@ -132,8 +150,10 @@ def command_for(preset, seed):
             "--stage1-scheduler-start-epoch", "40",
             "--stage1-lr-warmup-epochs", "5",
             "--stage1-lr", "0.0003",
-            "--max-stage1-val-ale", "12.0",
-            "--max-stage1-oof-ale", "15.0",
+            "--max-stage1-val-ale", "6.0",
+            "--max-stage1-oof-ale", "6.0",
+            "--max-stage1-oof-p95", "12.0",
+            "--max-stage1-oof-val-gap", "2.0",
             "--max-stage2-val-ale", "5.0",
             "--max-val-oracle-p95", "2.0",
             "--max-val-oracle-max", "15.0",
@@ -146,7 +166,7 @@ def command_for(preset, seed):
         if preset == "cv_preflight":
             command.append("--preflight-only")
         return command
-    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 7:
+    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 8:
         experiment = preset.upper()
         return fixed_external(f"ablation_{preset}_seed{seed}", experiment) + [
             "--roi-points", "512",
@@ -156,7 +176,7 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    raise ValueError("Preset must be smoke, a100, cv_preflight, cv, cv_repeated, or e0..e7")
+    raise ValueError("Preset must be smoke, a100, cv_preflight, cv, cv_repeated, or e0..e8")
 
 
 def validate_paths(preset):

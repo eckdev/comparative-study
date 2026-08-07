@@ -2,10 +2,12 @@ import numpy as np
 import torch
 from types import SimpleNamespace
 
-from all23_rgb_geodesic_cascade.alignment import apply_transform, build_robust_atlas
+from all23_rgb_geodesic_cascade.alignment import (
+    apply_transform, build_robust_atlas, robust_symmetric_surface_score,
+)
 from all23_rgb_geodesic_cascade.anatomy import MIDLINE, SYMMETRY_PAIRS, graph_attention_mask, mirror_permutation
 from all23_rgb_geodesic_cascade.data import (
-    assert_disjoint_splits, collate_graphs, collate_surface_graphs,
+    assert_disjoint_splits, build_roi_cache, collate_graphs, collate_surface_graphs,
 )
 from all23_rgb_geodesic_cascade.losses import (
     LossWeights, adaptive_wing_loss, compute_loss, region_loss,
@@ -13,7 +15,11 @@ from all23_rgb_geodesic_cascade.losses import (
 from all23_rgb_geodesic_cascade.model import (
     All23RGBGeodesicCascade, GlobalCoarseNetwork, segment_softmax,
 )
-from all23_rgb_geodesic_cascade.stage1 import _inner_partitions, stage1_loss
+from all23_rgb_geodesic_cascade.stage1 import (
+    _inner_partitions,
+    _stage1_quality_status,
+    stage1_loss,
+)
 from all23_rgb_geodesic_cascade.train import amp_torch_dtype
 from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import oracle_gate_status
 
@@ -98,6 +104,26 @@ def test_model_forward_and_backward_are_finite():
     assert any(parameter.grad is not None for parameter in model.parameters())
     mse_outputs = model(batch, coordinate_mode="mse_over_mesh")
     assert torch.isfinite(mse_outputs["final_coordinates"]).all()
+
+
+def test_refinement_gate_is_bounded_and_trainable():
+    batch = collate_graphs([synthetic_item()])
+    model = All23RGBGeodesicCascade(
+        input_dim=14,
+        width=32,
+        global_blocks=1,
+        heads=4,
+        dropout=0.0,
+        use_refinement_gate=True,
+    )
+    outputs = model(batch, coordinate_mode="topk")
+    alpha = outputs["refinement_alpha"]
+    assert alpha.shape == (1, 23)
+    assert torch.all((alpha > 0.0) & (alpha < 1.0))
+    loss, _, components = compute_loss(outputs, batch, LossWeights())
+    assert torch.isfinite(components["gate"])
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in model.refinement_gate.parameters())
 
 
 def test_global_only_ablation_uses_all_landmarks():
@@ -194,6 +220,48 @@ def test_nested_oof_partitions_exclude_holdout_samples():
     assert held_out == set(by_id)
 
 
+def test_fixed_epoch_oof_uses_every_non_holdout_sample():
+    samples = [
+        SimpleNamespace(
+            sample_id=f"S{index}",
+            class_name=f"Class{index % 2 + 1}",
+            gender="women" if index % 2 else "men",
+        )
+        for index in range(20)
+    ]
+    by_id = {sample.sample_id: sample for sample in samples}
+    partitions = _inner_partitions(
+        by_id,
+        list(by_id),
+        5,
+        0.2,
+        42,
+        fixed_training=True,
+    )
+    for partition in partitions:
+        assert partition["val"] == []
+        assert len(partition["train"]) == 16
+        assert set(partition["train"]) | set(partition["holdout"]) == set(by_id)
+
+
+def test_stage1_quality_gate_uses_absolute_oof_validation_gap():
+    metrics = {
+        "train_oof": {"overall_ale": 2.0, "p95": 4.0},
+        "validation": {"overall_ale": 4.0},
+    }
+    args = SimpleNamespace(
+        max_stage1_val_ale=6.0,
+        max_stage1_oof_ale=6.0,
+        max_stage1_oof_p95=12.0,
+        max_stage1_oof_val_gap=1.5,
+    )
+    status = _stage1_quality_status(metrics, args)
+    assert status["gap_mm"] == 2.0
+    assert status["signed_gap_mm"] == -2.0
+    assert not status["oof_validation_gap"]
+    assert not status["passed"]
+
+
 def test_robust_atlas_uses_multiple_train_meshes():
     rng = np.random.default_rng(4)
     base = rng.normal(size=(40, 3)).astype(np.float32) * [20.0, 30.0, 10.0]
@@ -216,6 +284,39 @@ def test_robust_atlas_uses_multiple_train_meshes():
     assert atlas_normals.shape == (32, 3)
     assert len(selected) == 3
     assert np.isfinite(atlas).all()
+
+
+def test_robust_symmetric_score_prefers_aligned_surfaces():
+    rng = np.random.default_rng(12)
+    points = rng.normal(size=(100, 3)).astype(np.float32)
+    aligned = robust_symmetric_surface_score(points, points)["score"]
+    shifted = robust_symmetric_surface_score(points + [5.0, 0.0, 0.0], points)["score"]
+    assert aligned < shifted
+
+
+def test_hybrid_roi_recovers_target_across_disconnected_mesh(tmp_path):
+    first = np.stack([np.arange(10), np.zeros(10), np.zeros(10)], axis=1).astype(np.float32)
+    second = np.stack([np.arange(11, 21), np.zeros(10), np.zeros(10)], axis=1).astype(np.float32)
+    points = np.concatenate([first, second], axis=0)
+    edges = []
+    for start, stop in ((0, 10), (10, 20)):
+        for index in range(start, stop - 1):
+            edges.extend([(index, index + 1), (index + 1, index)])
+    edge_index = np.asarray(edges, dtype=np.int64).T
+    landmarks = np.tile(points[10], (23, 1)).astype(np.float32)
+    coarse = np.tile(points[9], (23, 1)).astype(np.float32)
+    record = tmp_path / "mesh.npz"
+    np.savez_compressed(record, points=points, edge_index=edge_index, landmarks=landmarks)
+    geodesic_path = build_roi_cache(
+        record, coarse, 20, tmp_path / "geodesic", "S1", 42,
+        roi_mode="geodesic", multi_seed_count=1,
+    )
+    hybrid_path = build_roi_cache(
+        record, coarse, 20, tmp_path / "hybrid", "S1", 42,
+        roi_mode="hybrid", euclidean_radius_scale=1.25, multi_seed_count=3,
+    )
+    with np.load(geodesic_path) as geodesic, np.load(hybrid_path) as hybrid:
+        assert float(hybrid["oracle_error"].max()) < float(geodesic["oracle_error"].min())
 
 
 def test_oracle_gate_rejects_sample_level_outlier():

@@ -116,14 +116,22 @@ def train_stage1_model(
     args,
     seed,
     cache_signature,
+    fixed_epochs=None,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if fixed_epochs is not None and int(fixed_epochs) < 1:
+        raise ValueError("fixed_epochs must be positive")
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
     train_loader = _loader(train_dataset, args.stage1_batch_size, True, args, seed)
-    val_loader = _loader(val_dataset, args.stage1_eval_batch_size, False, args, seed)
+    fixed_mode = fixed_epochs is not None
+    val_loader = (
+        None
+        if fixed_mode
+        else _loader(val_dataset, args.stage1_eval_batch_size, False, args, seed)
+    )
     model = GlobalCoarseNetwork(
         input_dim=len(normalizer["mean"]),
         width=args.stage1_width,
@@ -145,27 +153,37 @@ def train_stage1_model(
             model.load_state_dict(checkpoint["model_state"])
             report = dict(completion["report"])
             report["loaded_from_cache"] = True
-            print(
-                f"Stage 1 model cached: {output_dir.name}; "
-                f"best validation ALE={report['best_validation_ale']:.4f}",
-                flush=True,
+            score_text = (
+                f"best validation ALE={report['best_validation_ale']:.4f}"
+                if report.get("best_validation_ale") is not None
+                else f"fixed epochs={report['best_epoch']}"
             )
+            print(f"Stage 1 model cached: {output_dir.name}; {score_text}", flush=True)
             return model, report
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.stage1_lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=args.stage1_scheduler_patience,
-        min_lr=1e-6,
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(fixed_epochs or 1) - int(args.stage1_lr_warmup_epochs), 1),
+            eta_min=1e-6,
+        )
+        if fixed_mode
+        else torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=args.stage1_scheduler_patience,
+            min_lr=1e-6,
+        )
     )
     scaler = grad_scaler(args.mixed_precision, args.amp_dtype, args.amp_init_scale)
     best_score, best_epoch, stale = float("inf"), 0, 0
     history = []
     started = time.time()
-    for epoch in range(1, args.stage1_epochs + 1):
+    total_epochs = int(fixed_epochs) if fixed_mode else int(args.stage1_epochs)
+    for epoch in range(1, total_epochs + 1):
         train_dataset.set_epoch(epoch)
         _set_warmup_lr(optimizer, args.stage1_lr, epoch, args.stage1_lr_warmup_epochs)
         model.train()
@@ -197,26 +215,61 @@ def train_stage1_model(
                 totals[name] = totals.get(name, 0.0) + float(value.detach()) * batch_size
         if count == 0:
             raise RuntimeError("Stage 1 completed an epoch without an optimizer update")
-        validation = collect_stage1(model, val_loader, device, args)
-        score = float(validation["errors"].mean())
-        if not np.isfinite(score):
-            raise RuntimeError("Stage 1 validation ALE is non-finite")
-        if epoch >= args.stage1_scheduler_start_epoch:
-            scheduler.step(score)
-        row = {
-            "epoch": epoch,
-            "validation_ale": score,
-            "validation_median": float(np.median(validation["errors"])),
-            "lr": optimizer.param_groups[0]["lr"],
-            **{f"train_{name}": value / count for name, value in totals.items()},
-        }
+        if fixed_mode:
+            score = None
+            if epoch > args.stage1_lr_warmup_epochs:
+                scheduler.step()
+            row = {
+                "epoch": epoch,
+                "training_mode": "fixed_epoch_oof",
+                "lr": optimizer.param_groups[0]["lr"],
+                **{f"train_{name}": value / count for name, value in totals.items()},
+            }
+        else:
+            validation = collect_stage1(model, val_loader, device, args)
+            score = float(validation["errors"].mean())
+            if not np.isfinite(score):
+                raise RuntimeError("Stage 1 validation ALE is non-finite")
+            if epoch >= args.stage1_scheduler_start_epoch:
+                scheduler.step(score)
+            row = {
+                "epoch": epoch,
+                "validation_ale": score,
+                "validation_median": float(np.median(validation["errors"])),
+                "lr": optimizer.param_groups[0]["lr"],
+                **{f"train_{name}": value / count for name, value in totals.items()},
+            }
         history.append(row)
-        print(
-            f"Stage1 epoch {epoch:04d}/{args.stage1_epochs} "
-            f"train={row['train_total']:.5f} val_ALE={score:.4f}",
-            flush=True,
-        )
-        if score < best_score - args.min_delta:
+        if fixed_mode:
+            print(
+                f"Stage1 OOF epoch {epoch:04d}/{total_epochs} "
+                f"train={row['train_total']:.5f}",
+                flush=True,
+            )
+            best_epoch = epoch
+            if epoch == total_epochs:
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+                        "epoch": epoch,
+                        "validation_ale": None,
+                        "normalizer": normalizer,
+                        "stage1_config": {
+                            "width": args.stage1_width,
+                            "blocks": args.stage1_blocks,
+                            "topk": args.stage1_topk,
+                            "training_mode": "fixed_epoch_oof",
+                        },
+                    },
+                    checkpoint_path,
+                )
+        else:
+            print(
+                f"Stage1 epoch {epoch:04d}/{total_epochs} "
+                f"train={row['train_total']:.5f} val_ALE={score:.4f}",
+                flush=True,
+            )
+        if not fixed_mode and score < best_score - args.min_delta:
             best_score, best_epoch, stale = score, epoch, 0
             torch.save(
                 {
@@ -232,14 +285,14 @@ def train_stage1_model(
                 },
                 checkpoint_path,
             )
-        elif epoch >= args.stage1_min_epochs:
+        elif not fixed_mode and epoch >= args.stage1_min_epochs:
             stale += 1
-        else:
+        elif not fixed_mode:
             stale = 0
         (output_dir / "history.json").write_text(
             json.dumps(history, indent=2), encoding="utf-8"
         )
-        if epoch >= args.stage1_min_epochs and stale >= args.stage1_patience:
+        if not fixed_mode and epoch >= args.stage1_min_epochs and stale >= args.stage1_patience:
             print(
                 f"Stage1 early stopping at epoch {epoch}; best epoch={best_epoch}",
                 flush=True,
@@ -252,11 +305,13 @@ def train_stage1_model(
     model.load_state_dict(checkpoint["model_state"])
     report = {
         "best_epoch": best_epoch,
-        "best_validation_ale": best_score,
+        "best_validation_ale": None if fixed_mode else best_score,
         "training_seconds": float(time.time() - started),
         "checkpoint": str(checkpoint_path),
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "loaded_from_cache": False,
+        "training_mode": "fixed_epoch_oof" if fixed_mode else "validation_early_stop",
+        "fit_sample_count": len(train_dataset),
     }
     (output_dir / "training_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
@@ -281,7 +336,14 @@ def _strata(sample_by_id, ids):
     )
 
 
-def _inner_partitions(sample_by_id, train_ids, folds, val_fraction, seed):
+def _inner_partitions(
+    sample_by_id,
+    train_ids,
+    folds,
+    val_fraction,
+    seed,
+    fixed_training=False,
+):
     ids = np.asarray(train_ids)
     strata = _strata(sample_by_id, ids)
     counts = Counter(strata.tolist())
@@ -295,6 +357,16 @@ def _inner_partitions(sample_by_id, train_ids, folds, val_fraction, seed):
     result = []
     for fold_index, (remaining, holdout) in enumerate(outer_iterator, start=1):
         remaining_ids = ids[remaining]
+        if fixed_training:
+            result.append(
+                {
+                    "fold": fold_index,
+                    "train": remaining_ids.tolist(),
+                    "val": [],
+                    "holdout": ids[holdout].tolist(),
+                }
+            )
+            continue
         remaining_strata = strata[remaining]
         remaining_counts = Counter(remaining_strata.tolist())
         can_stratify = len(remaining_counts) > 1 and min(remaining_counts.values()) >= 2
@@ -425,7 +497,7 @@ def _stage1_cache_key(splits, records, transforms, args):
         transform_digest.update(sample_id.encode("utf-8"))
         transform_digest.update(np.asarray(transforms[sample_id], dtype=np.float32).tobytes())
     payload = {
-        "pipeline_version": 3,
+        "pipeline_version": 5,
         "splits": splits,
         "record_files": {
             sample_id: Path(records[sample_id]).name
@@ -433,6 +505,9 @@ def _stage1_cache_key(splits, records, transforms, args):
         },
         "transform_digest": transform_digest.hexdigest(),
         "oof_folds": args.stage1_oof_folds,
+        "oof_mode": args.stage1_oof_mode,
+        "oof_fixed_epochs": args.stage1_oof_fixed_epochs,
+        "oof_template_alpha": args.stage1_oof_template_alpha,
         "inner_val_fraction": args.stage1_inner_val_fraction,
         "width": args.stage1_width,
         "blocks": args.stage1_blocks,
@@ -471,11 +546,23 @@ def _stage1_cache_key(splits, records, transforms, args):
 
 
 def _stage1_quality_status(metrics, args):
+    signed_gap = (
+        metrics["train_oof"]["overall_ale"]
+        - metrics["validation"]["overall_ale"]
+    )
+    gap = abs(signed_gap)
     checks = {
         "validation": metrics["validation"]["overall_ale"] <= args.max_stage1_val_ale,
         "train_oof": metrics["train_oof"]["overall_ale"] <= args.max_stage1_oof_ale,
+        "train_oof_p95": metrics["train_oof"]["p95"] <= args.max_stage1_oof_p95,
+        "oof_validation_gap": gap <= args.max_stage1_oof_val_gap,
     }
-    return {**checks, "passed": all(checks.values())}
+    return {
+        **checks,
+        "gap_mm": float(gap),
+        "signed_gap_mm": float(signed_gap),
+        "passed": all(checks.values()),
+    }
 
 
 def _enforce_stage1_quality(metrics, args, cached=False):
@@ -492,13 +579,35 @@ def _enforce_stage1_quality(metrics, args, cached=False):
             f"--max-stage1-oof-ale={args.max_stage1_oof_ale:.4f}. "
             "Completed predictions remain cached for inspection or a revised gate."
         )
+    if metrics["train_oof"]["p95"] > args.max_stage1_oof_p95:
+        raise RuntimeError(
+            f"{prefix} train OOF p95={metrics['train_oof']['p95']:.4f} exceeds "
+            f"--max-stage1-oof-p95={args.max_stage1_oof_p95:.4f}."
+        )
+    signed_gap = (
+        metrics["train_oof"]["overall_ale"]
+        - metrics["validation"]["overall_ale"]
+    )
+    gap = abs(signed_gap)
+    if gap > args.max_stage1_oof_val_gap:
+        raise RuntimeError(
+            f"{prefix} absolute OOF-validation ALE gap={gap:.4f} "
+            f"(signed={signed_gap:.4f}) exceeds "
+            f"--max-stage1-oof-val-gap={args.max_stage1_oof_val_gap:.4f}. "
+            "Stage 2 would otherwise train on a mismatched coarse-center distribution."
+        )
 
 
 def _print_stage1_summary(metrics, cached=False):
     source = "cached" if cached else "completed"
+    signed_gap = (
+        metrics["train_oof"]["overall_ale"]
+        - metrics["validation"]["overall_ale"]
+    )
     print(
         f"Stage 1 {source}: train OOF ALE={metrics['train_oof']['overall_ale']:.4f}, "
-        f"validation ALE={metrics['validation']['overall_ale']:.4f}",
+        f"validation ALE={metrics['validation']['overall_ale']:.4f}, "
+        f"absolute gap={abs(signed_gap):.4f} (signed={signed_gap:.4f})",
         flush=True,
     )
 
@@ -563,6 +672,7 @@ def generate_oof_stage1_predictions(
         args.stage1_oof_folds,
         args.stage1_inner_val_fraction,
         args.seed,
+        fixed_training=args.stage1_oof_mode == "fixed_epoch",
     )
     oof_predictions = {}
     provenance = {}
@@ -587,16 +697,20 @@ def generate_oof_stage1_predictions(
             True,
             args.seed + partition["fold"] * 100,
         )
-        val_dataset = _dataset(
-            samples,
-            partition["val"],
-            records,
-            transforms,
-            inner_normalizer,
-            args,
-            False,
-            True,
-            args.seed,
+        val_dataset = (
+            None
+            if args.stage1_oof_mode == "fixed_epoch"
+            else _dataset(
+                samples,
+                partition["val"],
+                records,
+                transforms,
+                inner_normalizer,
+                args,
+                False,
+                True,
+                args.seed,
+            )
         )
         model, report = train_stage1_model(
             train_dataset,
@@ -607,6 +721,11 @@ def generate_oof_stage1_predictions(
             args,
             args.seed + partition["fold"] * 1009,
             f"{cache_key}:inner:{partition['fold']}",
+            fixed_epochs=(
+                args.stage1_oof_fixed_epochs
+                if args.stage1_oof_mode == "fixed_epoch"
+                else None
+            ),
         )
         holdout_dataset = _dataset(
             samples,
@@ -619,24 +738,34 @@ def generate_oof_stage1_predictions(
             False,
             args.seed,
         )
-        calibration_dataset = _dataset(
-            samples,
-            partition["val"],
-            records,
-            transforms,
-            inner_normalizer,
-            args,
-            False,
-            False,
-            args.seed,
-        )
-        calibration_prediction = _predict(
-            model, calibration_dataset, device, args, args.seed
-        )
         template = _train_template(partition["train"], records)
-        alpha, candidates = _calibrate_template_blend(
-            calibration_prediction, partition["val"], template, records
-        )
+        if args.stage1_oof_mode == "fixed_epoch":
+            alpha = float(args.stage1_oof_template_alpha)
+            candidates = [
+                {
+                    "alpha": alpha,
+                    "validation_ale": None,
+                    "selection": "preconfigured_without_holdout_labels",
+                }
+            ]
+        else:
+            calibration_dataset = _dataset(
+                samples,
+                partition["val"],
+                records,
+                transforms,
+                inner_normalizer,
+                args,
+                False,
+                False,
+                args.seed,
+            )
+            calibration_prediction = _predict(
+                model, calibration_dataset, device, args, args.seed
+            )
+            alpha, candidates = _calibrate_template_blend(
+                calibration_prediction, partition["val"], template, records
+            )
         predicted = _apply_template_blend(
             _predict(model, holdout_dataset, device, args, args.seed), template, alpha
         )
@@ -718,9 +847,19 @@ def generate_oof_stage1_predictions(
     val_predictions = _predict(final_model, val_dataset, device, args, args.seed)
     test_predictions = _predict(final_model, test_dataset, device, args, args.seed)
     outer_template = _train_template(splits["train"], records)
-    outer_alpha, outer_candidates = _calibrate_template_blend(
-        val_predictions, splits["val"], outer_template, records
-    )
+    if args.stage1_oof_mode == "fixed_epoch":
+        outer_alpha = float(args.stage1_oof_template_alpha)
+        outer_candidates = [
+            {
+                "alpha": outer_alpha,
+                "validation_ale": None,
+                "selection": "matched_to_fixed_oof_without_validation_blend_fit",
+            }
+        ]
+    else:
+        outer_alpha, outer_candidates = _calibrate_template_blend(
+            val_predictions, splits["val"], outer_template, records
+        )
     val_predictions = _apply_template_blend(
         val_predictions, outer_template, outer_alpha
     )
@@ -755,7 +894,12 @@ def generate_oof_stage1_predictions(
         },
         "metrics": stage1_metrics,
         "provenance": {
-            "train": "nested out-of-fold; each sample excluded from model fit and checkpoint validation",
+            "train": (
+                "fixed-epoch out-of-fold; each sample excluded from model fit and no holdout "
+                "label used for checkpoint or blend selection"
+                if args.stage1_oof_mode == "fixed_epoch"
+                else "nested out-of-fold; each sample excluded from model fit and checkpoint validation"
+            ),
             "validation": "outer-train model; validation labels used only for checkpoint selection",
             "test": "outer-train model inference without loading test expert landmarks",
         },

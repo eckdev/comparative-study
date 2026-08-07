@@ -201,6 +201,7 @@ class All23RGBGeodesicCascade(nn.Module):
         use_anatomical_attention=True,
         use_specialized_heads=True,
         use_local_refiner=True,
+        use_refinement_gate=False,
         roi_radius_scale=1.0,
     ):
         super().__init__()
@@ -210,6 +211,7 @@ class All23RGBGeodesicCascade(nn.Module):
         self.use_anatomical_attention = bool(use_anatomical_attention)
         self.use_specialized_heads = bool(use_specialized_heads)
         self.use_local_refiner = bool(use_local_refiner)
+        self.use_refinement_gate = bool(use_refinement_gate)
         self.roi_radius_scale = float(roi_radius_scale)
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, width)
@@ -229,6 +231,16 @@ class All23RGBGeodesicCascade(nn.Module):
         self.inter_norm = nn.LayerNorm(width)
         self.inter_attention = nn.MultiheadAttention(width, heads, dropout=dropout, batch_first=True)
         self.inter_ffn = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width * 2), nn.GELU(), nn.Linear(width * 2, width))
+        self.trichion_context = nn.Sequential(
+            nn.Linear(width * 3, width),
+            nn.GELU(),
+            nn.Linear(width, width),
+        )
+        self.gonion_pair_context = nn.Sequential(
+            nn.Linear(width * 3, width * 2),
+            nn.GELU(),
+            nn.Linear(width * 2, width * 2),
+        )
         self.local_shared = nn.Sequential(nn.Linear(width * 2, width), nn.GELU(), nn.Dropout(dropout))
         self.score_heads = nn.ModuleDict(
             {
@@ -238,6 +250,12 @@ class All23RGBGeodesicCascade(nn.Module):
         )
         self.region_head = nn.Sequential(nn.Linear(width, width // 2), nn.GELU(), nn.Linear(width // 2, 1))
         self.confidence_head = nn.Sequential(nn.Linear(width, width // 2), nn.GELU(), nn.Linear(width // 2, 1))
+        self.refinement_gate = nn.Sequential(
+            nn.Linear(width + 5, width // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(width // 2, 1),
+        )
         self.register_buffer("anatomical_attention_mask", graph_attention_mask(), persistent=False)
         self.register_buffer(
             "roi_radii",
@@ -305,6 +323,10 @@ class All23RGBGeodesicCascade(nn.Module):
                 "local_logits": local_logits,
                 "region_logits": local_logits.masked_fill(~roi_mask, -20.0),
                 "final_coordinates": coarse_coordinates,
+                "refined_coordinates": coarse_coordinates,
+                "refinement_alpha": coarse_coordinates.new_ones(
+                    (batch_count, NUM_LANDMARKS)
+                ),
                 "log_var": self.confidence_head(global_tokens).squeeze(-1).clamp(-6.0, 6.0),
                 "candidate_points": points[roi_index],
                 "tokens": global_tokens,
@@ -312,7 +334,13 @@ class All23RGBGeodesicCascade(nn.Module):
         local_features = encoded[roi_index]
         candidates = points[roi_index]
         relative = candidates - batch["coarse"][:, :, None, :]
-        radii = self.roi_radii[None, :, None, None].clamp_min(1e-6)
+        sample_radius_scale = batch.get("sample_radius_scale")
+        if sample_radius_scale is None:
+            sample_radius_scale = self.roi_radii.new_ones((batch_count,))
+        radii = (
+            self.roi_radii[None, :, None, None]
+            * sample_radius_scale[:, None, None, None]
+        ).clamp_min(1e-6)
         radial = torch.linalg.norm(relative, dim=-1, keepdim=True) / radii
         local_features = local_features + self.relative_position(torch.cat([relative / radii, radial], dim=-1))
         local_features = local_features + self.landmark_embedding[None, :, None, :]
@@ -340,6 +368,17 @@ class All23RGBGeodesicCascade(nn.Module):
             )
             tokens = tokens + graph_tokens
             tokens = tokens + self.inter_ffn(tokens)
+        if self.use_specialized_heads:
+            hard_context = torch.zeros_like(tokens)
+            hard_context[:, 0] = self.trichion_context(
+                torch.cat([tokens[:, 0], tokens[:, 1], tokens[:, 2]], dim=-1)
+            )
+            lower_midline = tokens[:, 10:13].mean(dim=1)
+            gonion_context = self.gonion_pair_context(
+                torch.cat([tokens[:, 21], tokens[:, 22], lower_midline], dim=-1)
+            ).reshape(batch_count, 2, self.width)
+            hard_context[:, 21:23] = gonion_context
+            tokens = tokens + hard_context
         conditioned = self.local_shared(torch.cat([local_features, tokens[:, :, None, :].expand_as(local_features)], dim=-1))
 
         local_logits = conditioned.new_zeros(conditioned.shape[:-1])
@@ -365,17 +404,59 @@ class All23RGBGeodesicCascade(nn.Module):
         )
         if coordinate_mode == "mse_over_mesh":
             hard_coordinates = mse_over_mesh_coordinate(local_logits, candidates, roi_mask, self.heatmap_sigmas)
-            final_coordinates = hard_coordinates + soft_coordinates - soft_coordinates.detach()
+            refined_coordinates = hard_coordinates + soft_coordinates - soft_coordinates.detach()
         elif coordinate_mode == "topk":
-            final_coordinates = soft_coordinates
+            refined_coordinates = soft_coordinates
         else:
             raise ValueError(f"Unknown coordinate mode: {coordinate_mode}")
+
+        if self.use_refinement_gate:
+            work_logits = local_logits.float().masked_fill(~roi_mask, -torch.inf)
+            probability = torch.softmax(work_logits, dim=-1)
+            probability = torch.where(roi_mask, probability, torch.zeros_like(probability))
+            entropy = -(probability * torch.log(probability.clamp_min(1e-8))).sum(dim=-1)
+            valid_count = roi_mask.sum(dim=-1).float().clamp_min(2.0)
+            entropy = entropy / torch.log(valid_count)
+            top_values = torch.topk(probability, k=min(2, probability.shape[-1]), dim=-1).values
+            if top_values.shape[-1] == 1:
+                margin = top_values[..., 0]
+            else:
+                margin = top_values[..., 0] - top_values[..., 1]
+            scalar_radius = radii.squeeze(-1).squeeze(-1)
+            delta_norm = torch.linalg.norm(
+                refined_coordinates.detach() - batch["coarse"], dim=-1
+            ) / scalar_radius
+            coarse_disagreement = torch.linalg.norm(
+                coarse_coordinates.detach() - batch["coarse"], dim=-1
+            ) / scalar_radius
+            diagnostics = torch.stack(
+                [
+                    log_var.detach(),
+                    delta_norm,
+                    entropy.detach(),
+                    margin.detach(),
+                    coarse_disagreement,
+                ],
+                dim=-1,
+            )
+            refinement_alpha = torch.sigmoid(
+                self.refinement_gate(torch.cat([tokens, diagnostics], dim=-1)).squeeze(-1)
+            )
+        else:
+            refinement_alpha = refined_coordinates.new_ones(
+                (batch_count, NUM_LANDMARKS)
+            )
+        final_coordinates = batch["coarse"] + refinement_alpha[..., None] * (
+            refined_coordinates - batch["coarse"]
+        )
         return {
             "coarse_logits": coarse_logits,
             "coarse_coordinates": coarse_coordinates,
             "local_logits": local_logits,
             "region_logits": region_logits,
             "final_coordinates": final_coordinates,
+            "refined_coordinates": refined_coordinates,
+            "refinement_alpha": refinement_alpha,
             "log_var": log_var,
             "candidate_points": candidates,
             "tokens": tokens,
