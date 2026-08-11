@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from .anatomy import (
     CONTOUR_LANDMARKS,
+    HARD3,
     NUM_LANDMARKS,
     TEXTURE_LANDMARKS,
     graph_attention_mask,
@@ -91,6 +92,19 @@ def topk_soft_coordinate(logits, candidates, mask, topk=30, temperature=0.75):
     weights = torch.softmax(values / max(float(temperature), 1e-6), dim=-1)
     selected = torch.gather(candidates, 2, indices[..., None].expand(-1, -1, -1, 3))
     return torch.sum(weights[..., None] * selected, dim=2)
+
+
+@torch.no_grad()
+def nearest_candidate_coordinate(coordinates, candidates, mask):
+    """Project coordinates onto the closest valid ROI vertex."""
+    distances = torch.linalg.norm(candidates.float() - coordinates.float()[:, :, None], dim=-1)
+    distances = distances.masked_fill(~mask, torch.inf)
+    selected = torch.argmin(distances, dim=-1)
+    return torch.gather(
+        candidates,
+        2,
+        selected[..., None, None].expand(-1, -1, 1, 3),
+    ).squeeze(2)
 
 
 @torch.no_grad()
@@ -202,6 +216,9 @@ class All23RGBGeodesicCascade(nn.Module):
         use_specialized_heads=True,
         use_local_refiner=True,
         use_refinement_gate=False,
+        use_hard_candidate_ranker=False,
+        hard_coordinate_topk=8,
+        hard_coordinate_temperature=0.35,
         roi_radius_scale=1.0,
     ):
         super().__init__()
@@ -212,6 +229,9 @@ class All23RGBGeodesicCascade(nn.Module):
         self.use_specialized_heads = bool(use_specialized_heads)
         self.use_local_refiner = bool(use_local_refiner)
         self.use_refinement_gate = bool(use_refinement_gate)
+        self.use_hard_candidate_ranker = bool(use_hard_candidate_ranker)
+        self.hard_coordinate_topk = int(hard_coordinate_topk)
+        self.hard_coordinate_temperature = float(hard_coordinate_temperature)
         self.roi_radius_scale = float(roi_radius_scale)
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, width)
@@ -256,6 +276,48 @@ class All23RGBGeodesicCascade(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(width // 2, 1),
         )
+        if self.use_hard_candidate_ranker:
+            # Four stable coarse anchors describe each difficult candidate in
+            # an anatomy-relative coordinate frame. Trichion uses upper/midline
+            # anchors; each Gonion uses the lower midline and its contralateral mate.
+            self.hard_anchor_projection = nn.Sequential(
+                nn.Linear(4 * 4, width),
+                nn.LayerNorm(width),
+                nn.GELU(),
+                nn.Linear(width, width),
+            )
+            self.hard_candidate_ranker = nn.Sequential(
+                nn.Linear(width * 2, width),
+                nn.LayerNorm(width),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(width, width // 2),
+                nn.GELU(),
+                nn.Linear(width // 2, 1),
+            )
+            self.hard_refinement_gate = nn.Sequential(
+                nn.Linear(width + 5, width // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(width // 2, 1),
+            )
+        self.register_buffer(
+            "hard_indices",
+            torch.tensor(HARD3, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hard_anchor_indices",
+            torch.tensor(
+                [
+                    [1, 2, 3, 12],
+                    [10, 11, 12, 22],
+                    [10, 11, 12, 21],
+                ],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
         self.register_buffer("anatomical_attention_mask", graph_attention_mask(), persistent=False)
         self.register_buffer(
             "roi_radii",
@@ -298,6 +360,52 @@ class All23RGBGeodesicCascade(nn.Module):
                 )[0]
             )
         return torch.stack(coordinates)
+
+    def _hard_anchor_features(self, candidates, coarse, radii):
+        hard_candidates = candidates[:, self.hard_indices]
+        anchors = coarse[:, self.hard_anchor_indices]
+        vectors = hard_candidates[:, :, :, None, :] - anchors[:, :, None, :, :]
+        hard_radii = radii[:, self.hard_indices, 0, 0][:, :, None, None, None]
+        vectors = vectors / hard_radii.clamp_min(1e-6)
+        distances = torch.linalg.norm(vectors, dim=-1, keepdim=True)
+        return torch.cat([vectors, distances], dim=-1).flatten(start_dim=-2)
+
+    def coordinates_from_logits(self, logits, candidates, mask, coordinate_mode):
+        soft_coordinates = topk_soft_coordinate(
+            logits,
+            candidates,
+            mask,
+            self.coordinate_topk,
+            self.coordinate_temperature,
+        )
+        if coordinate_mode == "mse_over_mesh":
+            surface_coordinates = mse_over_mesh_coordinate(
+                logits, candidates, mask, self.heatmap_sigmas
+            )
+            refined = surface_coordinates + soft_coordinates - soft_coordinates.detach()
+        elif coordinate_mode == "topk":
+            refined = soft_coordinates
+        else:
+            raise ValueError(f"Unknown coordinate mode: {coordinate_mode}")
+
+        if self.use_hard_candidate_ranker:
+            hard_logits = logits[:, self.hard_indices]
+            hard_candidates = candidates[:, self.hard_indices]
+            hard_mask = mask[:, self.hard_indices]
+            hard_soft = topk_soft_coordinate(
+                hard_logits,
+                hard_candidates,
+                hard_mask,
+                self.hard_coordinate_topk,
+                self.hard_coordinate_temperature,
+            )
+            hard_surface = nearest_candidate_coordinate(
+                hard_soft, hard_candidates, hard_mask
+            )
+            hard_straight_through = hard_surface + hard_soft - hard_soft.detach()
+            refined = refined.clone()
+            refined[:, self.hard_indices] = hard_straight_through
+        return refined
 
     def forward(self, batch, coordinate_mode="topk"):
         points = batch["points"]
@@ -391,24 +499,25 @@ class All23RGBGeodesicCascade(nn.Module):
                 local_logits[:, indices] = self.score_heads[name](conditioned[:, indices]).squeeze(-1)
         else:
             local_logits = self.score_heads["generic"](conditioned).squeeze(-1)
+        if self.use_hard_candidate_ranker:
+            anchor_features = self._hard_anchor_features(candidates, batch["coarse"], radii)
+            anchor_embedding = self.hard_anchor_projection(anchor_features)
+            hard_conditioned = torch.cat(
+                [conditioned[:, self.hard_indices], anchor_embedding], dim=-1
+            )
+            hard_logits = self.hard_candidate_ranker(hard_conditioned).squeeze(-1)
+            local_logits = local_logits.clone()
+            local_logits[:, self.hard_indices] = hard_logits
         local_logits = local_logits.masked_fill(~roi_mask, -torch.inf)
         region_logits = self.region_head(conditioned).squeeze(-1).masked_fill(~roi_mask, -20.0)
         log_var = self.confidence_head(tokens).squeeze(-1).clamp(-6.0, 6.0)
 
-        soft_coordinates = topk_soft_coordinate(
+        refined_coordinates = self.coordinates_from_logits(
             local_logits,
             candidates,
             roi_mask,
-            self.coordinate_topk,
-            self.coordinate_temperature,
+            coordinate_mode,
         )
-        if coordinate_mode == "mse_over_mesh":
-            hard_coordinates = mse_over_mesh_coordinate(local_logits, candidates, roi_mask, self.heatmap_sigmas)
-            refined_coordinates = hard_coordinates + soft_coordinates - soft_coordinates.detach()
-        elif coordinate_mode == "topk":
-            refined_coordinates = soft_coordinates
-        else:
-            raise ValueError(f"Unknown coordinate mode: {coordinate_mode}")
 
         if self.use_refinement_gate:
             work_logits = local_logits.float().masked_fill(~roi_mask, -torch.inf)
@@ -439,9 +548,14 @@ class All23RGBGeodesicCascade(nn.Module):
                 ],
                 dim=-1,
             )
-            refinement_alpha = torch.sigmoid(
-                self.refinement_gate(torch.cat([tokens, diagnostics], dim=-1)).squeeze(-1)
-            )
+            gate_input = torch.cat([tokens, diagnostics], dim=-1)
+            gate_logits = self.refinement_gate(gate_input).squeeze(-1)
+            if self.use_hard_candidate_ranker:
+                gate_logits = gate_logits.clone()
+                gate_logits[:, self.hard_indices] = self.hard_refinement_gate(
+                    gate_input[:, self.hard_indices]
+                ).squeeze(-1)
+            refinement_alpha = torch.sigmoid(gate_logits)
         else:
             refinement_alpha = refined_coordinates.new_ones(
                 (batch_count, NUM_LANDMARKS)
@@ -460,4 +574,9 @@ class All23RGBGeodesicCascade(nn.Module):
             "log_var": log_var,
             "candidate_points": candidates,
             "tokens": tokens,
+            "hard_rank_logits": (
+                local_logits[:, self.hard_indices]
+                if self.use_hard_candidate_ranker
+                else None
+            ),
         }

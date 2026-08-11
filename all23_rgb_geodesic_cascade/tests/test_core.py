@@ -1,6 +1,8 @@
+import json
 import numpy as np
 import torch
 from types import SimpleNamespace
+from torch.utils.data import DataLoader, Dataset
 
 from all23_rgb_geodesic_cascade.alignment import (
     apply_transform, build_robust_atlas, robust_symmetric_surface_score,
@@ -23,8 +25,14 @@ from all23_rgb_geodesic_cascade.stage1 import (
     _stage1_quality_status,
     stage1_loss,
 )
-from all23_rgb_geodesic_cascade.train import amp_torch_dtype
-from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import oracle_gate_status
+from all23_rgb_geodesic_cascade.train import (
+    amp_torch_dtype, apply_refinement_calibration, fit_model,
+    fit_refinement_calibration,
+)
+from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
+    build_parser, experiment_settings, load_completed_fold, oracle_gate_status,
+    stage2_signature,
+)
 
 
 def test_anatomical_contract():
@@ -127,6 +135,151 @@ def test_refinement_gate_is_bounded_and_trainable():
     assert torch.isfinite(components["gate"])
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.refinement_gate.parameters())
+
+
+def test_e9_hard_candidate_ranker_selects_surface_vertices_and_trains():
+    batch = collate_graphs([synthetic_item()])
+    model = All23RGBGeodesicCascade(
+        input_dim=14,
+        width=32,
+        global_blocks=1,
+        heads=4,
+        dropout=0.0,
+        use_refinement_gate=True,
+        use_hard_candidate_ranker=True,
+        hard_coordinate_topk=3,
+    )
+    outputs = model(batch, coordinate_mode="mse_over_mesh")
+    assert outputs["hard_rank_logits"].shape == (1, 3, 8)
+    candidates = outputs["candidate_points"][:, [0, 21, 22]]
+    hard_prediction = outputs["refined_coordinates"][:, [0, 21, 22]]
+    nearest = torch.cdist(
+        hard_prediction.reshape(3, 1, 3), candidates.reshape(3, 8, 3)
+    ).amin(dim=-1)
+    assert torch.allclose(nearest, torch.zeros_like(nearest), atol=1e-6)
+    loss, _, components = compute_loss(
+        outputs,
+        batch,
+        LossWeights(hard_landmark=4.0, hard_rank=1.0, gate=0.5),
+    )
+    assert torch.isfinite(components["hard_rank"])
+    loss.backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in model.hard_candidate_ranker.parameters()
+    )
+    assert any(
+        parameter.grad is not None
+        for parameter in model.hard_refinement_gate.parameters()
+    )
+
+
+def test_group_refinement_calibration_is_fit_on_validation_coordinates():
+    shape = (2, 23, 3)
+    outputs = {
+        "coarse": np.zeros(shape, dtype=np.float32),
+        "refined": np.full(shape, 2.0, dtype=np.float32),
+        "expert": np.ones(shape, dtype=np.float32),
+        "prediction": np.full(shape, 2.0, dtype=np.float32),
+        "refinement_alpha": np.ones((2, 23), dtype=np.float32),
+        "errors": np.full((2, 23), np.sqrt(3.0), dtype=np.float32),
+    }
+    calibration = fit_refinement_calibration(outputs, "group_scale")
+    assert calibration["groups"]["core20"]["scale"] == 0.5
+    assert calibration["groups"]["hard3"]["scale"] == 0.5
+    calibrated = apply_refinement_calibration(outputs, calibration)
+    assert np.allclose(calibrated["prediction"], outputs["expert"])
+    assert np.allclose(calibrated["errors"], 0.0)
+
+
+def test_completed_fold_requires_matching_stage2_signature(tmp_path):
+    args = build_parser().parse_args(
+        ["--data-root", "dataset", "--output-dir", str(tmp_path), "--experiment", "E9"]
+    )
+    experiment_settings(args)
+    splits = {"train": ["A"], "val": ["B"], "test": ["C"]}
+    signature = stage2_signature(args, splits)
+    result = {
+        "stage2_signature": signature,
+        "training": {},
+        "validation": {},
+        "test": {},
+    }
+    (tmp_path / "run_summary.json").write_text(json.dumps(result), encoding="utf-8")
+    for name in ("metrics_val.json", "metrics_test.json", "predictions_test.csv"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    assert load_completed_fold(tmp_path, args, splits) == result
+    args.hard_rank_weight = 0.25
+    assert load_completed_fold(tmp_path, args, splits) is None
+
+
+def test_stage2_last_checkpoint_can_resume_without_retraining(tmp_path):
+    class TinyDataset(Dataset):
+        def __init__(self):
+            self.items = [synthetic_item(vertex_count=24, roi_points=4)]
+            self.epoch = 0
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, index):
+            return self.items[index]
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+    dataset = TinyDataset()
+    loader = DataLoader(dataset, batch_size=1, collate_fn=collate_graphs)
+    args = SimpleNamespace(
+        lr=1e-3,
+        weight_decay=0.0,
+        scheduler_patience=1,
+        mixed_precision=False,
+        amp_dtype="float32",
+        amp_init_scale=1.0,
+        resume_stage2=True,
+        force_stage2_retrain=False,
+        stage2_signature="test-signature",
+        lr_warmup_epochs=0,
+        epochs=1,
+        scheduler_start_epoch=1,
+        tta_validation=False,
+        checkpoint_metric="overall",
+        checkpoint_hard3_weight=0.35,
+        min_delta=0.0,
+        min_epochs=1,
+        patience=1,
+        checkpoint_every=1,
+        no_tqdm=True,
+        coordinate_mode="topk",
+        gate_warmup_epochs=0,
+        region_positive_weight=20.0,
+        grad_clip=1.0,
+        max_nonfinite_fraction=0.1,
+        max_amp_overflow_fraction=0.1,
+    )
+    normalizer = {"mean": [0.0] * 14, "std": [1.0] * 14}
+    model = All23RGBGeodesicCascade(
+        input_dim=14, width=16, global_blocks=1, heads=4, dropout=0.0
+    )
+    first = fit_model(
+        model, loader, loader, torch.device("cpu"), args, LossWeights(), normalizer, tmp_path
+    )
+    assert (tmp_path / "last_model.pth").exists()
+    resumed_model = All23RGBGeodesicCascade(
+        input_dim=14, width=16, global_blocks=1, heads=4, dropout=0.0
+    )
+    second = fit_model(
+        resumed_model,
+        loader,
+        loader,
+        torch.device("cpu"),
+        args,
+        LossWeights(),
+        normalizer,
+        tmp_path,
+    )
+    assert second["best_epoch"] == first["best_epoch"] == 1
 
 
 def test_global_only_ablation_uses_all_landmarks():

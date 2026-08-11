@@ -166,6 +166,8 @@ def save_evaluation(output_dir, split_name, outputs, calibration, bootstrap_iter
         "ungated_refined_core20": summarize(refined_errors[:, CORE20]),
         "ungated_refined_hard3": summarize(refined_errors[:, HARD3]),
         "coarse_overall": summarize(coarse_errors),
+        "coarse_core20": summarize(coarse_errors[:, CORE20]),
+        "coarse_hard3": summarize(coarse_errors[:, HARD3]),
         "oracle_overall": summarize(outputs["oracle"]),
         "bootstrap_ale": bootstrap_ci(errors, bootstrap_iterations, seed),
         "bootstrap_vs_coarse": bootstrap_delta(coarse_errors, errors, bootstrap_iterations, seed),
@@ -176,6 +178,13 @@ def save_evaluation(output_dir, split_name, outputs, calibration, bootstrap_iter
             "mean_alpha": float(np.mean(outputs["refinement_alpha"])),
             "core20_mean_alpha": float(np.mean(outputs["refinement_alpha"][:, CORE20])),
             "hard3_mean_alpha": float(np.mean(outputs["refinement_alpha"][:, HARD3])),
+            "refined_better_fraction": float(np.mean(refined_errors < coarse_errors)),
+            "core20_refined_better_fraction": float(
+                np.mean(refined_errors[:, CORE20] < coarse_errors[:, CORE20])
+            ),
+            "hard3_refined_better_fraction": float(
+                np.mean(refined_errors[:, HARD3] < coarse_errors[:, HARD3])
+            ),
         },
         "confidence_calibration": calibration,
     }

@@ -1,6 +1,7 @@
 import copy
 import json
 import math
+import random
 import time
 from pathlib import Path
 
@@ -9,9 +10,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from .anatomy import NUM_LANDMARKS, mirror_permutation
+from .anatomy import CORE20, HARD3, NUM_LANDMARKS, mirror_permutation
 from .losses import compute_loss
-from .model import mse_over_mesh_coordinate, topk_soft_coordinate
 
 
 def amp_torch_dtype(name):
@@ -217,18 +217,12 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
             refinement_alphas.append(refinement_alpha)
         averaged_heatmap = torch.stack(heatmaps).mean(dim=0)
         candidates = batch["points"][batch["roi_index"]]
-        if args.coordinate_mode == "mse_over_mesh":
-            refined = mse_over_mesh_coordinate(
-                averaged_heatmap, candidates, batch["roi_mask"], model.heatmap_sigmas
-            )
-        else:
-            refined = topk_soft_coordinate(
-                averaged_heatmap,
-                candidates,
-                batch["roi_mask"],
-                args.coordinate_topk,
-                args.coordinate_temperature,
-            )
+        refined = model.coordinates_from_logits(
+            averaged_heatmap,
+            candidates,
+            batch["roi_mask"],
+            args.coordinate_mode,
+        )
         refinement_alpha = torch.stack(refinement_alphas).mean(dim=0)
         prediction = (
             batch["coarse"]
@@ -263,6 +257,98 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
     return collected
 
 
+def validation_selection_score(validation, args):
+    overall = float(validation["errors"].mean())
+    core20 = float(validation["errors"][:, CORE20].mean())
+    hard3 = float(validation["errors"][:, HARD3].mean())
+    if args.checkpoint_metric == "balanced":
+        hard_weight = float(args.checkpoint_hard3_weight)
+        score = (1.0 - hard_weight) * core20 + hard_weight * hard3
+    else:
+        score = overall
+    return score, overall, core20, hard3
+
+
+def fit_refinement_calibration(outputs, mode="none"):
+    calibration = {"mode": mode, "groups": {}}
+    if mode == "none":
+        return calibration
+    groups = {"core20": CORE20, "hard3": HARD3}
+    scales = np.linspace(0.0, 1.25, 26)
+    for name, indices in groups.items():
+        indices = list(indices)
+        best = None
+        for scale in scales:
+            alpha = np.clip(outputs["refinement_alpha"][:, indices] * scale, 0.0, 1.0)
+            prediction = outputs["coarse"][:, indices] + alpha[..., None] * (
+                outputs["refined"][:, indices] - outputs["coarse"][:, indices]
+            )
+            ale = float(
+                np.linalg.norm(prediction - outputs["expert"][:, indices], axis=-1).mean()
+            )
+            candidate = (ale, abs(float(scale) - 1.0), float(scale))
+            if best is None or candidate < best:
+                best = candidate
+        calibration["groups"][name] = {
+            "scale": best[2],
+            "validation_ale": best[0],
+        }
+    return calibration
+
+
+def apply_refinement_calibration(outputs, calibration):
+    if calibration.get("mode") == "none":
+        return outputs
+    outputs = dict(outputs)
+    outputs["uncalibrated_prediction"] = outputs["prediction"].copy()
+    outputs["uncalibrated_refinement_alpha"] = outputs["refinement_alpha"].copy()
+    alpha = outputs["refinement_alpha"].copy()
+    for name, indices in (("core20", CORE20), ("hard3", HARD3)):
+        scale = float(calibration["groups"][name]["scale"])
+        alpha[:, indices] = np.clip(alpha[:, indices] * scale, 0.0, 1.0)
+    prediction = outputs["coarse"] + alpha[..., None] * (
+        outputs["refined"] - outputs["coarse"]
+    )
+    outputs["refinement_alpha"] = alpha
+    outputs["prediction"] = prediction
+    outputs["errors"] = np.linalg.norm(prediction - outputs["expert"], axis=-1)
+    return outputs
+
+
+def _atomic_torch_save(payload, path):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _rng_state(train_loader):
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    generator = getattr(train_loader, "generator", None)
+    if generator is not None:
+        state["loader_generator"] = generator.get_state()
+    return state
+
+
+def _restore_rng_state(state, train_loader):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+    generator = getattr(train_loader, "generator", None)
+    if generator is not None and "loader_generator" in state:
+        generator.set_state(state["loader_generator"])
+
+
 def fit_model(model, train_loader, val_loader, device, args, loss_weights, normalizer, output_dir):
     output_dir = Path(output_dir)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -271,10 +357,46 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
     )
     scaler = grad_scaler(args.mixed_precision, args.amp_dtype, args.amp_init_scale)
     checkpoint_path = output_dir / "best_model.pth"
-    best_score, best_epoch, stale = float("inf"), 0, 0
+    last_checkpoint_path = output_dir / "last_model.pth"
+    best_score, best_validation_ale, best_epoch, stale = float("inf"), float("inf"), 0, 0
     history = []
+    start_epoch = 1
+    elapsed_before = 0.0
+    training_complete = False
+    if args.resume_stage2 and not args.force_stage2_retrain and last_checkpoint_path.exists():
+        try:
+            resume = torch.load(last_checkpoint_path, map_location=device, weights_only=False)
+        except TypeError:
+            resume = torch.load(last_checkpoint_path, map_location=device)
+        expected_signature = getattr(args, "stage2_signature", None)
+        if resume.get("stage2_signature") != expected_signature:
+            raise RuntimeError(
+                "Stage 2 resume checkpoint does not match the current model/data configuration. "
+                "Use a new --output-dir or pass --force-stage2-retrain."
+            )
+        model.load_state_dict(resume["model_state"])
+        optimizer.load_state_dict(resume["optimizer_state"])
+        scheduler.load_state_dict(resume["scheduler_state"])
+        if resume.get("scaler_state"):
+            scaler.load_state_dict(resume["scaler_state"])
+        best_score = float(resume["best_score"])
+        best_validation_ale = float(resume["best_validation_ale"])
+        best_epoch = int(resume["best_epoch"])
+        stale = int(resume["stale"])
+        history = list(resume.get("history", []))
+        start_epoch = int(resume["epoch"]) + 1
+        elapsed_before = float(resume.get("training_seconds", 0.0))
+        training_complete = bool(resume.get("training_complete", False))
+        _restore_rng_state(resume.get("rng_state"), train_loader)
+        print(
+            f"Resuming Stage 2 after epoch {start_epoch - 1}; "
+            f"best epoch={best_epoch}, selection={best_score:.4f}",
+            flush=True,
+        )
     started = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        if training_complete:
+            break
         if args.lr_warmup_epochs > 0 and epoch <= args.lr_warmup_epochs:
             fraction = epoch / max(int(args.lr_warmup_epochs), 1)
             warmup_lr = float(args.lr) * (0.2 + 0.8 * fraction)
@@ -286,12 +408,17 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
             model, train_loader, optimizer, scaler, device, args, loss_weights
         )
         validation = collect_outputs(model, val_loader, device, args, normalizer, use_tta=args.tta_validation)
-        score = float(validation["errors"].mean())
+        score, overall_ale, core20_ale, hard3_ale = validation_selection_score(
+            validation, args
+        )
         if epoch >= args.scheduler_start_epoch:
             scheduler.step(score)
         row = {
             "epoch": epoch,
-            "validation_ale": score,
+            "validation_selection_score": score,
+            "validation_ale": overall_ale,
+            "validation_core20_ale": core20_ale,
+            "validation_hard3_ale": hard3_ale,
             "validation_median": float(np.median(validation["errors"])),
             "lr": optimizer.param_groups[0]["lr"],
             **{f"train_{name}": value for name, value in components.items()},
@@ -300,16 +427,21 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
         history.append(row)
         print(
             f"Epoch {epoch:04d}/{args.epochs} train={components['total']:.5f} "
-            f"val_ALE={score:.4f} val_median={row['validation_median']:.4f}",
+            f"val_ALE={overall_ale:.4f} core20={core20_ale:.4f} hard3={hard3_ale:.4f} "
+            f"selected={score:.4f}",
             flush=True,
         )
         if score < best_score - args.min_delta:
-            best_score, best_epoch, stale = score, epoch, 0
-            torch.save(
+            best_score, best_validation_ale, best_epoch, stale = score, overall_ale, epoch, 0
+            _atomic_torch_save(
                 {
                     "model_state": model.state_dict(),
                     "epoch": epoch,
-                    "validation_ale": score,
+                    "validation_ale": overall_ale,
+                    "validation_core20_ale": core20_ale,
+                    "validation_hard3_ale": hard3_ale,
+                    "validation_selection_score": score,
+                    "stage2_signature": getattr(args, "stage2_signature", None),
                     "args": vars(args),
                     "normalizer": normalizer,
                 },
@@ -320,9 +452,37 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
         else:
             stale = 0
         (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-        if epoch >= args.min_epochs and stale >= args.patience:
+        should_stop = epoch >= args.min_epochs and stale >= args.patience
+        training_complete = bool(should_stop or epoch >= args.epochs)
+        if (
+            epoch % max(int(args.checkpoint_every), 1) == 0
+            or training_complete
+            or epoch == best_epoch
+        ):
+            _atomic_torch_save(
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "epoch": epoch,
+                    "best_score": best_score,
+                    "best_validation_ale": best_validation_ale,
+                    "best_epoch": best_epoch,
+                    "stale": stale,
+                    "history": history,
+                    "training_seconds": elapsed_before + float(time.time() - started),
+                    "training_complete": training_complete,
+                    "stage2_signature": getattr(args, "stage2_signature", None),
+                    "rng_state": _rng_state(train_loader),
+                },
+                last_checkpoint_path,
+            )
+        if should_stop:
             print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}", flush=True)
             break
+    if not checkpoint_path.exists():
+        raise RuntimeError("Stage 2 did not produce a best checkpoint")
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
@@ -330,7 +490,10 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
     model.load_state_dict(checkpoint["model_state"])
     return {
         "best_epoch": best_epoch,
-        "best_validation_ale": best_score,
-        "training_seconds": float(time.time() - started),
+        "best_validation_ale": best_validation_ale,
+        "best_selection_score": best_score,
+        "selection_metric": args.checkpoint_metric,
+        "training_seconds": elapsed_before + float(time.time() - started),
         "checkpoint": str(checkpoint_path),
+        "resume_checkpoint": str(last_checkpoint_path),
     }

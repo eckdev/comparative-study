@@ -59,7 +59,7 @@ def command_for(preset, seed):
             "--coarse-source", "stage1_oof",
             "--train-center-mode", "external",
             "--alignment", "mesh_icp",
-            "--experiment", "E1",
+            "--experiment", "E9",
             "--max-samples", "24",
             "--icp-points", "128",
             "--icp-iterations", "2",
@@ -93,12 +93,17 @@ def command_for(preset, seed):
             "--max-stage1-oof-p95", "100",
             "--max-stage1-oof-val-gap", "100",
             "--max-stage2-val-ale", "100",
+            "--hard-landmark-weight", "4.0",
+            "--hard-rank-weight", "1.0",
+            "--gate-weight", "0.5",
+            "--checkpoint-metric", "balanced",
+            "--refinement-calibration", "group_scale",
             "--bootstrap-iters", "50",
             "--skip-oracle-gate",
             "--seed", str(seed),
         ]
     if preset == "a100":
-        return fixed_external(f"full_fixed_v4_seed{seed}", "FULL") + [
+        return fixed_external(f"full_fixed_v4_seed{seed}", "E8") + [
             "--amp-dtype", "bfloat16",
             "--roi-points", "512",
             "--width", "128",
@@ -107,10 +112,16 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    if preset in ("cv", "cv_repeated", "cv_preflight"):
+    if preset in ("cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv"):
         repeats = "3" if preset == "cv_repeated" else "1"
+        is_e9 = preset in ("e9_dev", "e9_cv")
         output_preset = "cv" if preset == "cv_preflight" else preset
-        command = common(f"publication_{output_preset}_stage1_v4_seed{seed}") + [
+        output_name = (
+            f"publication_e9_cv_seed{seed}"
+            if is_e9
+            else f"publication_{output_preset}_stage1_v4_seed{seed}"
+        )
+        command = common(output_name) + [
             "--protocol", "cv",
             "--folds", "5",
             "--cv-repeats", repeats,
@@ -124,7 +135,7 @@ def command_for(preset, seed):
             "--registration-restarts", "2",
             "--registration-trim-quantile", "0.8",
             "--registration-roi-expansion", "0.75",
-            "--experiment", "FULL",
+            "--experiment", "E9" if is_e9 else "E8",
             "--roi-points", "1024",
             "--roi-radius-scale", "1.5",
             "--roi-mode", "hybrid",
@@ -165,10 +176,25 @@ def command_for(preset, seed):
         ]
         if preset == "cv_preflight":
             command.append("--preflight-only")
+        if is_e9:
+            preprocessing_root = RUN_ROOT / f"publication_cv_stage1_v4_seed{seed}"
+            command.extend(
+                [
+                    "--preprocessing-root", str(preprocessing_root),
+                    "--hard-landmark-weight", "4.0",
+                    "--hard-rank-weight", "1.0",
+                    "--gate-weight", "0.5",
+                    "--checkpoint-metric", "balanced",
+                    "--checkpoint-hard3-weight", "0.35",
+                    "--refinement-calibration", "group_scale",
+                ]
+            )
+            if preset == "e9_dev":
+                command.extend(["--fold-indices", "1", "--validation-only"])
         return command
-    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 8:
+    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 9:
         experiment = preset.upper()
-        return fixed_external(f"ablation_{preset}_seed{seed}", experiment) + [
+        command = fixed_external(f"ablation_{preset}_seed{seed}", experiment) + [
             "--roi-points", "512",
             "--width", "128",
             "--global-blocks", "4",
@@ -176,18 +202,36 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    raise ValueError("Preset must be smoke, a100, cv_preflight, cv, cv_repeated, or e0..e8")
+        if preset == "e9":
+            command.extend(
+                [
+                    "--hard-landmark-weight", "4.0",
+                    "--hard-rank-weight", "1.0",
+                    "--gate-weight", "0.5",
+                    "--checkpoint-metric", "balanced",
+                    "--refinement-calibration", "group_scale",
+                ]
+            )
+        return command
+    raise ValueError(
+        "Preset must be smoke, a100, cv_preflight, cv, cv_repeated, "
+        "e9_dev, e9_cv, or e0..e9"
+    )
 
 
-def validate_paths(preset):
+def validate_paths(preset, seed):
     if preset == "e0":
         required = [INITIAL_RUN]
     else:
         required = [DATA_ROOT]
-    if preset not in ("cv", "cv_repeated", "cv_preflight", "smoke", "e0"):
+    if preset not in (
+        "cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv", "smoke", "e0"
+    ):
         required.extend([SPLITS_JSON, TRANSFORM_DIR, BASE_RUN, INITIAL_RUN])
     elif preset == "smoke":
         required.append(SPLITS_JSON)
+    if preset in ("e9_dev", "e9_cv"):
+        required.append(RUN_ROOT / f"publication_cv_stage1_v4_seed{seed}")
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise FileNotFoundError("Missing Colab paths:\n- " + "\n- ".join(missing))
@@ -198,7 +242,7 @@ def main():
     parser.add_argument("--preset", default="smoke")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    validate_paths(args.preset)
+    validate_paths(args.preset, args.seed)
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     command = command_for(args.preset.lower(), args.seed)
     environment = os.environ.copy()

@@ -99,6 +99,43 @@ Kontrol geçtikten sonra leakage-free 5-fold yayın koşusu:
 !python -u colab_run_all23_rgb_geodesic.py --preset cv --seed 42
 ```
 
+Mevcut E8 sonucunun detayli denetimi
+[`ENGINEERING_AUDIT_E8_TR.md`](ENGINEERING_AUDIT_E8_TR.md) dosyasindadir. Yeni E9
+candidate-ranker icin preflight ve Stage 1 tekrar calistirilmaz. Ilk olarak yalniz Fold 1,
+`publication_cv_stage1_v4_seed42` altindaki alignment, OOF Stage 1 ve ROI cache'leriyle
+calistirilir:
+
+```python
+%cd /content/comparative-study/all23_rgb_geodesic_cascade
+!python -u colab_run_all23_rgb_geodesic.py --preset e9_dev --seed 42
+```
+
+Fold 1 kabul kapisini otomatik hesaplayin:
+
+```python
+!python -u evaluate_e9_gate.py \
+  --baseline-root /content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/publication_cv_stage1_v4_seed42 \
+  --candidate-root /content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/publication_e9_cv_seed42 \
+  --fold 1
+```
+
+Fold 1 validation sonucu rapordaki kabul kapilarini gecerse ayni E9 tum foldlara acilir:
+
+```python
+!python -u colab_run_all23_rgb_geodesic.py --preset e9_cv --seed 42
+```
+
+Iki preset de `publication_e9_cv_seed42` klasorunu kullanir. `e9_dev` validation-only
+calisir ve test etiketlerini tuketmez. Tam kosu Fold 1'in tamamlanmis Stage 2 checkpointini
+yukler, validation kalibrasyonunu kilitler ve yalniz final test degerlendirmesini yapar;
+Fold 1 yeniden egitilmez.
+
+Her iki komut da kesintiden sonra aynen yeniden calistirilabilir. Tamamlanan foldlar konfigürasyon
+imzasi dogrulandiktan sonra atlanir; yarim kalan fold `last_model.pth` icindeki model, optimizer,
+scheduler, AMP scaler ve RNG durumundan devam eder. Hiperparametre degistirildiyse yeni bir output
+klasoru kullanin. Bilerek bastan baslatmak icin dogrudan ana scripte
+`--force-stage2-retrain` verilebilir.
+
 Pipeline kilitlendikten sonraki tekrarlı 5-fold nihai koşu:
 
 ```python
@@ -156,7 +193,9 @@ overflow denetimi kullanır.
 - `E5`: anatomik graph/simetri loss.
 - `E6`: texture/contour/generic specialized heads.
 - `E7`: MSE-over-mesh ve validation/test TTA.
-- `E8/FULL`: confidence-aware coarse/refined gate ve Hard3 bağlam modülleri.
+- `E8`: confidence-aware coarse/refined gate ve ilk Hard3 bağlam modülleri.
+- `E9/FULL`: anatomik anchor kosullu Hard3 surface-candidate ranker, Hard3'e ozel gate,
+  candidate CE loss, dengeli checkpoint secimi ve validation-only grup alpha kalibrasyonu.
 
 Üç seed ensemble, E8 model seçimi tamamlandıktan sonra ayrı `ensemble_runs.py` komutuyla uygulanır.
 
@@ -177,11 +216,14 @@ Her fold/run aşağıdakileri üretir:
 
 ```text
 best_model.pth
+last_model.pth
 history.json
 normalization.json
 alignment/alignment_report.json
 alignment/train_multimesh_atlas.npz
 split_and_leakage_report.json
+preprocessing_source.json
+refinement_calibration.json
 candidate_oracle_samples_pretrain.csv
 stage1_global_coarse/complete.json
 stage1_global_coarse/metrics_train_val.json

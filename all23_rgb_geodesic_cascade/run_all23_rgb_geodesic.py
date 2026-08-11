@@ -29,7 +29,10 @@ if __package__ in (None, ""):
     from all23_rgb_geodesic_cascade.metrics import calibrate_confidence, save_evaluation, write_csv
     from all23_rgb_geodesic_cascade.model import All23RGBGeodesicCascade
     from all23_rgb_geodesic_cascade.stage1 import generate_oof_stage1_predictions
-    from all23_rgb_geodesic_cascade.train import collect_outputs, fit_model
+    from all23_rgb_geodesic_cascade.train import (
+        apply_refinement_calibration, collect_outputs, fit_model,
+        fit_refinement_calibration,
+    )
 else:
     from .alignment import build_label_free_alignment
     from .anatomy import ANATOMICAL_EDGES, CORE20, HARD3, LANDMARK_NAMES, MIDLINE, SYMMETRY_PAIRS
@@ -43,7 +46,10 @@ else:
     from .metrics import calibrate_confidence, save_evaluation, write_csv
     from .model import All23RGBGeodesicCascade
     from .stage1 import generate_oof_stage1_predictions
-    from .train import collect_outputs, fit_model
+    from .train import (
+        apply_refinement_calibration, collect_outputs, fit_model,
+        fit_refinement_calibration,
+    )
 
 
 def set_seed(seed):
@@ -131,17 +137,18 @@ def validate_external_cv_provenance(splits, manifest):
 
 def experiment_settings(args):
     level = args.experiment.upper()
-    order = {f"E{index}": index for index in range(1, 9)}
+    order = {f"E{index}": index for index in range(1, 10)}
     if level == "FULL":
-        level = "E8"
+        level = "E9"
     if level not in order:
-        raise ValueError("--experiment must be E1..E8 or FULL")
+        raise ValueError("--experiment must be E1..E9 or FULL")
     stage = order[level]
     args.use_rgb = stage >= 2
     args.use_local_refiner = stage >= 4
     args.use_anatomical_attention = stage >= 5
     args.use_specialized_heads = stage >= 6
     args.use_refinement_gate = stage >= 8
+    args.use_hard_candidate_ranker = stage >= 9
     if stage < 3:
         args.global_blocks = 1
     if stage < 5:
@@ -151,6 +158,17 @@ def experiment_settings(args):
         args.coordinate_mode = "mse_over_mesh"
         args.tta = True
         args.tta_validation = True
+    if stage >= 9:
+        if args.hard_landmark_weight == 1.5:
+            args.hard_landmark_weight = 4.0
+        if args.hard_rank_weight == 0.0:
+            args.hard_rank_weight = 1.0
+        if args.gate_weight == 0.10:
+            args.gate_weight = 0.5
+        if args.checkpoint_metric == "overall":
+            args.checkpoint_metric = "balanced"
+        if args.refinement_calibration == "none":
+            args.refinement_calibration = "group_scale"
     return stage
 
 
@@ -210,7 +228,19 @@ def label_free_registration_roi_scales(alignment_report, train_ids, max_expansio
     }
 
 
-def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=True):
+def prepare_fold(
+    samples,
+    splits,
+    args,
+    fold_dir,
+    device,
+    enforce_oracle_gate=True,
+    preprocessing_dir=None,
+):
+    fold_dir = Path(fold_dir)
+    artifact_dir = Path(preprocessing_dir) if preprocessing_dir else fold_dir
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     assert_disjoint_splits(splits)
     by_id = {sample.sample_id: sample for sample in samples}
     selected_ids = list(dict.fromkeys(splits["train"] + splits["val"] + splits["test"]))
@@ -219,7 +249,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
     if missing:
         raise ValueError(f"Split references missing dataset samples: {sorted(missing)[:5]}")
 
-    alignment_dir = fold_dir / "alignment"
+    alignment_dir = artifact_dir / "alignment"
     if args.alignment == "mesh_icp":
         transforms, alignment_report = build_label_free_alignment(
             selected_samples,
@@ -261,7 +291,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         records[sample.sample_id] = prepare_mesh_record(
             sample,
             transforms[sample.sample_id],
-            fold_dir / "mesh_cache",
+            artifact_dir / "mesh_cache",
             args.max_vertices,
             include_landmarks=sample.sample_id not in set(splits["test"]),
         )
@@ -269,7 +299,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         selected_samples,
         records,
         splits["train"],
-        fold_dir / "normalization.json",
+        artifact_dir / "normalization.json",
         seed=args.seed,
     )
 
@@ -278,7 +308,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         with np.load(records[sample_id]) as record:
             train_landmarks.append(record["landmarks"].copy())
     train_template = np.mean(np.stack(train_landmarks), axis=0).astype(np.float32)
-    np.save(fold_dir / "train_template_landmarks.npy", train_template)
+    np.save(artifact_dir / "train_template_landmarks.npy", train_template)
     coarse_target = {}
     coarse_sources = {"mode": args.coarse_source}
     if args.coarse_source == "stage1_oof":
@@ -288,7 +318,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
             records,
             transforms,
             normalizer,
-            fold_dir,
+            artifact_dir,
             device,
             args,
         )
@@ -350,7 +380,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
             records[sample.sample_id],
             coarse_target[sample.sample_id],
             args.roi_points,
-            fold_dir / "cache" / "roi",
+            artifact_dir / "cache" / "roi",
             sample.sample_id,
             args.seed,
             radius_scale=(
@@ -403,10 +433,12 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
             ) if values.size else None,
         }
     write_csv(
-        fold_dir / "candidate_oracle_samples_pretrain.csv",
+        artifact_dir / "candidate_oracle_samples_pretrain.csv",
         oracle_samples["train"] + oracle_samples["val"],
     )
-    (fold_dir / "candidate_oracle_pretrain.json").write_text(json.dumps(oracle_report, indent=2), encoding="utf-8")
+    (artifact_dir / "candidate_oracle_pretrain.json").write_text(
+        json.dumps(oracle_report, indent=2), encoding="utf-8"
+    )
     val_oracle = oracle_report["val"]["ale"]
     val_hard3_oracle = oracle_report["val"]["hard3_ale"]
     gate = oracle_gate_status(oracle_report["val"], args)
@@ -429,7 +461,7 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         "coarse_predictions": coarse_target,
         "legacy_transform_dir": None,
         "normalizer": normalizer,
-        "cache_dir": fold_dir / "cache",
+        "cache_dir": artifact_dir / "cache",
         "roi_points": args.roi_points,
         "roi_radius_scale": args.roi_radius_scale,
         "roi_mode": args.roi_mode,
@@ -470,6 +502,28 @@ def prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=Tr
         },
     }
     (fold_dir / "split_and_leakage_report.json").write_text(json.dumps(split_report, indent=2), encoding="utf-8")
+    if artifact_dir != fold_dir:
+        (fold_dir / "preprocessing_source.json").write_text(
+            json.dumps(
+                {
+                    "source": str(artifact_dir),
+                    "reused_stage1_alignment_and_roi": True,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        (fold_dir / "normalization.json").write_text(
+            json.dumps(normalizer, indent=2), encoding="utf-8"
+        )
+        (fold_dir / "candidate_oracle_pretrain.json").write_text(
+            json.dumps(oracle_report, indent=2), encoding="utf-8"
+        )
+        output_alignment = fold_dir / "alignment"
+        output_alignment.mkdir(parents=True, exist_ok=True)
+        (output_alignment / "alignment_report.json").write_text(
+            json.dumps(alignment_report, indent=2), encoding="utf-8"
+        )
     return datasets, normalizer
 
 
@@ -495,9 +549,101 @@ def fold_output_dir(output_dir, args, repeat, fold_index):
     return output_dir / f"repeat_{repeat}" / f"fold_{fold_index}"
 
 
-def run_fold(samples, splits, args, fold_dir, device):
+def stage2_signature(args, splits):
+    keys = (
+        "experiment", "seed", "width", "global_blocks", "heads", "dropout",
+        "coordinate_mode", "coordinate_topk", "coordinate_temperature",
+        "hard_coordinate_topk", "hard_coordinate_temperature", "roi_points",
+        "roi_radius_scale", "roi_mode", "roi_euclidean_scale", "roi_multi_seeds",
+        "use_rgb", "use_local_refiner", "use_anatomical_attention",
+        "use_specialized_heads", "use_refinement_gate", "use_hard_candidate_ranker",
+        "rotation_degrees", "center_jitter_mm", "point_noise_mm", "rgb_noise",
+        "point_dropout", "heatmap_weight", "region_weight", "coordinate_weight",
+        "coarse_weight", "anatomy_weight", "symmetry_weight", "uncertainty_weight",
+        "clinical_weight", "gate_weight", "hard_landmark_weight", "hard_rank_weight",
+        "checkpoint_metric", "checkpoint_hard3_weight", "refinement_calibration",
+        "epochs", "lr", "weight_decay",
+        "batch_size", "min_epochs", "patience", "scheduler_start_epoch",
+        "lr_warmup_epochs", "coarse_source", "train_center_mode", "alignment",
+    )
+    payload = {
+        "args": {key: getattr(args, key) for key in keys},
+        "splits": {name: list(values) for name, values in splits.items()},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_completed_fold(fold_dir, args, splits):
+    if not args.resume_stage2 or args.force_stage2_retrain:
+        return None
+    summary_path = Path(fold_dir) / "run_summary.json"
+    required = (
+        Path(fold_dir) / "metrics_val.json",
+        Path(fold_dir) / "metrics_test.json",
+        Path(fold_dir) / "predictions_test.csv",
+    )
+    if not summary_path.exists() or not all(path.exists() for path in required):
+        return None
+    result = json.loads(summary_path.read_text(encoding="utf-8"))
+    expected = stage2_signature(args, splits)
+    if result.get("stage2_signature") != expected:
+        return None
+    print(f"Completed Stage 2 fold cached: {fold_dir}", flush=True)
+    return result
+
+
+def validate_preprocessing_root(root, args):
+    root = Path(root)
+    config_path = root / "experiment_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"--preprocessing-root has no experiment_config.json: {root}"
+        )
+    cached = json.loads(config_path.read_text(encoding="utf-8"))
+    keys = (
+        "protocol", "folds", "cv_repeats", "val_fraction", "seed",
+        "coarse_source", "train_center_mode", "alignment", "icp_points",
+        "icp_iterations", "atlas_size", "atlas_iterations",
+        "registration_candidates", "registration_restarts",
+        "registration_trim_quantile", "registration_roi_expansion",
+        "max_vertices", "roi_points", "roi_radius_scale", "roi_mode",
+        "roi_euclidean_scale", "roi_multi_seeds", "stage1_oof_folds",
+        "stage1_oof_mode", "stage1_oof_fixed_epochs",
+        "stage1_oof_template_alpha", "stage1_inner_val_fraction",
+        "stage1_width", "stage1_blocks", "heads", "dropout",
+        "stage1_topk", "stage1_temperature", "stage1_epochs",
+        "stage1_min_epochs", "stage1_patience", "stage1_scheduler_patience",
+        "stage1_scheduler_start_epoch", "stage1_lr_warmup_epochs", "stage1_lr",
+        "stage1_batch_size", "weight_decay", "grad_clip", "min_delta",
+        "stage1_rotation_degrees", "point_noise_mm", "rgb_noise", "point_dropout",
+        "use_rgb", "mixed_precision", "amp_dtype",
+    )
+    mismatches = []
+    for key in keys:
+        current = getattr(args, key)
+        previous = cached.get(key)
+        if previous != current:
+            mismatches.append(f"{key}: cached={previous!r}, current={current!r}")
+    if mismatches:
+        raise RuntimeError(
+            "Preprocessing cache is incompatible with the current run:\n- "
+            + "\n- ".join(mismatches)
+        )
+    return root
+
+
+def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     fold_dir.mkdir(parents=True, exist_ok=True)
-    datasets, normalizer = prepare_fold(samples, splits, args, fold_dir, device)
+    args.stage2_signature = stage2_signature(args, splits)
+    datasets, normalizer = prepare_fold(
+        samples,
+        splits,
+        args,
+        fold_dir,
+        device,
+        preprocessing_dir=preprocessing_dir,
+    )
     loaders = {
         "train": make_loader(datasets["train"], args.batch_size, True, args),
         "val": make_loader(datasets["val"], args.eval_batch_size, False, args),
@@ -515,6 +661,9 @@ def run_fold(samples, splits, args, fold_dir, device):
         use_specialized_heads=args.use_specialized_heads,
         use_local_refiner=args.use_local_refiner,
         use_refinement_gate=args.use_refinement_gate,
+        use_hard_candidate_ranker=args.use_hard_candidate_ranker,
+        hard_coordinate_topk=args.hard_coordinate_topk,
+        hard_coordinate_temperature=args.hard_coordinate_temperature,
         roi_radius_scale=args.roi_radius_scale,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -530,6 +679,7 @@ def run_fold(samples, splits, args, fold_dir, device):
         clinical=args.clinical_weight,
         gate=args.gate_weight,
         hard_landmark=args.hard_landmark_weight,
+        hard_rank=args.hard_rank_weight,
     )
     training = fit_model(model, loaders["train"], loaders["val"], device, args, loss_weights, normalizer, fold_dir)
     if training["best_validation_ale"] > args.max_stage2_val_ale:
@@ -538,10 +688,34 @@ def run_fold(samples, splits, args, fold_dir, device):
             f"--max-stage2-val-ale={args.max_stage2_val_ale:.4f}. Test labels remain sealed."
         )
     validation = collect_outputs(model, loaders["val"], device, args, normalizer, use_tta=args.tta)
+    refinement_calibration = fit_refinement_calibration(
+        validation, args.refinement_calibration
+    )
+    validation = apply_refinement_calibration(validation, refinement_calibration)
+    (fold_dir / "refinement_calibration.json").write_text(
+        json.dumps(refinement_calibration, indent=2), encoding="utf-8"
+    )
     calibration = calibrate_confidence(validation["log_var"], validation["errors"])
     validation_metrics = save_evaluation(
         fold_dir, "val", validation, calibration, args.bootstrap_iters, args.seed
     )
+    if args.validation_only:
+        result = {
+            "stage2_signature": args.stage2_signature,
+            "refinement_calibration": refinement_calibration,
+            "training": training,
+            "parameter_count": parameter_count,
+            "validation": validation_metrics,
+            "test": None,
+        }
+        (fold_dir / "validation_only_summary.json").write_text(
+            json.dumps(result, indent=2), encoding="utf-8"
+        )
+        print("\nValidation-only evaluation; test labels remain sealed", flush=True)
+        print(f"All-23 validation ALE: {validation_metrics['overall']['ale']:.4f}", flush=True)
+        print(f"Core20 validation ALE: {validation_metrics['core20']['ale']:.4f}", flush=True)
+        print(f"Hard3 validation ALE: {validation_metrics['hard3']['ale']:.4f}", flush=True)
+        return result
     # Test labels are consumed only after checkpoint and confidence calibration are locked on validation.
     print("Checkpoint locked. Preparing test ROIs and consuming test labels for final evaluation...", flush=True)
     for index in tqdm(range(len(datasets["test"])), desc="test ROI", disable=args.no_tqdm):
@@ -549,8 +723,11 @@ def run_fold(samples, splits, args, fold_dir, device):
         if args.no_tqdm and ((index + 1) % 10 == 0 or index + 1 == len(datasets["test"])):
             print(f"Test ROI {index + 1}/{len(datasets['test'])}", flush=True)
     test = collect_outputs(model, loaders["test"], device, args, normalizer, use_tta=args.tta)
+    test = apply_refinement_calibration(test, refinement_calibration)
     test_metrics = save_evaluation(fold_dir, "test", test, calibration, args.bootstrap_iters, args.seed)
     result = {
+        "stage2_signature": args.stage2_signature,
+        "refinement_calibration": refinement_calibration,
         "training": training,
         "parameter_count": parameter_count,
         "validation": validation_metrics,
@@ -573,6 +750,16 @@ def build_parser():
     parser.add_argument("--protocol", choices=("fixed", "cv"), default="fixed")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--cv-repeats", type=int, default=1)
+    parser.add_argument(
+        "--fold-indices",
+        default=None,
+        help="Comma-separated outer fold numbers to run, for example 1 or 1,2",
+    )
+    parser.add_argument(
+        "--preprocessing-root",
+        default=None,
+        help="Compatible prior run whose alignment, Stage 1 and ROI caches are reused",
+    )
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument(
         "--coarse-source",
@@ -630,6 +817,8 @@ def build_parser():
     parser.add_argument("--coordinate-mode", choices=("topk", "mse_over_mesh"), default="topk")
     parser.add_argument("--coordinate-topk", type=int, default=30)
     parser.add_argument("--coordinate-temperature", type=float, default=0.75)
+    parser.add_argument("--hard-coordinate-topk", type=int, default=8)
+    parser.add_argument("--hard-coordinate-temperature", type=float, default=0.35)
     parser.add_argument("--rotation-degrees", type=float, default=10.0)
     parser.add_argument("--center-jitter-mm", type=float, default=0.5)
     parser.add_argument("--point-noise-mm", type=float, default=0.1)
@@ -647,6 +836,20 @@ def build_parser():
     parser.add_argument("--gate-weight", type=float, default=0.10)
     parser.add_argument("--gate-warmup-epochs", type=int, default=30)
     parser.add_argument("--hard-landmark-weight", type=float, default=1.5)
+    parser.add_argument("--hard-rank-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--checkpoint-metric", choices=("overall", "balanced"), default="overall"
+    )
+    parser.add_argument("--checkpoint-hard3-weight", type=float, default=0.35)
+    parser.add_argument(
+        "--refinement-calibration",
+        choices=("none", "group_scale"),
+        default="none",
+    )
+    parser.add_argument("--checkpoint-every", type=int, default=1)
+    parser.add_argument("--no-resume-stage2", dest="resume_stage2", action="store_false")
+    parser.add_argument("--force-stage2-retrain", action="store_true")
+    parser.set_defaults(resume_stage2=True)
     parser.add_argument("--experiment", default="FULL")
     parser.add_argument("--tta", action="store_true")
     parser.add_argument("--tta-validation", action="store_true")
@@ -689,6 +892,7 @@ def build_parser():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--no-memory-cache", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--validation-only", action="store_true")
     parser.add_argument("--bootstrap-iters", type=int, default=2000)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -704,6 +908,11 @@ def main():
     resolve_precision(args, device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    preprocessing_root = (
+        validate_preprocessing_root(args.preprocessing_root, args)
+        if args.preprocessing_root
+        else None
+    )
     samples = discover_samples(args.data_root)
     print(f"Device: {device}; samples={len(samples)}; experiment=E{stage}", flush=True)
     print(
@@ -736,15 +945,42 @@ def main():
             for _, _, split in fold_specs:
                 validate_external_cv_provenance(split, manifest)
 
+    if args.fold_indices:
+        requested_folds = {
+            int(value.strip())
+            for value in str(args.fold_indices).split(",")
+            if value.strip()
+        }
+        available_folds = {fold_index for _, fold_index, _ in fold_specs}
+        unknown = requested_folds - available_folds
+        if unknown:
+            raise ValueError(f"Unknown --fold-indices: {sorted(unknown)}")
+        fold_specs = [
+            spec for spec in fold_specs if spec[1] in requested_folds
+        ]
+
     summaries = []
     started = time.time()
     if args.preflight_only:
         reports = []
         for run_index, (repeat, fold_index, splits) in enumerate(fold_specs, start=1):
             fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
+            preprocessing_dir = (
+                fold_output_dir(preprocessing_root, args, repeat, fold_index)
+                if preprocessing_root
+                else None
+            )
             fold_dir.mkdir(parents=True, exist_ok=True)
             print(f"\nPreflight {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index}", flush=True)
-            prepare_fold(samples, splits, args, fold_dir, device, enforce_oracle_gate=False)
+            prepare_fold(
+                samples,
+                splits,
+                args,
+                fold_dir,
+                device,
+                enforce_oracle_gate=False,
+                preprocessing_dir=preprocessing_dir,
+            )
             oracle = json.loads((fold_dir / "candidate_oracle_pretrain.json").read_text(encoding="utf-8"))
             alignment = json.loads(
                 (fold_dir / "alignment" / "alignment_report.json").read_text(
@@ -754,8 +990,9 @@ def main():
             adaptive_roi = alignment.get("adaptive_roi", {})
             stage1_metrics = None
             if args.coarse_source == "stage1_oof":
+                stage1_dir = preprocessing_dir if preprocessing_dir else fold_dir
                 stage1_metrics = json.loads(
-                    (fold_dir / "stage1_global_coarse" / "metrics_train_val.json").read_text(
+                    (stage1_dir / "stage1_global_coarse" / "metrics_train_val.json").read_text(
                         encoding="utf-8"
                     )
                 )
@@ -835,25 +1072,61 @@ def main():
         return
     for run_index, (repeat, fold_index, splits) in enumerate(fold_specs, start=1):
         fold_dir = fold_output_dir(output_dir, args, repeat, fold_index)
+        preprocessing_dir = (
+            fold_output_dir(preprocessing_root, args, repeat, fold_index)
+            if preprocessing_root
+            else None
+        )
         print(
             f"\nRun {run_index}/{len(fold_specs)} repeat={repeat} fold={fold_index} train/val/test="
             f"{len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}",
             flush=True,
         )
-        result = run_fold(samples, splits, args, fold_dir, device)
+        result = load_completed_fold(fold_dir, args, splits)
+        if result is None:
+            result = run_fold(
+                samples,
+                splits,
+                args,
+                fold_dir,
+                device,
+                preprocessing_dir=preprocessing_dir,
+            )
+        metric_scope = result["validation"] if args.validation_only else result["test"]
         summaries.append(
             {
                 "fold": fold_index,
                 "repeat": repeat,
-                "ale": result["test"]["overall"]["ale"],
-                "median": result["test"]["overall"]["median"],
-                "std": result["test"]["overall"]["std"],
-                "core20_ale": result["test"]["core20"]["ale"],
-                "hard3_ale": result["test"]["hard3"]["ale"],
+                "ale": metric_scope["overall"]["ale"],
+                "median": metric_scope["overall"]["median"],
+                "std": metric_scope["overall"]["std"],
+                "core20_ale": metric_scope["core20"]["ale"],
+                "hard3_ale": metric_scope["hard3"]["ale"],
                 "training_seconds": result["training"]["training_seconds"],
                 "parameter_count": result["parameter_count"],
             }
         )
+    if args.validation_only:
+        write_csv(output_dir / "summary_validation_metrics.csv", summaries)
+        validation_summary = {
+            "protocol": args.protocol,
+            "validation_only": True,
+            "folds": summaries,
+            "validation_ale_mean": float(np.mean([row["ale"] for row in summaries])),
+            "validation_ale_std": float(np.std([row["ale"] for row in summaries])),
+            "total_seconds": float(time.time() - started),
+            "test_labels_consumed": False,
+        }
+        (output_dir / "summary_validation_metrics.json").write_text(
+            json.dumps(validation_summary, indent=2), encoding="utf-8"
+        )
+        print(
+            f"\nValidation ALE: {validation_summary['validation_ale_mean']:.4f} +/- "
+            f"{validation_summary['validation_ale_std']:.4f}",
+            flush=True,
+        )
+        print("Test labels were not consumed.", flush=True)
+        return
     write_csv(output_dir / "summary_fold_metrics.csv", summaries)
     aggregate = {
         "protocol": args.protocol,

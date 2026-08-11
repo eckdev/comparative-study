@@ -18,6 +18,7 @@ class LossWeights:
     clinical: float = 0.05
     gate: float = 0.10
     hard_landmark: float = 1.5
+    hard_rank: float = 0.0
 
 
 def landmark_loss_weights(reference, hard_weight=1.0):
@@ -116,6 +117,27 @@ def coarse_nearest_loss(coarse_logits, batch, expert):
     return torch.stack(losses).mean()
 
 
+def hard_candidate_ranking_loss(logits, candidates, mask, expert):
+    """Classify the expert-nearest surface candidate for LM0/21/22."""
+    if logits is None:
+        return expert.new_zeros(())
+    hard_expert = expert[:, HARD3].float()
+    hard_candidates = candidates[:, HARD3].float()
+    hard_mask = mask[:, HARD3]
+    distances = torch.linalg.norm(
+        hard_candidates - hard_expert[:, :, None, :], dim=-1
+    ).masked_fill(~hard_mask, torch.inf)
+    nearest = torch.argmin(distances, dim=-1)
+    masked_logits = logits.float().masked_fill(~hard_mask, -torch.inf)
+    loss = F.cross_entropy(
+        masked_logits.reshape(-1, masked_logits.shape[-1]),
+        nearest.reshape(-1),
+    )
+    return loss / torch.log(
+        loss.new_tensor(max(masked_logits.shape[-1], 2), dtype=torch.float32)
+    )
+
+
 def compute_loss(outputs, batch, weights, positive_weight=20.0):
     expert = batch["expert"].float()
     prediction = outputs["final_coordinates"].float()
@@ -173,7 +195,29 @@ def compute_loss(outputs, batch, weights, positive_weight=20.0):
         )
         valid = denominator > 1e-4
         gate_error = torch.where(valid, gate_error, torch.zeros_like(gate_error))
-        gate = weighted_landmark_mean(gate_error, landmark_weights)
+        optimal_coordinate = external_coarse + optimal_alpha[..., None] * direction
+        gated_coordinate = external_coarse + outputs["refinement_alpha"].float()[
+            ..., None
+        ] * direction
+        gate_coordinate_error = F.smooth_l1_loss(
+            gated_coordinate,
+            optimal_coordinate,
+            beta=1.0,
+            reduction="none",
+        ).mean(dim=-1)
+        coarse_error = torch.linalg.norm(external_coarse - expert, dim=-1)
+        gated_error = torch.linalg.norm(gated_coordinate - expert, dim=-1)
+        gate_regret = torch.relu(gated_error - coarse_error)
+        gate = weighted_landmark_mean(
+            gate_error + 0.25 * gate_coordinate_error + 0.25 * gate_regret,
+            landmark_weights,
+        )
+    hard_rank = hard_candidate_ranking_loss(
+        outputs.get("hard_rank_logits"),
+        outputs["candidate_points"],
+        batch["roi_mask"],
+        expert,
+    )
     total = (
         weights.heatmap * heatmap
         + weights.region * region
@@ -184,6 +228,7 @@ def compute_loss(outputs, batch, weights, positive_weight=20.0):
         + weights.uncertainty * uncertainty
         + weights.clinical * clinical
         + weights.gate * gate
+        + weights.hard_rank * hard_rank
     )
     components = {
         "total": total,
@@ -196,5 +241,6 @@ def compute_loss(outputs, batch, weights, positive_weight=20.0):
         "uncertainty": uncertainty,
         "clinical": clinical,
         "gate": gate,
+        "hard_rank": hard_rank,
     }
     return total, euclidean, components
