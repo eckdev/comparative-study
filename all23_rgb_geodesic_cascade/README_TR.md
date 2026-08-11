@@ -130,6 +130,34 @@ calisir ve test etiketlerini tuketmez. Tam kosu Fold 1'in tamamlanmis Stage 2 ch
 yukler, validation kalibrasyonunu kilitler ve yalniz final test degerlendirmesini yapar;
 Fold 1 yeniden egitilmez.
 
+E10, pahali Stage 1/registration/ROI cache'lerini yine `publication_cv_stage1_v4_seed42`
+klasorunden kullanir. Once iki epochluk mimari ve iki-fazli egitim smoke testi yapilir:
+
+```python
+%cd /content/comparative-study/all23_rgb_geodesic_cascade
+!python -u colab_run_all23_rgb_geodesic.py --preset e10_smoke --seed 42
+```
+
+Ardindan test etiketlerini acmadan yalniz Fold 1 validation deneyi calistirilir:
+
+```python
+!python -u colab_run_all23_rgb_geodesic.py --preset e10_dev --seed 42
+```
+
+E10'un Fold 1 validation sonucu E9'a gore anlamli kazanc saglarsa bes fold acilir:
+
+```python
+!python -u colab_run_all23_rgb_geodesic.py --preset e10_cv --seed 42
+```
+
+E10'da LM0, RGB ve lokal texture-gradient ozelliklerini kullanan bagimsiz bir candidate
+ranker ile cozulur. LM21/22, contralateral coarse anchor kullanmadan refine edilmis LM10-12
+alt-orta-hat noktalarina gore ortak bilateral candidate-pair ranker ile puanlanir. Candidate
+hedefi tek en yakin vertex degil, uzmana geodezik/Euclidean yakinliga gore yumusayan listwise
+dagilimdir; yuksek puanli uzak adaylar hard-negative olarak ek cezalandirilir. Refiner fazinda
+gate parametreleri donuktur. En iyi refiner checkpointi kilitlendikten sonra yalniz sample-specific
+gate acilir ve ayri checkpoint/early stopping ile egitilir.
+
 Her iki komut da kesintiden sonra aynen yeniden calistirilabilir. Tamamlanan foldlar konfigürasyon
 imzasi dogrulandiktan sonra atlanir; yarim kalan fold `last_model.pth` icindeki model, optimizer,
 scheduler, AMP scaler ve RNG durumundan devam eder. Hiperparametre degistirildiyse yeni bir output
@@ -185,6 +213,8 @@ overflow denetimi kullanır.
 !python -u colab_run_all23_rgb_geodesic.py --preset e6
 !python -u colab_run_all23_rgb_geodesic.py --preset e7
 !python -u colab_run_all23_rgb_geodesic.py --preset e8
+!python -u colab_run_all23_rgb_geodesic.py --preset e9
+!python -u colab_run_all23_rgb_geodesic.py --preset e10
 ```
 
 - `E1`: düzeltilmiş anatomi/veri hattı, geometry-only.
@@ -196,6 +226,10 @@ overflow denetimi kullanır.
 - `E8`: confidence-aware coarse/refined gate ve ilk Hard3 bağlam modülleri.
 - `E9/FULL`: anatomik anchor kosullu Hard3 surface-candidate ranker, Hard3'e ozel gate,
   candidate CE loss, dengeli checkpoint secimi ve validation-only grup alpha kalibrasyonu.
+- `E10`: bagimsiz LM0 RGB/texture-gradient ranker, refine LM10-12 kosullu ortak bilateral
+  LM21/22 pair ranker, soft-listwise distance loss, hard-negative mining ve refiner sonrasi
+  ayri sample-specific gate egitimi. Geriye donuk yeniden uretilebilirlik icin `FULL`, `E9`
+  ile ayni kalir; E10 acikca `--experiment E10` ile secilir.
 
 Üç seed ensemble, E8 model seçimi tamamlandıktan sonra ayrı `ensemble_runs.py` komutuyla uygulanır.
 
@@ -218,6 +252,9 @@ Her fold/run aşağıdakileri üretir:
 best_model.pth
 last_model.pth
 history.json
+best_gate.pth                 # E10
+gate_history.json             # E10
+gate_training.json            # E10
 normalization.json
 alignment/alignment_report.json
 alignment/train_multimesh_atlas.npz

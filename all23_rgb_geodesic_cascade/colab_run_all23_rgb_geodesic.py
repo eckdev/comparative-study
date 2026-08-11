@@ -52,14 +52,14 @@ def command_for(preset, seed):
             "--prefix", "stacked",
             "--seed", str(seed),
         ]
-    if preset == "smoke":
-        return common("smoke") + [
+    if preset in ("smoke", "e10_smoke"):
+        command = common("e10_smoke" if preset == "e10_smoke" else "smoke") + [
             "--protocol", "fixed",
             "--splits-json", str(SPLITS_JSON),
             "--coarse-source", "stage1_oof",
             "--train-center-mode", "external",
             "--alignment", "mesh_icp",
-            "--experiment", "E9",
+            "--experiment", "E10" if preset == "e10_smoke" else "E9",
             "--max-samples", "24",
             "--icp-points", "128",
             "--icp-iterations", "2",
@@ -102,6 +102,18 @@ def command_for(preset, seed):
             "--skip-oracle-gate",
             "--seed", str(seed),
         ]
+        if preset == "e10_smoke":
+            command.extend(
+                [
+                    "--gonion-pair-topk", "8",
+                    "--hard-rank-mode", "soft_listwise",
+                    "--gate-stage-epochs", "2",
+                    "--gate-stage-min-epochs", "1",
+                    "--gate-stage-patience", "1",
+                    "--refinement-calibration", "none",
+                ]
+            )
+        return command
     if preset == "a100":
         return fixed_external(f"full_fixed_v4_seed{seed}", "E8") + [
             "--amp-dtype", "bfloat16",
@@ -112,13 +124,17 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-    if preset in ("cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv"):
+    if preset in (
+        "cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv", "e10_dev", "e10_cv"
+    ):
         repeats = "3" if preset == "cv_repeated" else "1"
         is_e9 = preset in ("e9_dev", "e9_cv")
+        is_e10 = preset in ("e10_dev", "e10_cv")
+        is_hard_experiment = is_e9 or is_e10
         output_preset = "cv" if preset == "cv_preflight" else preset
         output_name = (
-            f"publication_e9_cv_seed{seed}"
-            if is_e9
+            f"publication_{'e10' if is_e10 else 'e9'}_cv_seed{seed}"
+            if is_hard_experiment
             else f"publication_{output_preset}_stage1_v4_seed{seed}"
         )
         command = common(output_name) + [
@@ -135,7 +151,7 @@ def command_for(preset, seed):
             "--registration-restarts", "2",
             "--registration-trim-quantile", "0.8",
             "--registration-roi-expansion", "0.75",
-            "--experiment", "E9" if is_e9 else "E8",
+            "--experiment", "E10" if is_e10 else ("E9" if is_e9 else "E8"),
             "--roi-points", "1024",
             "--roi-radius-scale", "1.5",
             "--roi-mode", "hybrid",
@@ -176,7 +192,7 @@ def command_for(preset, seed):
         ]
         if preset == "cv_preflight":
             command.append("--preflight-only")
-        if is_e9:
+        if is_hard_experiment:
             preprocessing_root = RUN_ROOT / f"publication_cv_stage1_v4_seed{seed}"
             command.extend(
                 [
@@ -186,13 +202,29 @@ def command_for(preset, seed):
                     "--gate-weight", "0.5",
                     "--checkpoint-metric", "balanced",
                     "--checkpoint-hard3-weight", "0.35",
-                    "--refinement-calibration", "group_scale",
+                    "--refinement-calibration", "none" if is_e10 else "group_scale",
                 ]
             )
-            if preset == "e9_dev":
+            if is_e10:
+                command.extend(
+                    [
+                        "--gonion-pair-topk", "32",
+                        "--hard-rank-mode", "soft_listwise",
+                        "--hard-rank-sigma-lm0", "3.0",
+                        "--hard-rank-sigma-gonion", "4.0",
+                        "--hard-negative-count", "16",
+                        "--hard-negative-margin", "0.5",
+                        "--hard-negative-weight", "0.25",
+                        "--gate-stage-epochs", "40",
+                        "--gate-stage-min-epochs", "10",
+                        "--gate-stage-patience", "10",
+                        "--gate-stage-lr", "0.001",
+                    ]
+                )
+            if preset in ("e9_dev", "e10_dev"):
                 command.extend(["--fold-indices", "1", "--validation-only"])
         return command
-    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 9:
+    if preset.startswith("e") and preset[1:].isdigit() and 1 <= int(preset[1:]) <= 10:
         experiment = preset.upper()
         command = fixed_external(f"ablation_{preset}_seed{seed}", experiment) + [
             "--roi-points", "512",
@@ -202,20 +234,28 @@ def command_for(preset, seed):
             "--patience", "35",
             "--seed", str(seed),
         ]
-        if preset == "e9":
+        if preset in ("e9", "e10"):
             command.extend(
                 [
                     "--hard-landmark-weight", "4.0",
                     "--hard-rank-weight", "1.0",
                     "--gate-weight", "0.5",
                     "--checkpoint-metric", "balanced",
-                    "--refinement-calibration", "group_scale",
+                    "--refinement-calibration", "none" if preset == "e10" else "group_scale",
+                ]
+            )
+        if preset == "e10":
+            command.extend(
+                [
+                    "--gonion-pair-topk", "32",
+                    "--hard-rank-mode", "soft_listwise",
+                    "--gate-stage-epochs", "40",
                 ]
             )
         return command
     raise ValueError(
-        "Preset must be smoke, a100, cv_preflight, cv, cv_repeated, "
-        "e9_dev, e9_cv, or e0..e9"
+        "Preset must be smoke, e10_smoke, a100, cv_preflight, cv, cv_repeated, "
+        "e9_dev, e9_cv, e10_dev, e10_cv, or e0..e10"
     )
 
 
@@ -225,12 +265,13 @@ def validate_paths(preset, seed):
     else:
         required = [DATA_ROOT]
     if preset not in (
-        "cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv", "smoke", "e0"
+        "cv", "cv_repeated", "cv_preflight", "e9_dev", "e9_cv", "e10_dev", "e10_cv",
+        "smoke", "e10_smoke", "e0"
     ):
         required.extend([SPLITS_JSON, TRANSFORM_DIR, BASE_RUN, INITIAL_RUN])
-    elif preset == "smoke":
+    elif preset in ("smoke", "e10_smoke"):
         required.append(SPLITS_JSON)
-    if preset in ("e9_dev", "e9_cv"):
+    if preset in ("e9_dev", "e9_cv", "e10_dev", "e10_cv"):
         required.append(RUN_ROOT / f"publication_cv_stage1_v4_seed{seed}")
     missing = [str(path) for path in required if not path.exists()]
     if missing:

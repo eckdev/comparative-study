@@ -12,7 +12,8 @@ from all23_rgb_geodesic_cascade.data import (
     assert_disjoint_splits, build_roi_cache, collate_graphs, collate_surface_graphs,
 )
 from all23_rgb_geodesic_cascade.losses import (
-    LossWeights, adaptive_wing_loss, compute_loss, region_loss,
+    LossWeights, adaptive_wing_loss, compute_loss, hard_candidate_ranking_loss,
+    region_loss, sample_specific_gate_loss,
 )
 from all23_rgb_geodesic_cascade.model import (
     All23RGBGeodesicCascade, GlobalCoarseNetwork, segment_softmax,
@@ -174,6 +175,97 @@ def test_e9_hard_candidate_ranker_selects_surface_vertices_and_trains():
     )
 
 
+def test_e10_uses_independent_texture_and_joint_bilateral_rankers():
+    batch = collate_graphs([synthetic_item()])
+    model = All23RGBGeodesicCascade(
+        input_dim=14,
+        width=32,
+        global_blocks=1,
+        heads=4,
+        dropout=0.0,
+        use_refinement_gate=True,
+        use_hard_candidate_ranker=True,
+        use_e10_rankers=True,
+        gonion_pair_topk=4,
+    )
+    outputs = model(batch, coordinate_mode="mse_over_mesh")
+    assert outputs["hard_rank_logits"].shape == (1, 3, 8)
+    assert model.gonion_anchor_projection[0].in_features == 12
+    assert not hasattr(model, "hard_candidate_ranker")
+    loss, _, components = compute_loss(
+        outputs,
+        batch,
+        LossWeights(hard_landmark=4.0, hard_rank=1.0),
+        hard_rank_mode="soft_listwise",
+    )
+    assert torch.isfinite(components["hard_rank"])
+    loss.backward()
+    for module in (
+        model.trichion_candidate_ranker,
+        model.gonion_unary_ranker,
+        model.gonion_pair_score,
+    ):
+        assert any(parameter.grad is not None for parameter in module.parameters())
+
+
+def test_soft_listwise_ranking_prefers_distance_consistent_scores():
+    candidate_count = 8
+    candidates = torch.zeros(1, 23, candidate_count, 3)
+    candidates[..., 0] = torch.arange(candidate_count, dtype=torch.float32)
+    mask = torch.ones(1, 23, candidate_count, dtype=torch.bool)
+    expert = torch.zeros(1, 23, 3)
+    distances = torch.arange(candidate_count, dtype=torch.float32)
+    good_logits = (-distances)[None, None].expand(1, 3, -1).clone()
+    bad_logits = distances[None, None].expand(1, 3, -1).clone()
+    good = hard_candidate_ranking_loss(
+        good_logits,
+        candidates,
+        mask,
+        expert,
+        mode="soft_listwise",
+        hard_negative_weight=0.0,
+    )
+    bad = hard_candidate_ranking_loss(
+        bad_logits,
+        candidates,
+        mask,
+        expert,
+        mode="soft_listwise",
+        hard_negative_weight=0.0,
+    )
+    assert good < bad
+
+
+def test_e10_gate_can_train_with_refiner_frozen():
+    batch = collate_graphs([synthetic_item()])
+    model = All23RGBGeodesicCascade(
+        input_dim=14,
+        width=32,
+        global_blocks=1,
+        heads=4,
+        dropout=0.0,
+        use_refinement_gate=True,
+        use_hard_candidate_ranker=True,
+        use_e10_rankers=True,
+        gonion_pair_topk=4,
+    )
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.set_refinement_gate_trainable(True)
+    outputs = model(batch, coordinate_mode="topk")
+    loss, _, _ = sample_specific_gate_loss(outputs, batch)
+    loss.backward()
+    assert any(
+        parameter.grad is not None
+        for module in model.refinement_gate_modules()
+        for parameter in module.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for parameter in model.trichion_candidate_ranker.parameters()
+    )
+
+
 def test_group_refinement_calibration_is_fit_on_validation_coordinates():
     shape = (2, 23, 3)
     outputs = {
@@ -211,6 +303,20 @@ def test_completed_fold_requires_matching_stage2_signature(tmp_path):
     assert load_completed_fold(tmp_path, args, splits) == result
     args.hard_rank_weight = 0.25
     assert load_completed_fold(tmp_path, args, splits) is None
+
+
+def test_e10_experiment_enables_two_phase_soft_ranking():
+    args = build_parser().parse_args(
+        ["--data-root", "dataset", "--output-dir", "run", "--experiment", "E10"]
+    )
+    stage = experiment_settings(args)
+    assert stage == 10
+    assert args.use_e10_rankers
+    assert args.use_hard_candidate_ranker
+    assert args.separate_gate_training
+    assert args.hard_rank_mode == "soft_listwise"
+    assert args.gate_weight == 0.0
+    assert args.refinement_calibration == "none"
 
 
 def test_stage2_last_checkpoint_can_resume_without_retraining(tmp_path):

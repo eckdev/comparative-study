@@ -31,7 +31,7 @@ if __package__ in (None, ""):
     from all23_rgb_geodesic_cascade.stage1 import generate_oof_stage1_predictions
     from all23_rgb_geodesic_cascade.train import (
         apply_refinement_calibration, collect_outputs, fit_model,
-        fit_refinement_calibration,
+        fit_refinement_calibration, fit_separate_refinement_gate,
     )
 else:
     from .alignment import build_label_free_alignment
@@ -48,7 +48,7 @@ else:
     from .stage1 import generate_oof_stage1_predictions
     from .train import (
         apply_refinement_calibration, collect_outputs, fit_model,
-        fit_refinement_calibration,
+        fit_refinement_calibration, fit_separate_refinement_gate,
     )
 
 
@@ -137,11 +137,11 @@ def validate_external_cv_provenance(splits, manifest):
 
 def experiment_settings(args):
     level = args.experiment.upper()
-    order = {f"E{index}": index for index in range(1, 10)}
+    order = {f"E{index}": index for index in range(1, 11)}
     if level == "FULL":
         level = "E9"
     if level not in order:
-        raise ValueError("--experiment must be E1..E9 or FULL")
+        raise ValueError("--experiment must be E1..E10 or FULL")
     stage = order[level]
     args.use_rgb = stage >= 2
     args.use_local_refiner = stage >= 4
@@ -149,6 +149,8 @@ def experiment_settings(args):
     args.use_specialized_heads = stage >= 6
     args.use_refinement_gate = stage >= 8
     args.use_hard_candidate_ranker = stage >= 9
+    args.use_e10_rankers = stage >= 10
+    args.separate_gate_training = stage >= 10
     if stage < 3:
         args.global_blocks = 1
     if stage < 5:
@@ -169,6 +171,10 @@ def experiment_settings(args):
             args.checkpoint_metric = "balanced"
         if args.refinement_calibration == "none":
             args.refinement_calibration = "group_scale"
+    if stage >= 10:
+        args.hard_rank_mode = "soft_listwise"
+        args.gate_weight = 0.0
+        args.refinement_calibration = "none"
     return stage
 
 
@@ -566,6 +572,15 @@ def stage2_signature(args, splits):
         "batch_size", "min_epochs", "patience", "scheduler_start_epoch",
         "lr_warmup_epochs", "coarse_source", "train_center_mode", "alignment",
     )
+    if getattr(args, "use_e10_rankers", False):
+        keys += (
+            "gonion_pair_topk", "hard_rank_mode", "hard_rank_sigma_lm0",
+            "hard_rank_sigma_gonion", "hard_negative_count", "hard_negative_margin",
+            "hard_negative_weight", "use_e10_rankers", "separate_gate_training",
+            "gate_stage_epochs", "gate_stage_min_epochs", "gate_stage_patience",
+            "gate_stage_lr", "gate_stage_weight_decay",
+            "gate_stage_scheduler_patience",
+        )
     payload = {
         "args": {key: getattr(args, key) for key in keys},
         "splits": {name: list(values) for name, values in splits.items()},
@@ -662,10 +677,14 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         use_local_refiner=args.use_local_refiner,
         use_refinement_gate=args.use_refinement_gate,
         use_hard_candidate_ranker=args.use_hard_candidate_ranker,
+        use_e10_rankers=args.use_e10_rankers,
         hard_coordinate_topk=args.hard_coordinate_topk,
         hard_coordinate_temperature=args.hard_coordinate_temperature,
+        gonion_pair_topk=args.gonion_pair_topk,
         roi_radius_scale=args.roi_radius_scale,
     ).to(device)
+    if args.separate_gate_training:
+        model.set_refinement_gate_trainable(False)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"Parameters: {parameter_count:,}", flush=True)
     loss_weights = LossWeights(
@@ -687,7 +706,28 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             f"Stage 2 best validation ALE={training['best_validation_ale']:.4f} exceeds "
             f"--max-stage2-val-ale={args.max_stage2_val_ale:.4f}. Test labels remain sealed."
         )
-    validation = collect_outputs(model, loaders["val"], device, args, normalizer, use_tta=args.tta)
+    force_refined_evaluation = False
+    if args.separate_gate_training:
+        gate_training = fit_separate_refinement_gate(
+            model,
+            loaders["train"],
+            loaders["val"],
+            device,
+            args,
+            normalizer,
+            fold_dir,
+        )
+        training["separate_gate"] = gate_training
+        force_refined_evaluation = not gate_training["accepted"]
+    validation = collect_outputs(
+        model,
+        loaders["val"],
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta,
+        force_refined=force_refined_evaluation,
+    )
     refinement_calibration = fit_refinement_calibration(
         validation, args.refinement_calibration
     )
@@ -702,6 +742,9 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     if args.validation_only:
         result = {
             "stage2_signature": args.stage2_signature,
+            "evaluation_policy": (
+                "refined_only" if force_refined_evaluation else "sample_specific_gate"
+            ),
             "refinement_calibration": refinement_calibration,
             "training": training,
             "parameter_count": parameter_count,
@@ -722,11 +765,22 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         datasets["test"][index]
         if args.no_tqdm and ((index + 1) % 10 == 0 or index + 1 == len(datasets["test"])):
             print(f"Test ROI {index + 1}/{len(datasets['test'])}", flush=True)
-    test = collect_outputs(model, loaders["test"], device, args, normalizer, use_tta=args.tta)
+    test = collect_outputs(
+        model,
+        loaders["test"],
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta,
+        force_refined=force_refined_evaluation,
+    )
     test = apply_refinement_calibration(test, refinement_calibration)
     test_metrics = save_evaluation(fold_dir, "test", test, calibration, args.bootstrap_iters, args.seed)
     result = {
         "stage2_signature": args.stage2_signature,
+        "evaluation_policy": (
+            "refined_only" if force_refined_evaluation else "sample_specific_gate"
+        ),
         "refinement_calibration": refinement_calibration,
         "training": training,
         "parameter_count": parameter_count,
@@ -819,6 +873,17 @@ def build_parser():
     parser.add_argument("--coordinate-temperature", type=float, default=0.75)
     parser.add_argument("--hard-coordinate-topk", type=int, default=8)
     parser.add_argument("--hard-coordinate-temperature", type=float, default=0.35)
+    parser.add_argument("--gonion-pair-topk", type=int, default=32)
+    parser.add_argument(
+        "--hard-rank-mode",
+        choices=("nearest_ce", "soft_listwise"),
+        default="nearest_ce",
+    )
+    parser.add_argument("--hard-rank-sigma-lm0", type=float, default=3.0)
+    parser.add_argument("--hard-rank-sigma-gonion", type=float, default=4.0)
+    parser.add_argument("--hard-negative-count", type=int, default=16)
+    parser.add_argument("--hard-negative-margin", type=float, default=0.5)
+    parser.add_argument("--hard-negative-weight", type=float, default=0.25)
     parser.add_argument("--rotation-degrees", type=float, default=10.0)
     parser.add_argument("--center-jitter-mm", type=float, default=0.5)
     parser.add_argument("--point-noise-mm", type=float, default=0.1)
@@ -835,6 +900,12 @@ def build_parser():
     parser.add_argument("--clinical-weight", type=float, default=0.05)
     parser.add_argument("--gate-weight", type=float, default=0.10)
     parser.add_argument("--gate-warmup-epochs", type=int, default=30)
+    parser.add_argument("--gate-stage-epochs", type=int, default=40)
+    parser.add_argument("--gate-stage-min-epochs", type=int, default=10)
+    parser.add_argument("--gate-stage-patience", type=int, default=10)
+    parser.add_argument("--gate-stage-scheduler-patience", type=int, default=4)
+    parser.add_argument("--gate-stage-lr", type=float, default=1e-3)
+    parser.add_argument("--gate-stage-weight-decay", type=float, default=1e-4)
     parser.add_argument("--hard-landmark-weight", type=float, default=1.5)
     parser.add_argument("--hard-rank-weight", type=float, default=0.0)
     parser.add_argument(

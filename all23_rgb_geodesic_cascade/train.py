@@ -11,7 +11,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from .anatomy import CORE20, HARD3, NUM_LANDMARKS, mirror_permutation
-from .losses import compute_loss
+from .losses import compute_loss, sample_specific_gate_loss
 
 
 def amp_torch_dtype(name):
@@ -59,14 +59,27 @@ def train_epoch(model, loader, optimizer, scaler, device, args, loss_weights):
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, args.mixed_precision, args.amp_dtype):
             outputs = model(batch, coordinate_mode=args.coordinate_mode)
-        if (
+        if getattr(args, "separate_gate_training", False):
+            outputs["final_coordinates"] = outputs["refined_coordinates"]
+        elif (
             getattr(model, "use_refinement_gate", False)
-            and getattr(loader.dataset, "epoch", 0) <= args.gate_warmup_epochs
+            and getattr(loader.dataset, "epoch", 0) <= getattr(args, "gate_warmup_epochs", 0)
         ):
             # Let the local heatmap/refiner learn before alpha can attenuate its
             # coordinate gradient. The gate loss still trains in parallel.
             outputs["final_coordinates"] = outputs["refined_coordinates"]
-        loss, errors, components = compute_loss(outputs, batch, loss_weights, args.region_positive_weight)
+        loss, errors, components = compute_loss(
+            outputs,
+            batch,
+            loss_weights,
+            args.region_positive_weight,
+            hard_rank_mode=getattr(args, "hard_rank_mode", "nearest_ce"),
+            hard_rank_sigma_lm0=getattr(args, "hard_rank_sigma_lm0", 3.0),
+            hard_rank_sigma_gonion=getattr(args, "hard_rank_sigma_gonion", 4.0),
+            hard_negative_count=getattr(args, "hard_negative_count", 16),
+            hard_negative_margin=getattr(args, "hard_negative_margin", 0.5),
+            hard_negative_weight=getattr(args, "hard_negative_weight", 0.25),
+        )
         if not torch.isfinite(loss):
             skipped_nonfinite += 1
             bad = [name for name, value in components.items() if not torch.isfinite(value)]
@@ -187,7 +200,9 @@ def inverse_predictions(prediction, rotation, center, mirror=False):
 
 
 @torch.no_grad()
-def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
+def collect_outputs(
+    model, loader, device, args, normalizer, use_tta=False, force_refined=False
+):
     model.eval()
     collected = {
         "sample_ids": [], "classes": [], "genders": [], "subject_ids": [],
@@ -224,7 +239,9 @@ def collect_outputs(model, loader, device, args, normalizer, use_tta=False):
             args.coordinate_mode,
         )
         refinement_alpha = torch.stack(refinement_alphas).mean(dim=0)
-        prediction = (
+        if force_refined:
+            refinement_alpha = torch.ones_like(refinement_alpha)
+        prediction = refined if force_refined else (
             batch["coarse"]
             + refinement_alpha[..., None] * (refined - batch["coarse"])
             if model.use_refinement_gate
@@ -349,6 +366,214 @@ def _restore_rng_state(state, train_loader):
         generator.set_state(state["loader_generator"])
 
 
+def fit_separate_refinement_gate(
+    model, train_loader, val_loader, device, args, normalizer, output_dir
+):
+    """Freeze the refiner and fit only the sample-specific coarse/refined gate."""
+    if not getattr(model, "use_refinement_gate", False):
+        raise ValueError("Separate gate training requires use_refinement_gate=True")
+    output_dir = Path(output_dir)
+    best_path = output_dir / "best_gate.pth"
+    history_path = output_dir / "gate_history.json"
+    result_path = output_dir / "gate_training.json"
+    if (
+        getattr(args, "resume_stage2", True)
+        and not getattr(args, "force_stage2_retrain", False)
+        and result_path.exists()
+    ):
+        cached_result = json.loads(result_path.read_text(encoding="utf-8"))
+        expected_signature = getattr(args, "stage2_signature", None)
+        if cached_result.get("stage2_signature") == expected_signature:
+            if not cached_result.get("accepted", False):
+                print("Separate gate cached: refined-only fallback selected", flush=True)
+                return cached_result
+            if best_path.exists():
+                try:
+                    cached_checkpoint = torch.load(
+                        best_path, map_location=device, weights_only=False
+                    )
+                except TypeError:
+                    cached_checkpoint = torch.load(best_path, map_location=device)
+                if cached_checkpoint.get("stage2_signature") == expected_signature:
+                    model.load_refinement_gate_state_dict(cached_checkpoint["gate_state"])
+                    print(
+                        f"Separate gate cached: best epoch={cached_result['best_epoch']}",
+                        flush=True,
+                    )
+                    return cached_result
+    original_trainable = {
+        name: parameter.requires_grad for name, parameter in model.named_parameters()
+    }
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.set_refinement_gate_trainable(True)
+    gate_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        gate_parameters,
+        lr=float(getattr(args, "gate_stage_lr", 1e-3)),
+        weight_decay=float(getattr(args, "gate_stage_weight_decay", 1e-4)),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=max(int(getattr(args, "gate_stage_scheduler_patience", 4)), 1),
+        min_lr=1e-6,
+    )
+    scaler = grad_scaler(args.mixed_precision, args.amp_dtype, args.amp_init_scale)
+    epochs = int(getattr(args, "gate_stage_epochs", 40))
+    minimum_epochs = int(getattr(args, "gate_stage_min_epochs", 10))
+    patience = int(getattr(args, "gate_stage_patience", 10))
+    baseline_validation = collect_outputs(
+        model,
+        val_loader,
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta_validation,
+        force_refined=True,
+    )
+    baseline_score, baseline_overall, baseline_core20, baseline_hard3 = (
+        validation_selection_score(baseline_validation, args)
+    )
+    best_score, best_epoch, stale = baseline_score, 0, 0
+    improved_checkpoint = False
+    history = []
+    started = time.time()
+    print(
+        f"Gate baseline refined-only: val_ALE={baseline_overall:.4f} "
+        f"core20={baseline_core20:.4f} hard3={baseline_hard3:.4f} "
+        f"selected={baseline_score:.4f}",
+        flush=True,
+    )
+
+    for epoch in range(1, epochs + 1):
+        model.eval()
+        for module in model.refinement_gate_modules():
+            module.train()
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
+        running, seen = {}, 0
+        per_landmark_sum = np.zeros(NUM_LANDMARKS, dtype=np.float64)
+        for batch in tqdm(
+            train_loader,
+            desc="gate train",
+            leave=False,
+            disable=args.no_tqdm,
+        ):
+            batch = move_batch(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, args.mixed_precision, args.amp_dtype):
+                outputs = model(batch, coordinate_mode=args.coordinate_mode)
+                loss, errors, components = sample_specific_gate_loss(
+                    outputs,
+                    batch,
+                    hard_landmark_weight=getattr(args, "hard_landmark_weight", 4.0),
+                )
+            if not torch.isfinite(loss):
+                raise RuntimeError("Separate gate training produced a non-finite loss")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            gradient_norm = nn.utils.clip_grad_norm_(
+                gate_parameters, float(getattr(args, "grad_clip", 1.0))
+            )
+            if not torch.isfinite(gradient_norm):
+                raise RuntimeError("Separate gate training produced non-finite gradients")
+            scaler.step(optimizer)
+            scaler.update()
+            batch_size = len(batch["sample_id"])
+            seen += batch_size
+            per_landmark_sum += errors.detach().sum(dim=0).cpu().numpy()
+            for name, value in components.items():
+                running[name] = running.get(name, 0.0) + float(value.detach()) * batch_size
+
+        validation = collect_outputs(
+            model,
+            val_loader,
+            device,
+            args,
+            normalizer,
+            use_tta=args.tta_validation,
+            force_refined=False,
+        )
+        score, overall, core20, hard3 = validation_selection_score(validation, args)
+        scheduler.step(score)
+        row = {
+            "epoch": epoch,
+            "validation_selection_score": score,
+            "validation_ale": overall,
+            "validation_core20_ale": core20,
+            "validation_hard3_ale": hard3,
+            "validation_median": float(np.median(validation["errors"])),
+            "lr": optimizer.param_groups[0]["lr"],
+            **{f"train_{name}": value / max(seen, 1) for name, value in running.items()},
+            **{
+                f"train_lm{index}_ale": value
+                for index, value in enumerate(per_landmark_sum / max(seen, 1))
+            },
+        }
+        history.append(row)
+        print(
+            f"Gate epoch {epoch:03d}/{epochs} train={row['train_total']:.5f} "
+            f"val_ALE={overall:.4f} core20={core20:.4f} hard3={hard3:.4f} "
+            f"selected={score:.4f}",
+            flush=True,
+        )
+        if score < best_score - float(getattr(args, "min_delta", 1e-4)):
+            best_score, best_epoch, stale = score, epoch, 0
+            improved_checkpoint = True
+            _atomic_torch_save(
+                {
+                    "gate_state": model.refinement_gate_state_dict(),
+                    "epoch": epoch,
+                    "validation_ale": overall,
+                    "validation_core20_ale": core20,
+                    "validation_hard3_ale": hard3,
+                    "validation_selection_score": score,
+                    "stage2_signature": getattr(args, "stage2_signature", None),
+                },
+                best_path,
+            )
+        elif epoch >= minimum_epochs:
+            stale += 1
+        history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        if epoch >= minimum_epochs and stale >= patience:
+            print(
+                f"Gate early stopping at epoch {epoch}; best epoch={best_epoch}",
+                flush=True,
+            )
+            break
+
+    if improved_checkpoint:
+        try:
+            checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(best_path, map_location=device)
+        model.load_refinement_gate_state_dict(checkpoint["gate_state"])
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(original_trainable[name])
+    model.eval()
+    result = {
+        "best_epoch": best_epoch,
+        "best_selection_score": best_score,
+        "accepted": bool(improved_checkpoint),
+        "baseline_refined_only": {
+            "selection_score": baseline_score,
+            "overall_ale": baseline_overall,
+            "core20_ale": baseline_core20,
+            "hard3_ale": baseline_hard3,
+        },
+        "selection_metric": args.checkpoint_metric,
+        "training_seconds": float(time.time() - started),
+        "checkpoint": str(best_path) if improved_checkpoint else None,
+        "stage2_signature": getattr(args, "stage2_signature", None),
+    }
+    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 def fit_model(model, train_loader, val_loader, device, args, loss_weights, normalizer, output_dir):
     output_dir = Path(output_dir)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -407,7 +632,15 @@ def fit_model(model, train_loader, val_loader, device, args, loss_weights, norma
         components, per_landmark = train_epoch(
             model, train_loader, optimizer, scaler, device, args, loss_weights
         )
-        validation = collect_outputs(model, val_loader, device, args, normalizer, use_tta=args.tta_validation)
+        validation = collect_outputs(
+            model,
+            val_loader,
+            device,
+            args,
+            normalizer,
+            use_tta=args.tta_validation,
+            force_refined=getattr(args, "separate_gate_training", False),
+        )
         score, overall_ale, core20_ale, hard3_ale = validation_selection_score(
             validation, args
         )

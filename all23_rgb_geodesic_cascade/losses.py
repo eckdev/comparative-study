@@ -3,7 +3,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .anatomy import ANATOMICAL_EDGES, HARD3, MIDLINE, NUM_LANDMARKS, SYMMETRY_PAIRS
+from .anatomy import (
+    ANATOMICAL_EDGES, HARD3, MIDLINE, NUM_LANDMARKS, SYMMETRY_PAIRS,
+    heatmap_sigma_mm,
+)
 
 
 @dataclass
@@ -117,8 +120,20 @@ def coarse_nearest_loss(coarse_logits, batch, expert):
     return torch.stack(losses).mean()
 
 
-def hard_candidate_ranking_loss(logits, candidates, mask, expert):
-    """Classify the expert-nearest surface candidate for LM0/21/22."""
+def hard_candidate_ranking_loss(
+    logits,
+    candidates,
+    mask,
+    expert,
+    mode="nearest_ce",
+    sigma_lm0=3.0,
+    sigma_gonion=4.0,
+    hard_negative_count=16,
+    hard_negative_margin=0.5,
+    hard_negative_weight=0.25,
+    geodesic_heatmap_target=None,
+):
+    """Rank difficult-landmark candidates using hard or distance-soft targets."""
     if logits is None:
         return expert.new_zeros(())
     hard_expert = expert[:, HARD3].float()
@@ -129,16 +144,134 @@ def hard_candidate_ranking_loss(logits, candidates, mask, expert):
     ).masked_fill(~hard_mask, torch.inf)
     nearest = torch.argmin(distances, dim=-1)
     masked_logits = logits.float().masked_fill(~hard_mask, -torch.inf)
-    loss = F.cross_entropy(
-        masked_logits.reshape(-1, masked_logits.shape[-1]),
-        nearest.reshape(-1),
+    if mode == "nearest_ce":
+        loss = F.cross_entropy(
+            masked_logits.reshape(-1, masked_logits.shape[-1]),
+            nearest.reshape(-1),
+        )
+        return loss / torch.log(
+            loss.new_tensor(max(masked_logits.shape[-1], 2), dtype=torch.float32)
+        )
+    if mode != "soft_listwise":
+        raise ValueError(f"Unknown hard candidate ranking mode: {mode}")
+
+    sigmas = distances.new_tensor(
+        [float(sigma_lm0), float(sigma_gonion), float(sigma_gonion)]
+    )[None, :, None]
+    ranking_distances = distances
+    if geodesic_heatmap_target is not None:
+        hard_heatmap = geodesic_heatmap_target[:, HARD3].float()
+        source_sigmas = distances.new_tensor(
+            [heatmap_sigma_mm(index) for index in HARD3]
+        )[None, :, None]
+        ranking_distances = source_sigmas * torch.sqrt(
+            -2.0 * torch.log(hard_heatmap.clamp_min(1e-12))
+        )
+        ranking_distances = ranking_distances.masked_fill(~hard_mask, torch.inf)
+    target_energy = -(ranking_distances**2) / (2.0 * sigmas.clamp_min(1e-6) ** 2)
+    target_energy = target_energy.masked_fill(~hard_mask, -torch.inf)
+    target_probability = torch.softmax(target_energy, dim=-1)
+    predicted_log_probability = torch.log_softmax(masked_logits, dim=-1)
+    listwise = torch.where(
+        hard_mask,
+        target_probability
+        * (
+            torch.log(target_probability.clamp_min(1e-8))
+            - predicted_log_probability
+        ),
+        torch.zeros_like(target_probability),
+    ).sum(dim=-1)
+
+    # Mine candidates that the network ranks highly despite being at least one
+    # target sigma farther than the surface oracle. This avoids spending most
+    # gradient on the many already-obvious background vertices.
+    ranking_nearest = torch.argmin(ranking_distances, dim=-1)
+    minimum_distance = torch.gather(ranking_distances, -1, ranking_nearest[..., None])
+    negative_mask = hard_mask & (ranking_distances > minimum_distance + sigmas)
+    negative_scores = masked_logits.masked_fill(~negative_mask, -torch.inf)
+    negative_count = min(max(int(hard_negative_count), 1), logits.shape[-1])
+    selected_scores, selected_indices = torch.topk(
+        negative_scores, negative_count, dim=-1
     )
-    return loss / torch.log(
-        loss.new_tensor(max(masked_logits.shape[-1], 2), dtype=torch.float32)
+    selected_valid = torch.gather(negative_mask, -1, selected_indices)
+    positive_score = (target_probability * masked_logits.masked_fill(~hard_mask, 0.0)).sum(
+        dim=-1, keepdim=True
     )
+    hard_negative = F.softplus(
+        selected_scores - positive_score + float(hard_negative_margin)
+    )
+    hard_negative = torch.where(
+        selected_valid, hard_negative, torch.zeros_like(hard_negative)
+    )
+    hard_negative = hard_negative.sum(dim=-1) / selected_valid.sum(dim=-1).clamp_min(1)
+    return (listwise + float(hard_negative_weight) * hard_negative).mean()
 
 
-def compute_loss(outputs, batch, weights, positive_weight=20.0):
+def sample_specific_gate_loss(outputs, batch, hard_landmark_weight=4.0):
+    """Train a frozen-refiner gate to choose/blend coarse and refined outputs."""
+    expert = batch["expert"].float()
+    coarse = batch["coarse"].float()
+    refined = outputs["refined_coordinates"].float().detach()
+    alpha = outputs["refinement_alpha"].float()
+    gate_logits = outputs["refinement_gate_logits"].float()
+    direction = refined - coarse
+    denominator = direction.pow(2).sum(dim=-1)
+    optimal_alpha = (
+        ((expert - coarse) * direction).sum(dim=-1)
+        / denominator.clamp_min(1e-6)
+    ).clamp(0.0, 1.0)
+    coarse_error = torch.linalg.norm(coarse - expert, dim=-1)
+    refined_error = torch.linalg.norm(refined - expert, dim=-1)
+    refined_better = (refined_error < coarse_error).float()
+    prediction = coarse + alpha[..., None] * direction
+    prediction_error = torch.linalg.norm(prediction - expert, dim=-1)
+    oracle_endpoint_error = torch.minimum(coarse_error, refined_error)
+
+    alpha_loss = F.smooth_l1_loss(
+        alpha, optimal_alpha, beta=0.1, reduction="none"
+    )
+    classification = F.binary_cross_entropy_with_logits(
+        gate_logits, refined_better, reduction="none"
+    )
+    coordinate = F.smooth_l1_loss(
+        prediction, expert, beta=1.0, reduction="none"
+    ).mean(dim=-1)
+    regret = torch.relu(prediction_error - oracle_endpoint_error)
+    valid = denominator > 1e-4
+    per_landmark = torch.where(
+        valid,
+        alpha_loss + 0.25 * classification + 0.25 * coordinate + 0.5 * regret,
+        torch.zeros_like(alpha_loss),
+    )
+    weights = landmark_loss_weights(expert, hard_landmark_weight)
+    loss = weighted_landmark_mean(per_landmark, weights)
+    masked_alpha = torch.where(valid, alpha_loss, torch.zeros_like(alpha_loss))
+    masked_classification = torch.where(
+        valid, classification, torch.zeros_like(classification)
+    )
+    masked_coordinate = torch.where(valid, coordinate, torch.zeros_like(coordinate))
+    masked_regret = torch.where(valid, regret, torch.zeros_like(regret))
+    return loss, prediction_error, {
+        "total": loss,
+        "alpha": weighted_landmark_mean(masked_alpha, weights),
+        "classification": weighted_landmark_mean(masked_classification, weights),
+        "coordinate": weighted_landmark_mean(masked_coordinate, weights),
+        "regret": weighted_landmark_mean(masked_regret, weights),
+    }
+
+
+def compute_loss(
+    outputs,
+    batch,
+    weights,
+    positive_weight=20.0,
+    hard_rank_mode="nearest_ce",
+    hard_rank_sigma_lm0=3.0,
+    hard_rank_sigma_gonion=4.0,
+    hard_negative_count=16,
+    hard_negative_margin=0.5,
+    hard_negative_weight=0.25,
+):
     expert = batch["expert"].float()
     prediction = outputs["final_coordinates"].float()
     landmark_weights = landmark_loss_weights(expert, weights.hard_landmark)
@@ -217,6 +350,13 @@ def compute_loss(outputs, batch, weights, positive_weight=20.0):
         outputs["candidate_points"],
         batch["roi_mask"],
         expert,
+        mode=hard_rank_mode,
+        sigma_lm0=hard_rank_sigma_lm0,
+        sigma_gonion=hard_rank_sigma_gonion,
+        hard_negative_count=hard_negative_count,
+        hard_negative_margin=hard_negative_margin,
+        hard_negative_weight=hard_negative_weight,
+        geodesic_heatmap_target=batch.get("heatmap_target"),
     )
     total = (
         weights.heatmap * heatmap
