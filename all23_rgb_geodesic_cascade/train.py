@@ -353,17 +353,29 @@ def _rng_state(train_loader):
     return state
 
 
+def _cpu_byte_rng_state(value):
+    """Normalize RNG payloads loaded with map_location to PyTorch's required type."""
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu", dtype=torch.uint8)
+    return torch.as_tensor(value, dtype=torch.uint8, device="cpu")
+
+
 def _restore_rng_state(state, train_loader):
     if not state:
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_cpu_byte_rng_state(state["torch"]))
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        for device_index, cuda_state in enumerate(
+            state["cuda"][: torch.cuda.device_count()]
+        ):
+            torch.cuda.set_rng_state(
+                _cpu_byte_rng_state(cuda_state), device=device_index
+            )
     generator = getattr(train_loader, "generator", None)
     if generator is not None and "loader_generator" in state:
-        generator.set_state(state["loader_generator"])
+        generator.set_state(_cpu_byte_rng_state(state["loader_generator"]))
 
 
 def fit_separate_refinement_gate(

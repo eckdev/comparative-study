@@ -1,4 +1,5 @@
 import json
+import random
 import numpy as np
 import torch
 from types import SimpleNamespace
@@ -27,7 +28,7 @@ from all23_rgb_geodesic_cascade.stage1 import (
     stage1_loss,
 )
 from all23_rgb_geodesic_cascade.train import (
-    amp_torch_dtype, apply_refinement_calibration, fit_model,
+    _restore_rng_state, amp_torch_dtype, apply_refinement_calibration, fit_model,
     fit_refinement_calibration,
 )
 from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
@@ -386,6 +387,24 @@ def test_stage2_last_checkpoint_can_resume_without_retraining(tmp_path):
         tmp_path,
     )
     assert second["best_epoch"] == first["best_epoch"] == 1
+
+
+def test_resume_normalizes_rng_tensors_loaded_on_the_wrong_dtype():
+    torch.manual_seed(123)
+    expected_torch = torch.get_rng_state()
+    generator = torch.Generator().manual_seed(456)
+    expected_generator = generator.get_state()
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": expected_torch.to(torch.int64),
+        "loader_generator": expected_generator.to(torch.int64),
+    }
+    torch.manual_seed(999)
+    generator.manual_seed(999)
+    _restore_rng_state(state, SimpleNamespace(generator=generator))
+    assert torch.equal(torch.get_rng_state(), expected_torch)
+    assert torch.equal(generator.get_state(), expected_generator)
 
 
 def test_global_only_ablation_uses_all_landmarks():
