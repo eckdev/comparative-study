@@ -87,6 +87,20 @@ def command_for(preset, seed, fold_indices):
             "1",
             "--bootstrap-iters",
             "50",
+            "--hard3-structured-folds",
+            "2",
+            "--hard3-structured-epochs",
+            "2",
+            "--hard3-structured-min-epochs",
+            "1",
+            "--hard3-structured-patience",
+            "1",
+            "--hard3-structured-batch-size",
+            "4",
+            "--hard3-structured-width",
+            "16",
+            "--hard3-structured-pair-topk",
+            "4",
             "--skip-oracle-gate",
             "--max-stage2-val-ale",
             "200",
@@ -157,7 +171,7 @@ def command_for(preset, seed, fold_indices):
         command.extend(["--fold-indices", fold_indices])
     if preset == "cv_preflight":
         command.append("--preflight-only")
-    elif preset == "dev_fold1":
+    elif preset in ("dev_fold1", "hard3_fold1"):
         command.extend(["--fold-indices", "1", "--validation-only"])
     return command
 
@@ -166,7 +180,7 @@ def main():
     parser = argparse.ArgumentParser(description="Colab runner for AGH-Former vNext")
     parser.add_argument(
         "--preset",
-        choices=("smoke", "cv_preflight", "dev_fold1", "cv"),
+        choices=("smoke", "cv_preflight", "dev_fold1", "hard3_fold1", "cv"),
         default="smoke",
     )
     parser.add_argument("--seed", type=int, default=42)

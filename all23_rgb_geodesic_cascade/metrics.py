@@ -144,6 +144,10 @@ def prediction_rows(outputs, confidence):
                 coordinate_names.append("stage1_coarse")
             if "neural_prediction" in outputs:
                 coordinate_names.append("neural_prediction")
+            if "pre_hard3_prediction" in outputs:
+                coordinate_names.append("pre_hard3_prediction")
+            if "hard3_candidate" in outputs:
+                coordinate_names.append("hard3_candidate")
             for name in coordinate_names:
                 for axis_index, axis in enumerate(("x", "y", "z")):
                     row[f"{name}_{axis}"] = float(outputs[name][sample_index, landmark, axis_index])
@@ -157,6 +161,13 @@ def prediction_rows(outputs, confidence):
                     sample_index, landmark
                 ]
             )
+            for name in (
+                "hard3_reliability",
+                "hard3_ensemble_spread",
+                "hard3_effective_alpha",
+            ):
+                if name in outputs:
+                    row[name] = float(outputs[name][sample_index, landmark])
             row["oracle_error"] = float(outputs["oracle"][sample_index, landmark])
             rows.append(row)
     return rows
