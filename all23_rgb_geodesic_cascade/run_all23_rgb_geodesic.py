@@ -486,6 +486,7 @@ def prepare_fold(
             point_noise_mm=args.point_noise_mm,
             rgb_noise=args.rgb_noise,
             point_dropout=args.point_dropout,
+            mirror_probability=args.mirror_probability,
             center_jitter_mm=args.center_jitter_mm,
             **common,
         ),
@@ -564,7 +565,7 @@ def stage2_signature(args, splits):
         "use_rgb", "use_local_refiner", "use_anatomical_attention",
         "use_specialized_heads", "use_refinement_gate", "use_hard_candidate_ranker",
         "rotation_degrees", "center_jitter_mm", "point_noise_mm", "rgb_noise",
-        "point_dropout", "heatmap_weight", "region_weight", "coordinate_weight",
+        "point_dropout", "mirror_probability", "heatmap_weight", "region_weight", "coordinate_weight",
         "coarse_weight", "anatomy_weight", "symmetry_weight", "uncertainty_weight",
         "clinical_weight", "gate_weight", "hard_landmark_weight", "hard_rank_weight",
         "checkpoint_metric", "checkpoint_hard3_weight", "refinement_calibration",
@@ -889,6 +890,7 @@ def build_parser():
     parser.add_argument("--point-noise-mm", type=float, default=0.1)
     parser.add_argument("--rgb-noise", type=float, default=0.05)
     parser.add_argument("--point-dropout", type=float, default=0.03)
+    parser.add_argument("--mirror-probability", type=float, default=0.0)
     parser.add_argument("--heatmap-weight", type=float, default=1.0)
     parser.add_argument("--region-weight", type=float, default=0.25)
     parser.add_argument("--region-positive-weight", type=float, default=20.0)

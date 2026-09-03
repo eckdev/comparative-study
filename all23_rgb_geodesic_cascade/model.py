@@ -422,7 +422,7 @@ class All23RGBGeodesicCascade(nn.Module):
         if hasattr(self, "hard_refinement_gate") and "hard_refinement_gate" in state:
             self.hard_refinement_gate.load_state_dict(state["hard_refinement_gate"])
 
-    def coarse_heatmaps(self, encoded, batch, batch_count):
+    def coarse_heatmaps(self, encoded, batch, batch_count, external_coarse=None):
         pooled = torch.cat([scatter_mean(encoded, batch, batch_count), scatter_max(encoded, batch, batch_count)], dim=-1)
         context = self.global_context(pooled)
         tokens = context[:, None, :] + self.landmark_embedding[None, :, :]
@@ -430,6 +430,15 @@ class All23RGBGeodesicCascade(nn.Module):
         token_queries = self.coarse_token_query(tokens)
         logits = torch.sum(point_keys[:, None, :] * token_queries[batch], dim=-1) / math.sqrt(self.width)
         return logits, tokens
+
+    def fuse_coarse_coordinates(self, tokens, heatmap_coordinates, coarse_logits, batch):
+        """Hook for models that combine an external coarse estimate with a heatmap.
+
+        The base cascade keeps its historical behavior and uses the externally
+        supplied center unchanged. Subclasses may return a differentiable fused
+        center plus auxiliary tensors to expose in the forward output.
+        """
+        return batch["coarse"], {}
 
     def _coarse_coordinates(self, logits, points, batch, batch_count, vertex_mask):
         coordinates = []
@@ -627,9 +636,23 @@ class All23RGBGeodesicCascade(nn.Module):
         graph_batch = batch["batch"]
         batch_count = int(batch["coarse"].shape[0])
         encoded = self.encode_surface(batch["features"], points, batch["edge_index"])
-        coarse_logits, global_tokens = self.coarse_heatmaps(encoded, graph_batch, batch_count)
-        coarse_coordinates = self._coarse_coordinates(
+        coarse_logits, global_tokens = self.coarse_heatmaps(
+            encoded,
+            graph_batch,
+            batch_count,
+            external_coarse=batch["coarse"],
+        )
+        global_heatmap_coordinates = self._coarse_coordinates(
             coarse_logits, points, graph_batch, batch_count, batch["vertex_mask"]
+        )
+        refinement_center, fusion_outputs = self.fuse_coarse_coordinates(
+            global_tokens,
+            global_heatmap_coordinates,
+            coarse_logits,
+            batch,
+        )
+        coarse_loss_coordinates = fusion_outputs.get(
+            "coarse_loss_coordinates", global_heatmap_coordinates
         )
 
         roi_index = batch["roi_index"]
@@ -642,21 +665,24 @@ class All23RGBGeodesicCascade(nn.Module):
             local_logits = local_logits.masked_fill(~roi_mask, -torch.inf)
             return {
                 "coarse_logits": coarse_logits,
-                "coarse_coordinates": coarse_coordinates,
+                "coarse_coordinates": coarse_loss_coordinates,
+                "global_heatmap_coordinates": global_heatmap_coordinates,
+                "gate_coarse": refinement_center,
                 "local_logits": local_logits,
                 "region_logits": local_logits.masked_fill(~roi_mask, -20.0),
-                "final_coordinates": coarse_coordinates,
-                "refined_coordinates": coarse_coordinates,
-                "refinement_alpha": coarse_coordinates.new_ones(
+                "final_coordinates": global_heatmap_coordinates,
+                "refined_coordinates": global_heatmap_coordinates,
+                "refinement_alpha": global_heatmap_coordinates.new_ones(
                     (batch_count, NUM_LANDMARKS)
                 ),
                 "log_var": self.confidence_head(global_tokens).squeeze(-1).clamp(-6.0, 6.0),
                 "candidate_points": points[roi_index],
                 "tokens": global_tokens,
+                **fusion_outputs,
             }
         local_features = encoded[roi_index]
         candidates = points[roi_index]
-        relative = candidates - batch["coarse"][:, :, None, :]
+        relative = candidates - refinement_center[:, :, None, :]
         sample_radius_scale = batch.get("sample_radius_scale")
         if sample_radius_scale is None:
             sample_radius_scale = self.roi_radii.new_ones((batch_count,))
@@ -746,7 +772,7 @@ class All23RGBGeodesicCascade(nn.Module):
             local_logits[:, 21] = gonion_left_logits
             local_logits[:, 22] = gonion_right_logits
         elif self.use_hard_candidate_ranker:
-            anchor_features = self._hard_anchor_features(candidates, batch["coarse"], radii)
+            anchor_features = self._hard_anchor_features(candidates, refinement_center, radii)
             anchor_embedding = self.hard_anchor_projection(anchor_features)
             hard_conditioned = torch.cat(
                 [conditioned[:, self.hard_indices], anchor_embedding], dim=-1
@@ -779,10 +805,10 @@ class All23RGBGeodesicCascade(nn.Module):
                 margin = top_values[..., 0] - top_values[..., 1]
             scalar_radius = radii.squeeze(-1).squeeze(-1)
             delta_norm = torch.linalg.norm(
-                refined_coordinates.detach() - batch["coarse"], dim=-1
+                refined_coordinates.detach() - refinement_center.detach(), dim=-1
             ) / scalar_radius
             coarse_disagreement = torch.linalg.norm(
-                coarse_coordinates.detach() - batch["coarse"], dim=-1
+                global_heatmap_coordinates.detach() - refinement_center.detach(), dim=-1
             ) / scalar_radius
             diagnostics = torch.stack(
                 [
@@ -811,12 +837,14 @@ class All23RGBGeodesicCascade(nn.Module):
             refinement_alpha = refined_coordinates.new_ones(
                 (batch_count, NUM_LANDMARKS)
             )
-        final_coordinates = batch["coarse"] + refinement_alpha[..., None] * (
-            refined_coordinates - batch["coarse"]
+        final_coordinates = refinement_center + refinement_alpha[..., None] * (
+            refined_coordinates - refinement_center
         )
         return {
             "coarse_logits": coarse_logits,
-            "coarse_coordinates": coarse_coordinates,
+            "coarse_coordinates": coarse_loss_coordinates,
+            "global_heatmap_coordinates": global_heatmap_coordinates,
+            "gate_coarse": refinement_center,
             "local_logits": local_logits,
             "region_logits": region_logits,
             "final_coordinates": final_coordinates,
@@ -831,4 +859,5 @@ class All23RGBGeodesicCascade(nn.Module):
                 if self.use_hard_candidate_ranker
                 else None
             ),
+            **fusion_outputs,
         }

@@ -207,6 +207,7 @@ def collect_outputs(
     collected = {
         "sample_ids": [], "classes": [], "genders": [], "subject_ids": [],
         "prediction": [], "refined": [], "expert": [], "coarse": [],
+        "stage1_coarse": [], "fusion_alpha": [],
         "log_var": [], "refinement_alpha": [], "oracle": [],
     }
     variants = [(0.0, False)]
@@ -214,7 +215,7 @@ def collect_outputs(
         variants.extend([(-5.0, False), (5.0, False), (0.0, True)])
     for raw_batch in tqdm(loader, desc="eval", leave=False, disable=args.no_tqdm):
         batch = move_batch(raw_batch, device)
-        heatmaps, variances, refinement_alphas = [], [], []
+        heatmaps, variances, refinement_alphas, gate_coarses, fusion_alphas = [], [], [], [], []
         for angle, mirror in variants:
             variant, rotation, center = transform_batch(batch, normalizer, angle, mirror)
             with autocast_context(device, args.mixed_precision, args.amp_dtype):
@@ -222,14 +223,26 @@ def collect_outputs(
             logits = outputs["local_logits"].float()
             log_var = outputs["log_var"].float()
             refinement_alpha = outputs["refinement_alpha"].float()
+            fusion_alpha = outputs.get(
+                "fusion_alpha", torch.zeros_like(refinement_alpha)
+            ).float()
+            gate_coarse = inverse_predictions(
+                outputs.get("gate_coarse", variant["coarse"]).float(),
+                rotation,
+                center,
+                mirror,
+            )
             if mirror:
                 permutation = torch.tensor(mirror_permutation(), device=device)
                 logits = logits[:, permutation]
                 log_var = log_var[:, permutation]
                 refinement_alpha = refinement_alpha[:, permutation]
+                fusion_alpha = fusion_alpha[:, permutation]
             heatmaps.append(logits)
             variances.append(log_var)
             refinement_alphas.append(refinement_alpha)
+            gate_coarses.append(gate_coarse)
+            fusion_alphas.append(fusion_alpha)
         averaged_heatmap = torch.stack(heatmaps).mean(dim=0)
         candidates = batch["points"][batch["roi_index"]]
         refined = model.coordinates_from_logits(
@@ -239,11 +252,13 @@ def collect_outputs(
             args.coordinate_mode,
         )
         refinement_alpha = torch.stack(refinement_alphas).mean(dim=0)
+        gate_coarse = torch.stack(gate_coarses).mean(dim=0)
+        fusion_alpha = torch.stack(fusion_alphas).mean(dim=0)
         if force_refined:
             refinement_alpha = torch.ones_like(refinement_alpha)
         prediction = refined if force_refined else (
-            batch["coarse"]
-            + refinement_alpha[..., None] * (refined - batch["coarse"])
+            gate_coarse
+            + refinement_alpha[..., None] * (refined - gate_coarse)
             if model.use_refinement_gate
             else refined
         )
@@ -256,14 +271,15 @@ def collect_outputs(
         collected["subject_ids"].extend(raw_batch["subject_id"].numpy().tolist())
         for name, value in (
             ("prediction", prediction), ("refined", refined),
-            ("expert", expert), ("coarse", batch["coarse"]),
+            ("expert", expert), ("coarse", gate_coarse),
+            ("stage1_coarse", batch["coarse"]), ("fusion_alpha", fusion_alpha),
             ("log_var", log_var), ("refinement_alpha", refinement_alpha),
             ("oracle", batch["oracle_error"]),
         ):
             collected[name].append(value.detach().cpu().numpy())
     for name in (
-        "prediction", "refined", "expert", "coarse", "log_var",
-        "refinement_alpha", "oracle",
+        "prediction", "refined", "expert", "coarse", "stage1_coarse",
+        "fusion_alpha", "log_var", "refinement_alpha", "oracle",
     ):
         collected[name] = np.concatenate(collected[name], axis=0)
     collected["subject_ids"] = np.asarray(collected["subject_ids"], dtype=np.int64)

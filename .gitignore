@@ -31,6 +31,7 @@ diffusion_net_orthodontic_comparison/runs/
 pointnet2_orthodontic_comparison/runs/
 all23_rgb_geodesic_cascade/all23_rgb_geodesic_runs/
 all23_rgb_geodesic_cascade/result_summaries/
+agh_former_vnext_orthodontic_comparison/runs/
 
 # Heavy experiment/model files if created outside ignored run folders.
 *.pth

@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .alignment import apply_transform, rotate_vectors
-from .anatomy import NUM_LANDMARKS, heatmap_sigma_mm, roi_radius_mm
+from .anatomy import NUM_LANDMARKS, heatmap_sigma_mm, mirror_permutation, roi_radius_mm
 
 
 LANDMARK_RE = re.compile(
@@ -666,6 +666,7 @@ class RGBGeodesicDataset(Dataset):
         point_noise_mm=0.0,
         rgb_noise=0.0,
         point_dropout=0.0,
+        mirror_probability=0.0,
         center_jitter_mm=0.0,
         use_rgb=True,
         coarse_in_target_space=False,
@@ -692,6 +693,7 @@ class RGBGeodesicDataset(Dataset):
         self.point_noise_mm = float(point_noise_mm)
         self.rgb_noise = float(rgb_noise)
         self.point_dropout = float(point_dropout)
+        self.mirror_probability = float(mirror_probability)
         self.center_jitter_mm = float(center_jitter_mm)
         self.use_rgb = bool(use_rgb)
         self.coarse_in_target_space = bool(coarse_in_target_space)
@@ -787,6 +789,26 @@ class RGBGeodesicDataset(Dataset):
                 0.0,
                 1.0,
             )
+        roi_index = roi["roi_index"]
+        roi_mask = roi["roi_mask"]
+        heatmap_target = roi["heatmap_target"]
+        region_target = roi["region_target"]
+        oracle_error = roi["oracle_error"]
+        if self.training and self.mirror_probability > 0 and rng.random() < self.mirror_probability:
+            center_x = float(self.mean[0])
+            points[:, 0] = 2.0 * center_x - points[:, 0]
+            expert[:, 0] = 2.0 * center_x - expert[:, 0]
+            coarse[:, 0] = 2.0 * center_x - coarse[:, 0]
+            raw_features[:, :3] = points
+            raw_features[:, 9] *= -1.0
+            permutation = np.asarray(mirror_permutation(), dtype=np.int64)
+            expert = expert[permutation]
+            coarse = coarse[permutation]
+            roi_index = roi_index[permutation]
+            roi_mask = roi_mask[permutation]
+            heatmap_target = heatmap_target[permutation]
+            region_target = region_target[permutation]
+            oracle_error = oracle_error[permutation]
         if not self.use_rgb:
             raw_features[:, 3:9] = 0.0
 
@@ -794,7 +816,7 @@ class RGBGeodesicDataset(Dataset):
         if self.training and self.point_dropout > 0:
             vertex_mask = rng.random(len(points)) >= self.point_dropout
             # Every ROI retains a valid candidate; dropped vertices are excluded from edges and logits.
-            vertex_mask[roi["roi_index"][:, 0]] = True
+            vertex_mask[roi_index[:, 0]] = True
         features = ((raw_features - self.mean) / self.std).astype(np.float32)
         return {
             "sample_id": sample.sample_id,
@@ -807,11 +829,11 @@ class RGBGeodesicDataset(Dataset):
             "vertex_mask": torch.from_numpy(vertex_mask),
             "coarse": torch.from_numpy(coarse),
             "expert": torch.from_numpy(expert),
-            "roi_index": torch.from_numpy(roi["roi_index"].astype(np.int64)),
-            "roi_mask": torch.from_numpy(roi["roi_mask"].astype(np.bool_)),
-            "heatmap_target": torch.from_numpy(roi["heatmap_target"].astype(np.float32)),
-            "region_target": torch.from_numpy(roi["region_target"].astype(np.float32)),
-            "oracle_error": torch.from_numpy(roi["oracle_error"].astype(np.float32)),
+            "roi_index": torch.from_numpy(roi_index.astype(np.int64)),
+            "roi_mask": torch.from_numpy(roi_mask.astype(np.bool_)),
+            "heatmap_target": torch.from_numpy(heatmap_target.astype(np.float32)),
+            "region_target": torch.from_numpy(region_target.astype(np.float32)),
+            "oracle_error": torch.from_numpy(oracle_error.astype(np.float32)),
             "sample_radius_scale": torch.tensor(sample_radius_scale, dtype=torch.float32),
         }
 

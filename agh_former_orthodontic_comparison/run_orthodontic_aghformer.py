@@ -372,17 +372,17 @@ def parse_indices(text):
 
 def build_anatomical_adjacency(num_landmarks, symmetry_pairs, midline_indices):
     adjacency = torch.eye(num_landmarks, dtype=torch.float32)
-    groups = [
-        list(range(0, 5)),
-        list(range(5, 10)),
-        list(range(10, 18)),
-        list(range(18, 23)),
+    canonical_edges = [
+        *[(index, index + 1) for index in range(12)],
+        (1, 13), (1, 16), (2, 14), (2, 15),
+        (3, 17), (3, 18), (5, 17), (5, 18),
+        (7, 19), (7, 20), (10, 21), (10, 22),
+        (11, 21), (11, 22), (12, 21), (12, 22),
     ]
-    for group in groups:
-        for i in group:
-            for j in group:
-                if i < num_landmarks and j < num_landmarks:
-                    adjacency[i, j] = 1.0
+    for i, j in canonical_edges:
+        if i < num_landmarks and j < num_landmarks:
+            adjacency[i, j] = 1.0
+            adjacency[j, i] = 1.0
     for i, j in symmetry_pairs:
         if i < num_landmarks and j < num_landmarks:
             adjacency[i, j] = 1.0
@@ -1198,8 +1198,8 @@ def main():
     parser.add_argument("--clinical-weight", type=float, default=0.05)
     parser.add_argument("--uncertainty-weight", type=float, default=0.02)
     parser.add_argument("--clinical-threshold-mm", type=float, default=2.0)
-    parser.add_argument("--symmetry-pairs", default="1-2,3-4,7-8,10-11,12-13,14-15,16-17,19-20,21-22")
-    parser.add_argument("--midline-indices", default="0,5,6,9,18")
+    parser.add_argument("--symmetry-pairs", default="13-16,14-15,17-18,19-20,21-22")
+    parser.add_argument("--midline-indices", default="0,1,2,3,4,5,6,7,8,9,10,11,12")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=4)

@@ -130,17 +130,17 @@ def build_features(split, normalizer=None, feature_mode="full"):
         normalizer = {"mean": mean, "std": std, "feature_mode": feature_mode}
     flat_norm = (flat - normalizer["mean"]) / normalizer["std"]
     pairs = [
-        (1, 2),
-        (3, 4),
-        (5, 6),
-        (7, 8),
-        (9, 10),
-        (11, 12),
-        (13, 14),
-        (15, 16),
+        (13, 16),
+        (14, 15),
         (17, 18),
         (19, 20),
         (21, 22),
+        (0, 2),
+        (2, 3),
+        (3, 5),
+        (5, 7),
+        (7, 10),
+        (10, 12),
     ]
     ones = np.ones((len(points), 1), dtype=np.float64)
     parts = [ones, flat_norm]

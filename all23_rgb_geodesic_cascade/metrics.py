@@ -139,13 +139,23 @@ def prediction_rows(outputs, confidence):
                 "landmark": landmark,
                 "landmark_name": LANDMARK_NAMES[landmark],
             }
-            for name in ("expert", "coarse", "refined", "prediction"):
+            coordinate_names = ["expert", "coarse", "refined", "prediction"]
+            if "stage1_coarse" in outputs:
+                coordinate_names.append("stage1_coarse")
+            if "neural_prediction" in outputs:
+                coordinate_names.append("neural_prediction")
+            for name in coordinate_names:
                 for axis_index, axis in enumerate(("x", "y", "z")):
                     row[f"{name}_{axis}"] = float(outputs[name][sample_index, landmark, axis_index])
             row["error"] = float(outputs["errors"][sample_index, landmark])
             row["confidence"] = float(confidence[sample_index, landmark])
             row["refinement_alpha"] = float(
                 outputs["refinement_alpha"][sample_index, landmark]
+            )
+            row["fusion_alpha"] = float(
+                outputs.get("fusion_alpha", np.zeros_like(outputs["refinement_alpha"]))[
+                    sample_index, landmark
+                ]
             )
             row["oracle_error"] = float(outputs["oracle"][sample_index, landmark])
             rows.append(row)
@@ -154,6 +164,7 @@ def prediction_rows(outputs, confidence):
 
 def save_evaluation(output_dir, split_name, outputs, calibration, bootstrap_iterations=2000, seed=42):
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     errors = outputs["errors"]
     refined_errors = outputs["refined_errors"]
     coarse_errors = localization_errors(outputs["coarse"], outputs["expert"])
@@ -188,6 +199,17 @@ def save_evaluation(output_dir, split_name, outputs, calibration, bootstrap_iter
         },
         "confidence_calibration": calibration,
     }
+    if "stage1_coarse" in outputs:
+        stage1_errors = localization_errors(outputs["stage1_coarse"], outputs["expert"])
+        metrics["stage1_coarse_overall"] = summarize(stage1_errors)
+        metrics["stage1_coarse_core20"] = summarize(stage1_errors[:, CORE20])
+        metrics["stage1_coarse_hard3"] = summarize(stage1_errors[:, HARD3])
+    if "fusion_alpha" in outputs:
+        metrics["coarse_fusion"] = {
+            "mean_alpha": float(np.mean(outputs["fusion_alpha"])),
+            "core20_mean_alpha": float(np.mean(outputs["fusion_alpha"][:, CORE20])),
+            "hard3_mean_alpha": float(np.mean(outputs["fusion_alpha"][:, HARD3])),
+        }
     (output_dir / f"metrics_{split_name}.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     write_csv(output_dir / f"landmark_metrics_{split_name}.csv", landmark_rows(errors))
     write_csv(output_dir / f"group_metrics_{split_name}.csv", group_rows(errors, outputs["classes"], outputs["genders"]))

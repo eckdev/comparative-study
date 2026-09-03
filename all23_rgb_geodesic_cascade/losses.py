@@ -210,7 +210,7 @@ def hard_candidate_ranking_loss(
 def sample_specific_gate_loss(outputs, batch, hard_landmark_weight=4.0):
     """Train a frozen-refiner gate to choose/blend coarse and refined outputs."""
     expert = batch["expert"].float()
-    coarse = batch["coarse"].float()
+    coarse = outputs.get("gate_coarse", batch["coarse"]).float()
     refined = outputs["refined_coordinates"].float().detach()
     alpha = outputs["refinement_alpha"].float()
     gate_logits = outputs["refinement_gate_logits"].float()
@@ -312,7 +312,7 @@ def compute_loss(
         and "refined_coordinates" in outputs
         and outputs["refinement_alpha"].requires_grad
     ):
-        external_coarse = batch["coarse"].float()
+        external_coarse = outputs.get("gate_coarse", batch["coarse"]).float()
         refined = outputs["refined_coordinates"].float().detach()
         direction = refined - external_coarse
         denominator = direction.pow(2).sum(dim=-1)
