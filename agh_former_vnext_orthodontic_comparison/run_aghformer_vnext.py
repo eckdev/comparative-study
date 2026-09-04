@@ -20,6 +20,12 @@ from agh_former_vnext_orthodontic_comparison.hard3_structured import (
     fit_or_load_hard3_refiner,
 )
 from agh_former_vnext_orthodontic_comparison.shape_prior import TrainOnlyShapePrior
+from hard3_anatomical_context_refinement import (
+    Hard3DualViewConfig,
+    apply_dual_view_blend,
+    calibrate_dual_view_blend,
+    fit_or_load_dual_view_refiner,
+)
 from all23_rgb_geodesic_cascade.anatomy import (
     ANATOMICAL_EDGES,
     CORE20,
@@ -105,6 +111,12 @@ def build_parser():
         "--no-hard3-structured", dest="hard3_structured", action="store_false"
     )
     parser.set_defaults(hard3_structured=True)
+    parser.add_argument(
+        "--hard3-refiner-mode",
+        choices=("dual_view", "structured"),
+        default="dual_view",
+        help="dual_view uses anatomy-specific RGB-depth patches; structured keeps the legacy point ranker",
+    )
     parser.add_argument("--hard3-structured-folds", type=int, default=5)
     parser.add_argument("--hard3-structured-epochs", type=int, default=70)
     parser.add_argument("--hard3-structured-min-epochs", type=int, default=20)
@@ -125,7 +137,7 @@ def build_parser():
     parser.add_argument("--hard3-structured-max-step-lm0", type=float, default=12.0)
     parser.add_argument("--hard3-structured-max-step-gonion", type=float, default=15.0)
     parser.add_argument("--hard3-structured-min-overall-gain-mm", type=float, default=0.03)
-    parser.add_argument("--hard3-structured-min-hard3-gain-mm", type=float, default=0.15)
+    parser.add_argument("--hard3-structured-min-hard3-gain-mm", type=float, default=0.20)
     parser.add_argument(
         "--hard3-structured-min-improvement-probability", type=float, default=0.90
     )
@@ -133,7 +145,35 @@ def build_parser():
         "--hard3-structured-max-p95-regression-mm", type=float, default=0.10
     )
     parser.add_argument("--hard3-stage3-full-cv-max-overall", type=float, default=2.25)
-    parser.add_argument("--hard3-stage3-full-cv-max-hard3", type=float, default=4.50)
+    parser.add_argument("--hard3-stage3-full-cv-max-hard3", type=float, default=4.00)
+    parser.add_argument("--hard3-dual-view-folds", type=int, default=5)
+    parser.add_argument("--hard3-dual-view-epochs", type=int, default=90)
+    parser.add_argument("--hard3-dual-view-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-dual-view-patience", type=int, default=15)
+    parser.add_argument("--hard3-dual-view-batch-size", type=int, default=8)
+    parser.add_argument("--hard3-dual-view-image-size", type=int, default=64)
+    parser.add_argument("--hard3-dual-view-width", type=int, default=24)
+    parser.add_argument("--hard3-dual-view-dropout", type=float, default=0.10)
+    parser.add_argument("--hard3-dual-view-radius-scale", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-translation-pixels", type=int, default=4)
+    parser.add_argument("--hard3-dual-view-color-noise", type=float, default=0.025)
+    parser.add_argument("--hard3-dual-view-lr", type=float, default=3e-4)
+    parser.add_argument("--hard3-dual-view-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hard3-dual-view-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-sigma-lm0", type=float, default=3.0)
+    parser.add_argument("--hard3-dual-view-sigma-gonion", type=float, default=4.0)
+    parser.add_argument("--hard3-dual-view-heatmap-weight", type=float, default=1.0)
+    parser.add_argument("--hard3-dual-view-poss-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-dual-view-poss-exponent", type=float, default=2.0)
+    parser.add_argument("--hard3-dual-view-poss-temperature", type=float, default=0.1)
+    parser.add_argument("--hard3-dual-view-ranking-weight", type=float, default=0.5)
+    parser.add_argument("--hard3-dual-view-coordinate-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-dual-view-pair-weight", type=float, default=0.10)
+    parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
+    parser.add_argument("--hard3-dual-view-atlas-neighbors", type=int, default=8)
+    parser.add_argument("--hard3-dual-view-atlas-temperature", type=float, default=2.0)
+    parser.add_argument("--hard3-dual-view-final-members", type=int, default=3)
+    parser.add_argument("--hard3-dual-view-target-ale", type=float, default=4.0)
     parser.add_argument("--no-tta", dest="tta", action="store_false")
     parser.add_argument(
         "--no-tta-validation", dest="tta_validation", action="store_false"
@@ -198,6 +238,47 @@ def hard3_config_from_args(args):
     )
 
 
+def hard3_dual_view_config_from_args(args):
+    return Hard3DualViewConfig(
+        folds=args.hard3_dual_view_folds,
+        epochs=args.hard3_dual_view_epochs,
+        min_epochs=args.hard3_dual_view_min_epochs,
+        patience=args.hard3_dual_view_patience,
+        batch_size=args.hard3_dual_view_batch_size,
+        image_size=args.hard3_dual_view_image_size,
+        width=args.hard3_dual_view_width,
+        dropout=args.hard3_dual_view_dropout,
+        radius_scale=args.hard3_dual_view_radius_scale,
+        translation_pixels=args.hard3_dual_view_translation_pixels,
+        color_noise=args.hard3_dual_view_color_noise,
+        lr=args.hard3_dual_view_lr,
+        weight_decay=args.hard3_dual_view_weight_decay,
+        grad_clip=args.hard3_dual_view_grad_clip,
+        sigma_lm0=args.hard3_dual_view_sigma_lm0,
+        sigma_gonion=args.hard3_dual_view_sigma_gonion,
+        heatmap_weight=args.hard3_dual_view_heatmap_weight,
+        poss_weight=args.hard3_dual_view_poss_weight,
+        poss_exponent=args.hard3_dual_view_poss_exponent,
+        poss_temperature=args.hard3_dual_view_poss_temperature,
+        ranking_weight=args.hard3_dual_view_ranking_weight,
+        coordinate_weight=args.hard3_dual_view_coordinate_weight,
+        pair_weight=args.hard3_dual_view_pair_weight,
+        negative_weight=args.hard3_dual_view_negative_weight,
+        atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
+        atlas_temperature=args.hard3_dual_view_atlas_temperature,
+        final_ensemble_members=args.hard3_dual_view_final_members,
+        maximum_step_lm0=args.hard3_structured_max_step_lm0,
+        maximum_step_gonion=args.hard3_structured_max_step_gonion,
+        bootstrap_iters=args.bootstrap_iters,
+        minimum_overall_gain_mm=args.hard3_structured_min_overall_gain_mm,
+        minimum_hard3_gain_mm=args.hard3_structured_min_hard3_gain_mm,
+        minimum_improvement_probability=args.hard3_structured_min_improvement_probability,
+        maximum_p95_regression_mm=args.hard3_structured_max_p95_regression_mm,
+        target_hard3_ale=args.hard3_dual_view_target_ale,
+        seed=args.seed,
+    )
+
+
 def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
     baseline_overall = float(baseline_metrics["overall"]["ale"])
     baseline_hard3 = float(baseline_metrics["hard3"]["ale"])
@@ -213,7 +294,13 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             final_overall <= args.hard3_stage3_full_cv_max_overall
         ),
         "hard3_at_or_below_full_cv_gate": bool(
-            final_hard3 <= args.hard3_stage3_full_cv_max_hard3
+            final_hard3 < args.hard3_stage3_full_cv_max_hard3
+        ),
+        "hard3_validation_target_reached": bool(
+            hard3_report.get("blend", {}).get(
+                "target_reached_on_validation",
+                final_hard3 < args.hard3_stage3_full_cv_max_hard3,
+            )
         ),
         "core20_unchanged_by_stage3": bool(
             abs(
@@ -448,34 +535,49 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     hard3_refiner = None
     hard3_policy = None
+    hard3_apply = None
+    hard3_output_dir = None
     hard3_report = {"enabled": False, "reason": "disabled_by_argument"}
     if args.hard3_structured:
-        hard3_dir = fold_dir / "hard3_structured"
-        hard3_config = hard3_config_from_args(args)
-        hard3_refiner = fit_or_load_hard3_refiner(
-            datasets["train"], hard3_dir, hard3_config, device
-        )
+        if args.hard3_refiner_mode == "dual_view":
+            hard3_output_dir = fold_dir / "hard3_dual_view"
+            hard3_config = hard3_dual_view_config_from_args(args)
+            hard3_refiner = fit_or_load_dual_view_refiner(
+                datasets["train"], hard3_output_dir, hard3_config, device
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], validation, "Hard3 validation dual-view patches"
+            )
+            hard3_policy = calibrate_dual_view_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_dual_view_blend
+        else:
+            hard3_output_dir = fold_dir / "hard3_structured"
+            hard3_config = hard3_config_from_args(args)
+            hard3_refiner = fit_or_load_hard3_refiner(
+                datasets["train"], hard3_output_dir, hard3_config, device
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], "Hard3 validation descriptors"
+            )
+            hard3_policy = calibrate_hard3_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_hard3_blend
         hard3_parameter_count = int(
             hard3_refiner.report["parameter_count_per_member"]
             * hard3_refiner.report["ensemble_members"]
         )
-        hard3_validation = hard3_refiner.predict(
-            datasets["val"], "Hard3 validation descriptors"
-        )
-        hard3_policy = calibrate_hard3_blend(
-            validation, hard3_validation, hard3_config
-        )
-        (hard3_dir / "hard3_blend_selection.json").write_text(
+        (hard3_output_dir / "hard3_blend_selection.json").write_text(
             json.dumps(hard3_policy, indent=2), encoding="utf-8"
         )
-        validation = apply_hard3_blend(
-            validation, hard3_validation, hard3_policy
-        )
+        validation = hard3_apply(validation, hard3_validation, hard3_policy)
         hard3_calibration = calibrate_confidence(
             validation["log_var"], validation["errors"]
         )
         hard3_validation_metrics = save_evaluation(
-            hard3_dir,
+            hard3_output_dir,
             "val",
             validation,
             hard3_calibration,
@@ -484,19 +586,23 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         )
         hard3_report = {
             "enabled": True,
+            "mode": args.hard3_refiner_mode,
             "training": hard3_refiner.report,
             "blend": hard3_policy,
             "validation": hard3_validation_metrics,
         }
         print(
-            "Hard3 structured refinement: "
+            f"Hard3 {args.hard3_refiner_mode} refinement: "
             f"accepted={hard3_policy['accepted']} "
             f"mode={hard3_policy['selected']['confidence_mode']} "
             f"alpha=({hard3_policy['selected']['alpha_lm0']:.2f},"
             f"{hard3_policy['selected']['alpha_gonion']:.2f}) "
             f"hard3={hard3_policy['base_hard3']['ale']:.4f}->"
             f"{hard3_policy['blended_hard3']['ale']:.4f} "
-            f"overall_gain={hard3_policy['overall_gain_mm']:.4f}",
+            f"overall_gain={hard3_policy['overall_gain_mm']:.4f} "
+            f"target4={hard3_policy.get('target_reached_on_validation', False)} "
+            f"candidate=({hard3_policy['selected'].get('lm0_variant', 'legacy')},"
+            f"{hard3_policy['selected'].get('gonion_variant', 'legacy')})",
             flush=True,
         )
     calibration = calibrate_confidence(validation["log_var"], validation["errors"])
@@ -528,7 +634,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     if args.validation_only:
         result = {
-            "postprocess_version": 1,
+            "postprocess_version": 2,
             "stage2_signature": args.stage2_signature,
             "parameter_count": parameter_count,
             "total_inference_parameter_count": parameter_count
@@ -586,12 +692,17 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     hard3_test_metrics = None
     if hard3_refiner is not None:
-        hard3_test = hard3_refiner.predict(
-            datasets["test"], "Hard3 test descriptors"
-        )
-        test = apply_hard3_blend(test, hard3_test, hard3_policy)
+        if args.hard3_refiner_mode == "dual_view":
+            hard3_test = hard3_refiner.predict(
+                datasets["test"], test, "Hard3 test dual-view patches"
+            )
+        else:
+            hard3_test = hard3_refiner.predict(
+                datasets["test"], "Hard3 test descriptors"
+            )
+        test = hard3_apply(test, hard3_test, hard3_policy)
         hard3_test_metrics = save_evaluation(
-            fold_dir / "hard3_structured",
+            hard3_output_dir,
             "test",
             test,
             hard3_calibration,
@@ -607,7 +718,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         args.seed,
     )
     result = {
-        "postprocess_version": 1,
+        "postprocess_version": 2,
         "stage2_signature": args.stage2_signature,
         "parameter_count": parameter_count,
         "total_inference_parameter_count": parameter_count
@@ -706,14 +817,30 @@ def load_completed_fold(fold_dir, args, splits):
     if result.get("stage2_signature") != vnext_signature(args, splits):
         return None
     if args.hard3_structured:
+        hard3_mode = getattr(args, "hard3_refiner_mode", "structured")
+        if hard3_mode == "dual_view":
+            hard3_root = fold_dir / "hard3_dual_view"
+            checkpoint = hard3_root / "hard3_dual_view_model.pth"
+        else:
+            hard3_root = fold_dir / "hard3_structured"
+            checkpoint = hard3_root / "hard3_structured_model.pth"
         hard3_required = (
-            fold_dir / "hard3_structured" / "hard3_structured_model.pth",
-            fold_dir / "hard3_structured" / "metrics_val.json",
-            fold_dir / "hard3_structured" / "metrics_test.json",
+            checkpoint,
+            hard3_root / "metrics_val.json",
+            hard3_root / "metrics_test.json",
+        )
+        valid_postprocess_version = (
+            result.get("postprocess_version") == 2
+            if hard3_mode == "dual_view"
+            else result.get("postprocess_version") in (1, 2)
+        )
+        stored_mode = result.get("hard3_structured", {}).get(
+            "mode", "structured"
         )
         if (
-            result.get("postprocess_version") != 1
+            not valid_postprocess_version
             or not result.get("hard3_structured", {}).get("enabled", False)
+            or stored_mode != hard3_mode
             or not all(path.exists() for path in hard3_required)
         ):
             print(

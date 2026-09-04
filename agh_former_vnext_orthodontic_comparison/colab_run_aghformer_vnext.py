@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -14,6 +15,25 @@ PREPROCESSING_ROOT = Path(
     "/content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/"
     "publication_cv_stage1_v4_seed42"
 )
+
+
+def require_hard3_development_gate(output_dir):
+    decision_path = Path(output_dir) / "fold_1/hard3_stage3_decision.json"
+    if not decision_path.exists():
+        raise RuntimeError(
+            "Fold 1 Hard3 gate is missing. Run --preset hard3_fold1 before --preset cv: "
+            f"{decision_path}"
+        )
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    if not decision.get("run_full_cv", False):
+        failed = [
+            name for name, passed in decision.get("checks", {}).items() if not passed
+        ]
+        raise RuntimeError(
+            "Fold 1 Hard3 gate failed; full CV is intentionally blocked. "
+            f"Failed checks: {failed or ['run_full_cv']}"
+        )
+    return decision
 
 
 def command_for(preset, seed, fold_indices):
@@ -101,6 +121,24 @@ def command_for(preset, seed, fold_indices):
             "16",
             "--hard3-structured-pair-topk",
             "4",
+            "--hard3-refiner-mode",
+            "dual_view",
+            "--hard3-dual-view-folds",
+            "2",
+            "--hard3-dual-view-epochs",
+            "2",
+            "--hard3-dual-view-min-epochs",
+            "1",
+            "--hard3-dual-view-patience",
+            "1",
+            "--hard3-dual-view-batch-size",
+            "4",
+            "--hard3-dual-view-image-size",
+            "32",
+            "--hard3-dual-view-width",
+            "8",
+            "--hard3-dual-view-final-members",
+            "1",
             "--skip-oracle-gate",
             "--max-stage2-val-ale",
             "200",
@@ -164,6 +202,8 @@ def command_for(preset, seed, fold_indices):
         "60",
         "--stage1-patience",
         "20",
+        "--hard3-refiner-mode",
+        "dual_view",
     ]
     if PREPROCESSING_ROOT.exists():
         command.extend(["--preprocessing-root", str(PREPROCESSING_ROOT)])
@@ -190,6 +230,10 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {DATA_ROOT}")
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     command = command_for(args.preset, args.seed, args.fold_indices)
+    if args.preset == "cv":
+        require_hard3_development_gate(
+            RUN_ROOT / f"publication_cv_seed{args.seed}"
+        )
     print("Working directory:", CODE_ROOT, flush=True)
     print("Running:", " ".join(map(str, command)), flush=True)
     environment = os.environ.copy()

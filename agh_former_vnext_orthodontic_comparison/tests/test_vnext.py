@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from agh_former_vnext_orthodontic_comparison.hard3_structured import (
@@ -21,6 +22,9 @@ from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import (
     build_stage3_decision,
     load_completed_fold,
     vnext_signature,
+)
+from agh_former_vnext_orthodontic_comparison.colab_run_aghformer_vnext import (
+    require_hard3_development_gate,
 )
 from agh_former_vnext_orthodontic_comparison.shape_prior import TrainOnlyShapePrior
 from all23_rgb_geodesic_cascade.anatomy import CORE20, MIDLINE, SYMMETRY_PAIRS
@@ -373,3 +377,28 @@ def test_stage3_decision_exposes_two_mm_hard3_budget():
     ) < 1e-9
     assert decision["run_full_cv"] is True
     assert decision["test_labels_consumed"] is False
+
+
+def test_colab_full_cv_requires_passing_hard3_gate(tmp_path):
+    fold = tmp_path / "fold_1"
+    fold.mkdir()
+    decision_path = fold / "hard3_stage3_decision.json"
+    decision_path.write_text(
+        json.dumps(
+            {
+                "run_full_cv": False,
+                "checks": {
+                    "hard3_at_or_below_full_cv_gate": False,
+                    "core20_unchanged_by_stage3": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="intentionally blocked"):
+        require_hard3_development_gate(tmp_path)
+    decision_path.write_text(
+        json.dumps({"run_full_cv": True, "checks": {"target": True}}),
+        encoding="utf-8",
+    )
+    assert require_hard3_development_gate(tmp_path)["run_full_cv"] is True
