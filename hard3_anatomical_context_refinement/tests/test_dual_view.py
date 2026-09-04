@@ -138,7 +138,7 @@ def test_joint_pair_decoder_uses_both_gonion_candidate_sets():
 def test_joint_pair_decoder_is_finite_when_topk_contains_padding():
     torch.manual_seed(27)
     model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=6)
-    logits = torch.randn(2, 3, 8)
+    logits = torch.randn(2, 3, 8, requires_grad=True)
     canonical = torch.randn(2, 3, 8, 18)
     points = torch.randn(2, 3, 8, 3)
     mask = torch.zeros(2, 3, 8, dtype=torch.bool)
@@ -146,6 +146,11 @@ def test_joint_pair_decoder_is_finite_when_topk_contains_padding():
     pair = model.gonion_pair(logits, canonical, points, mask)
     assert torch.isfinite(pair["logits"][pair["mask"]]).all()
     assert torch.isfinite(pair["soft_coordinate"]).all()
+    objective = (
+        pair["logits"][pair["mask"]].mean() + pair["soft_coordinate"].square().mean()
+    )
+    objective.backward()
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_tiny_joint_pair_training_and_inference_complete():

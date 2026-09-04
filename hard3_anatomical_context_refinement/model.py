@@ -145,15 +145,14 @@ class DualViewHard3Net(nn.Module):
     def _masked_standardize(values, mask):
         valid = mask.to(values.dtype)
         count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        mean = (values.masked_fill(~mask, 0.0) * valid).sum(
-            dim=-1, keepdim=True
-        ) / count
-        variance = (((values - mean).masked_fill(~mask, 0.0) ** 2) * valid).sum(
-            dim=-1, keepdim=True
-        ) / count
-        return ((values - mean) / torch.sqrt(variance + 1e-4)).masked_fill(
-            ~mask, -torch.inf
-        )
+        # candidate_logits intentionally contains -inf at padded vertices. They
+        # must be removed before subtraction/division; masking only afterwards
+        # leaves an inf intermediate whose backward pass can produce NaN.
+        safe = values.masked_fill(~mask, 0.0)
+        mean = (safe * valid).sum(dim=-1, keepdim=True) / count
+        centered = (safe - mean) * valid
+        variance = (centered.square()).sum(dim=-1, keepdim=True) / count
+        return (centered / torch.sqrt(variance + 1e-4)).masked_fill(~mask, -torch.inf)
 
     def forward_with_context(self, images):
         batch, landmarks, views, channels, height, width = images.shape
