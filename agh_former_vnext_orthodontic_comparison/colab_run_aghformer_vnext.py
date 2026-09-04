@@ -37,7 +37,9 @@ def require_hard3_development_gate(output_dir):
 
 
 def command_for(preset, seed, fold_indices):
-    script = CODE_ROOT / "agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py"
+    script = (
+        CODE_ROOT / "agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py"
+    )
     common = [
         sys.executable,
         "-u",
@@ -137,6 +139,8 @@ def command_for(preset, seed, fold_indices):
             "32",
             "--hard3-dual-view-width",
             "8",
+            "--hard3-dual-view-pair-topk",
+            "8",
             "--hard3-dual-view-final-members",
             "1",
             "--skip-oracle-gate",
@@ -231,9 +235,7 @@ def main():
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     command = command_for(args.preset, args.seed, args.fold_indices)
     if args.preset == "cv":
-        require_hard3_development_gate(
-            RUN_ROOT / f"publication_cv_seed{args.seed}"
-        )
+        require_hard3_development_gate(RUN_ROOT / f"publication_cv_seed{args.seed}")
     print("Working directory:", CODE_ROOT, flush=True)
     print("Running:", " ".join(map(str, command)), flush=True)
     environment = os.environ.copy()

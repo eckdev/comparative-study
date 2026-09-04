@@ -19,6 +19,7 @@ class DualViewCandidateSet:
     targets: np.ndarray
     grids: np.ndarray
     points: np.ndarray
+    canonical: np.ndarray
     mask: np.ndarray
     expert: np.ndarray
     expert_full: np.ndarray
@@ -134,7 +135,9 @@ def _target_heatmap(expert_relative, axes, radius, image_size, sigma_mm):
     )
 
 
-def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_scale=1.0, centers=None):
+def render_item(
+    item, normalizer_mean, normalizer_std, image_size=64, radius_scale=1.0, centers=None
+):
     points = item["points"].numpy().astype(np.float32)
     normalized = item["features"].numpy().astype(np.float32)
     raw = normalized * np.asarray(normalizer_std, dtype=np.float32) + np.asarray(
@@ -147,8 +150,8 @@ def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_sca
     roi_index = item["roi_index"].numpy().astype(np.int64)[list(HARD3)]
     roi_mask = item["roi_mask"].numpy().astype(bool)[list(HARD3)]
 
-    origin, frame, _ = _canonical_frame(centers)
-    images, targets, grids, target_view_masks = [], [], [], []
+    origin, frame, face_scale = _canonical_frame(centers)
+    images, targets, grids, canonical_rows, target_view_masks = [], [], [], [], []
     candidate_points = points[roi_index]
     for local_index, landmark in enumerate(HARD3):
         indices = roi_index[local_index]
@@ -156,12 +159,38 @@ def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_sca
         selected = points[indices]
         side = _side_sign(landmark, centers, origin, frame)
         relative = (selected - centers[landmark]) @ frame
+        global_relative = (selected - origin) @ frame
         expert_relative = (expert_full[landmark] - centers[landmark]) @ frame
         normal = raw[indices, 9:12] @ frame
         if landmark in (21, 22):
             relative[:, 0] *= side
+            global_relative[:, 0] *= side
             expert_relative[0] *= side
             normal[:, 0] *= side
+
+        # The bilateral decoder must compare both Gonion candidates in the same
+        # mirrored coordinate system.  LM10-12 are stable lower-midline anchors;
+        # unlike an atlas coordinate they are available at inference from the
+        # frozen all-23 prediction and do not expose expert labels.
+        local_geometry = relative / max(
+            float(roi_radius_mm(landmark)) * float(radius_scale), 1e-4
+        )
+        global_geometry = global_relative / max(float(face_scale), 1e-4)
+        anchor_geometry = []
+        for anchor in (10, 11, 12):
+            anchor_vector = ((selected - centers[anchor]) @ frame) / max(
+                float(face_scale), 1e-4
+            )
+            if landmark in (21, 22):
+                anchor_vector[:, 0] *= side
+            anchor_geometry.extend(
+                [anchor_vector, np.linalg.norm(anchor_vector, axis=1, keepdims=True)]
+            )
+        canonical_rows.append(
+            np.concatenate(
+                [local_geometry, global_geometry, *anchor_geometry], axis=1
+            ).astype(np.float32)
+        )
 
         rgb = np.clip(raw[indices, 3:6], 0.0, 1.0)
         contrast = raw[indices, 6:9]
@@ -193,7 +222,12 @@ def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_sca
             )
             mask[nearest] = True
         roi_mask[local_index] = mask
-        landmark_images, landmark_targets, landmark_grids, landmark_target_masks = [], [], [], []
+        landmark_images, landmark_targets, landmark_grids, landmark_target_masks = (
+            [],
+            [],
+            [],
+            [],
+        )
         # Frontal view (lateral/vertical) and side view (depth/vertical).
         for view_code, axes in enumerate(((0, 1, 2), (2, 1, 0))):
             landmark_images.append(
@@ -237,6 +271,7 @@ def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_sca
         np.asarray(targets, dtype=np.float16),
         np.asarray(grids, dtype=np.float32),
         candidate_points.astype(np.float32),
+        np.asarray(canonical_rows, dtype=np.float32),
         roi_mask,
         expert,
         expert_full,
@@ -245,10 +280,12 @@ def render_item(item, normalizer_mean, normalizer_std, image_size=64, radius_sca
     )
 
 
-def extract_dual_view_set(dataset, image_size=64, radius_scale=1.0, centers_by_id=None, label="Hard3 patches"):
+def extract_dual_view_set(
+    dataset, image_size=64, radius_scale=1.0, centers_by_id=None, label="Hard3 patches"
+):
     previous_training = dataset.training
     dataset.training = False
-    rows = [[] for _ in range(9)]
+    rows = [[] for _ in range(10)]
     sample_ids, strata = [], []
     try:
         for index in range(len(dataset)):
@@ -279,9 +316,10 @@ def extract_dual_view_set(dataset, image_size=64, radius_scale=1.0, centers_by_i
         targets=np.stack(rows[1]),
         grids=np.stack(rows[2]),
         points=np.stack(rows[3]),
-        mask=np.stack(rows[4]),
-        expert=np.stack(rows[5]),
-        expert_full=np.stack(rows[6]),
-        target_distance=np.stack(rows[7]),
-        target_view_mask=np.stack(rows[8]),
+        canonical=np.stack(rows[4]),
+        mask=np.stack(rows[5]),
+        expert=np.stack(rows[6]),
+        expert_full=np.stack(rows[7]),
+        target_distance=np.stack(rows[8]),
+        target_view_mask=np.stack(rows[9]),
     )

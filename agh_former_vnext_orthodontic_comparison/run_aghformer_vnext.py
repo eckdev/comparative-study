@@ -105,7 +105,9 @@ def build_parser():
     parser.set_defaults(shape_prior=True)
     parser.add_argument("--shape-prior-components", default="6,10,15,20,30")
     parser.add_argument("--shape-prior-l2", default="0.1,1,10,100")
-    parser.add_argument("--shape-prior-max-core-regression-mm", type=float, default=0.03)
+    parser.add_argument(
+        "--shape-prior-max-core-regression-mm", type=float, default=0.03
+    )
     parser.add_argument("--shape-prior-min-val-gain-mm", type=float, default=0.01)
     parser.add_argument(
         "--no-hard3-structured", dest="hard3_structured", action="store_false"
@@ -130,14 +132,20 @@ def build_parser():
     parser.add_argument("--hard3-structured-grad-clip", type=float, default=1.0)
     parser.add_argument("--hard3-structured-sigma-lm0", type=float, default=2.5)
     parser.add_argument("--hard3-structured-sigma-gonion", type=float, default=3.0)
-    parser.add_argument("--hard3-structured-coordinate-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--hard3-structured-coordinate-weight", type=float, default=0.25
+    )
     parser.add_argument("--hard3-structured-negative-weight", type=float, default=0.15)
     parser.add_argument("--hard3-structured-negative-margin", type=float, default=0.5)
     parser.add_argument("--hard3-structured-feature-noise", type=float, default=0.02)
     parser.add_argument("--hard3-structured-max-step-lm0", type=float, default=12.0)
     parser.add_argument("--hard3-structured-max-step-gonion", type=float, default=15.0)
-    parser.add_argument("--hard3-structured-min-overall-gain-mm", type=float, default=0.03)
-    parser.add_argument("--hard3-structured-min-hard3-gain-mm", type=float, default=0.20)
+    parser.add_argument(
+        "--hard3-structured-min-overall-gain-mm", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--hard3-structured-min-hard3-gain-mm", type=float, default=0.20
+    )
     parser.add_argument(
         "--hard3-structured-min-improvement-probability", type=float, default=0.90
     )
@@ -169,7 +177,16 @@ def build_parser():
     parser.add_argument("--hard3-dual-view-ranking-weight", type=float, default=0.5)
     parser.add_argument("--hard3-dual-view-coordinate-weight", type=float, default=0.25)
     parser.add_argument("--hard3-dual-view-pair-weight", type=float, default=0.10)
+    parser.add_argument("--hard3-dual-view-joint-pair-weight", type=float, default=0.75)
+    parser.add_argument(
+        "--hard3-dual-view-joint-pair-negative-weight", type=float, default=0.20
+    )
+    parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=32)
+    parser.add_argument("--hard3-dual-view-pair-temperature", type=float, default=0.5)
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--hard3-dual-view-gonion-color-dropout", type=float, default=0.25
+    )
     parser.add_argument("--hard3-dual-view-atlas-neighbors", type=int, default=8)
     parser.add_argument("--hard3-dual-view-atlas-temperature", type=float, default=2.0)
     parser.add_argument("--hard3-dual-view-final-members", type=int, default=3)
@@ -263,7 +280,12 @@ def hard3_dual_view_config_from_args(args):
         ranking_weight=args.hard3_dual_view_ranking_weight,
         coordinate_weight=args.hard3_dual_view_coordinate_weight,
         pair_weight=args.hard3_dual_view_pair_weight,
+        joint_pair_weight=args.hard3_dual_view_joint_pair_weight,
+        joint_pair_negative_weight=args.hard3_dual_view_joint_pair_negative_weight,
+        pair_topk=args.hard3_dual_view_pair_topk,
+        pair_temperature=args.hard3_dual_view_pair_temperature,
         negative_weight=args.hard3_dual_view_negative_weight,
+        gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
         atlas_temperature=args.hard3_dual_view_atlas_temperature,
         final_ensemble_members=args.hard3_dual_view_final_members,
@@ -303,10 +325,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             )
         ),
         "core20_unchanged_by_stage3": bool(
-            abs(
-                final_core20 - float(baseline_metrics["core20"]["ale"])
-            )
-            <= 1e-6
+            abs(final_core20 - float(baseline_metrics["core20"]["ale"])) <= 1e-6
         ),
     }
     return {
@@ -343,7 +362,9 @@ def train_shapes_from_dataset(dataset):
     for sample in dataset.samples:
         with np.load(dataset.records[sample.sample_id]) as record:
             if "landmarks" not in record.files:
-                raise RuntimeError(f"Outer-train record has no landmarks: {sample.sample_id}")
+                raise RuntimeError(
+                    f"Outer-train record has no landmarks: {sample.sample_id}"
+                )
             shapes.append(record["landmarks"].astype(np.float32))
         sample_ids.append(sample.sample_id)
     return np.stack(shapes), sample_ids
@@ -363,8 +384,14 @@ def fit_shape_prior(args, dataset, validation, fold_dir):
         return None, {"enabled": False, "reason": "disabled_by_argument"}
     train_shapes, train_ids = train_shapes_from_dataset(dataset)
     prior = TrainOnlyShapePrior(
-        component_grid=[int(value) for value in args.shape_prior_components.split(",") if value.strip()],
-        l2_grid=[float(value) for value in args.shape_prior_l2.split(",") if value.strip()],
+        component_grid=[
+            int(value)
+            for value in args.shape_prior_components.split(",")
+            if value.strip()
+        ],
+        l2_grid=[
+            float(value) for value in args.shape_prior_l2.split(",") if value.strip()
+        ],
     ).fit(train_shapes, train_ids)
     selected = prior.calibrate(
         validation["prediction"],
@@ -374,7 +401,9 @@ def fit_shape_prior(args, dataset, validation, fold_dir):
     )
     base_ale = float(validation["errors"].mean())
     candidate = prior.transform(validation["prediction"])
-    candidate_ale = float(np.linalg.norm(candidate - validation["expert"], axis=-1).mean())
+    candidate_ale = float(
+        np.linalg.norm(candidate - validation["expert"], axis=-1).mean()
+    )
     gain = base_ale - candidate_ale
     accepted = gain >= float(args.shape_prior_min_val_gain_mm)
     if not accepted:
@@ -596,7 +625,8 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             f"accepted={hard3_policy['accepted']} "
             f"mode={hard3_policy['selected']['confidence_mode']} "
             f"alpha=({hard3_policy['selected']['alpha_lm0']:.2f},"
-            f"{hard3_policy['selected']['alpha_gonion']:.2f}) "
+            f"{hard3_policy['selected'].get('alpha_gonion_left', hard3_policy['selected']['alpha_gonion']):.2f},"
+            f"{hard3_policy['selected'].get('alpha_gonion_right', hard3_policy['selected']['alpha_gonion']):.2f}) "
             f"hard3={hard3_policy['base_hard3']['ale']:.4f}->"
             f"{hard3_policy['blended_hard3']['ale']:.4f} "
             f"overall_gain={hard3_policy['overall_gain_mm']:.4f} "
@@ -634,11 +664,10 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     if args.validation_only:
         result = {
-            "postprocess_version": 2,
+            "postprocess_version": 3 if args.hard3_refiner_mode == "dual_view" else 2,
             "stage2_signature": args.stage2_signature,
             "parameter_count": parameter_count,
-            "total_inference_parameter_count": parameter_count
-            + hard3_parameter_count,
+            "total_inference_parameter_count": parameter_count + hard3_parameter_count,
             "training": training,
             "hard3_structured": hard3_report,
             "shape_prior": prior_report,
@@ -652,15 +681,29 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             json.dumps(result, indent=2), encoding="utf-8"
         )
         print("\nValidation-only; test labels remain sealed", flush=True)
-        print(f"All-23 validation ALE: {validation_metrics['overall']['ale']:.4f}", flush=True)
-        print(f"Core20 validation ALE: {validation_metrics['core20']['ale']:.4f}", flush=True)
-        print(f"Hard3 validation ALE: {validation_metrics['hard3']['ale']:.4f}", flush=True)
+        print(
+            f"All-23 validation ALE: {validation_metrics['overall']['ale']:.4f}",
+            flush=True,
+        )
+        print(
+            f"Core20 validation ALE: {validation_metrics['core20']['ale']:.4f}",
+            flush=True,
+        )
+        print(
+            f"Hard3 validation ALE: {validation_metrics['hard3']['ale']:.4f}",
+            flush=True,
+        )
         return result
 
-    print("Checkpoint and validation policies locked. Preparing final test ROIs...", flush=True)
+    print(
+        "Checkpoint and validation policies locked. Preparing final test ROIs...",
+        flush=True,
+    )
     for index in range(len(datasets["test"])):
         datasets["test"][index]
-        if args.no_tqdm and ((index + 1) % 10 == 0 or index + 1 == len(datasets["test"])):
+        if args.no_tqdm and (
+            (index + 1) % 10 == 0 or index + 1 == len(datasets["test"])
+        ):
             print(f"Test ROI {index + 1}/{len(datasets['test'])}", flush=True)
     test = collect_outputs(
         model,
@@ -718,11 +761,10 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         args.seed,
     )
     result = {
-        "postprocess_version": 2,
+        "postprocess_version": 3 if args.hard3_refiner_mode == "dual_view" else 2,
         "stage2_signature": args.stage2_signature,
         "parameter_count": parameter_count,
-        "total_inference_parameter_count": parameter_count
-        + hard3_parameter_count,
+        "total_inference_parameter_count": parameter_count + hard3_parameter_count,
         "training": training,
         "hard3_structured": {
             **hard3_report,
@@ -760,9 +802,7 @@ def aggregate(output_dir, summaries, elapsed):
         )
         training_seconds = (
             result["training"].get("training_seconds", 0.0)
-            + result["training"].get("separate_gate", {}).get(
-                "training_seconds", 0.0
-            )
+            + result["training"].get("separate_gate", {}).get("training_seconds", 0.0)
             + hard3_training_seconds
         )
         rows.append(
@@ -830,13 +870,11 @@ def load_completed_fold(fold_dir, args, splits):
             hard3_root / "metrics_test.json",
         )
         valid_postprocess_version = (
-            result.get("postprocess_version") == 2
+            result.get("postprocess_version") == 3
             if hard3_mode == "dual_view"
             else result.get("postprocess_version") in (1, 2)
         )
-        stored_mode = result.get("hard3_structured", {}).get(
-            "mode", "structured"
-        )
+        stored_mode = result.get("hard3_structured", {}).get("mode", "structured")
         if (
             not valid_postprocess_version
             or not result.get("hard3_structured", {}).get("enabled", False)
@@ -890,7 +928,9 @@ def main():
     if args.protocol == "fixed":
         if not args.splits_json:
             raise ValueError("--protocol fixed requires --splits-json")
-        fold_specs = [(1, 1, limit_splits(load_split_file(args.splits_json), args.max_samples))]
+        fold_specs = [
+            (1, 1, limit_splits(load_split_file(args.splits_json), args.max_samples))
+        ]
     else:
         fold_specs = []
         for repeat in range(1, args.cv_repeats + 1):
@@ -950,9 +990,7 @@ def main():
                 device,
                 preprocessing_dir,
             )
-        summaries.append(
-            {"repeat": repeat, "fold": fold_index, "result": result}
-        )
+        summaries.append({"repeat": repeat, "fold": fold_index, "result": result})
     if args.preflight_only:
         (output_dir / "preflight_complete.json").write_text(
             json.dumps({"complete": True, "fold_count": len(fold_specs)}, indent=2),

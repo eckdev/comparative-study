@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 from agh_former_vnext_orthodontic_comparison.hard3_structured import (
-    _blend_prediction,
     _decode_numpy,
     _decode_policy,
     _limited_hard3_candidate,
@@ -54,8 +53,13 @@ class Hard3DualViewConfig:
     ranking_weight: float = 0.5
     coordinate_weight: float = 0.25
     pair_weight: float = 0.10
+    joint_pair_weight: float = 0.75
+    joint_pair_negative_weight: float = 0.20
+    pair_topk: int = 32
+    pair_temperature: float = 0.5
     negative_weight: float = 0.15
     negative_margin: float = 0.5
+    gonion_color_dropout: float = 0.25
     atlas_neighbors: int = 8
     atlas_temperature: float = 2.0
     final_ensemble_members: int = 3
@@ -84,14 +88,19 @@ def _shift_without_wrap(values, shift_x, shift_y):
 
 
 def _tensor_batch(candidate_set, indices, device, config, training=False, rng=None):
-    images = torch.from_numpy(candidate_set.images[indices].astype(np.float32)).to(device)
-    targets = torch.from_numpy(candidate_set.targets[indices].astype(np.float32)).to(device)
+    images = torch.from_numpy(candidate_set.images[indices].astype(np.float32)).to(
+        device
+    )
+    targets = torch.from_numpy(candidate_set.targets[indices].astype(np.float32)).to(
+        device
+    )
     grids = torch.from_numpy(candidate_set.grids[indices]).to(device)
     result = {
         "images": images,
         "targets": targets,
         "grids": grids,
         "points": torch.from_numpy(candidate_set.points[indices]).to(device),
+        "canonical": torch.from_numpy(candidate_set.canonical[indices]).to(device),
         "mask": torch.from_numpy(candidate_set.mask[indices]).to(device),
         "expert": torch.from_numpy(candidate_set.expert[indices]).to(device),
         "distance": torch.from_numpy(candidate_set.target_distance[indices]).to(device),
@@ -106,6 +115,13 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
             0.0,
             1.0,
         )
+    if training and config.gonion_color_dropout > 0:
+        # Gonion is geometry/contour defined. Randomly withholding RGB and local
+        # colour contrast prevents the network from keying on unilateral shadow.
+        drop = torch.rand(len(indices), 2, device=device) < float(
+            config.gonion_color_dropout
+        )
+        result["images"][:, 1:3, :, :6] *= (~drop)[:, :, None, None, None, None]
     if training and config.translation_pixels > 0:
         rng = rng or np.random.default_rng(config.seed)
         height, width = images.shape[-2:]
@@ -122,20 +138,20 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
                 result["targets"][batch_index, landmark] = _shift_without_wrap(
                     result["targets"][batch_index, landmark], int(shift_x), int(shift_y)
                 )
-                result["grids"][batch_index, landmark, :, :, 0] += 2.0 * float(
-                    shift_x
-                ) / max(width - 1, 1)
-                result["grids"][batch_index, landmark, :, :, 1] += 2.0 * float(
-                    shift_y
-                ) / max(height - 1, 1)
+                result["grids"][batch_index, landmark, :, :, 0] += (
+                    2.0 * float(shift_x) / max(width - 1, 1)
+                )
+                result["grids"][batch_index, landmark, :, :, 1] += (
+                    2.0 * float(shift_y) / max(height - 1, 1)
+                )
         projected = torch.all(torch.abs(result["grids"]) <= 1.0, dim=-1).all(dim=2)
         result["mask"] &= projected
         for batch_index in range(len(indices)):
             for landmark in range(3):
                 if not bool(result["mask"][batch_index, landmark].any()):
-                    extent = torch.abs(
-                        result["grids"][batch_index, landmark]
-                    ).amax(dim=(0, 2))
+                    extent = torch.abs(result["grids"][batch_index, landmark]).amax(
+                        dim=(0, 2)
+                    )
                     result["mask"][batch_index, landmark, torch.argmin(extent)] = True
     return result
 
@@ -166,9 +182,7 @@ def _adaptive_wing_image_loss(
     constant = theta * coefficient - omega * torch.log1p(theta_ratio)
     second = coefficient * difference - constant
     weight = 1.0 + 4.0 * target
-    loss = (torch.where(difference < theta, first, second) * weight).mean(
-        dim=(-2, -1)
-    )
+    loss = (torch.where(difference < theta, first, second) * weight).mean(dim=(-2, -1))
     if view_mask is None:
         return loss.mean()
     valid = view_mask.float()
@@ -179,9 +193,9 @@ def _poss_image_loss(logits, target, view_mask=None, exponent=2.0, temperature=0
     """Position-aware and sample-sensitive heatmap loss (Zhu, ICCV 2025)."""
     prediction = torch.sigmoid(logits.float()).clamp(1e-6, 1.0 - 1e-6)
     target = target.float()
-    modulation = torch.abs(
-        (target - prediction) / max(float(temperature), 1e-4)
-    ).pow(float(exponent))
+    modulation = torch.abs((target - prediction) / max(float(temperature), 1e-4)).pow(
+        float(exponent)
+    )
     loss = (-target * modulation * torch.log(prediction)).mean(dim=(-2, -1))
     if view_mask is None:
         return loss.mean()
@@ -200,7 +214,23 @@ def _weighted_coordinate(logits, points, mask, topk=10, temperature=0.5):
     return torch.sum(weight[..., None] * selected, dim=2)
 
 
-def _loss(heatmaps, candidate_logits, batch, config):
+def _forward_model(model, batch, config, training=False):
+    heatmaps, view_weights = model.forward_with_context(batch["images"])
+    candidate_logits = model.candidate_logits(
+        heatmaps, batch["grids"], batch["mask"], view_weights
+    )
+    pair = model.gonion_pair(
+        candidate_logits,
+        batch["canonical"],
+        batch["points"],
+        batch["mask"],
+        config.pair_temperature,
+        batch["distance"] if training else None,
+    )
+    return heatmaps, candidate_logits, pair, view_weights
+
+
+def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
     heatmap = _adaptive_wing_image_loss(
         heatmaps, batch["targets"], batch.get("target_view_mask")
     )
@@ -221,15 +251,80 @@ def _loss(heatmaps, candidate_logits, batch, config):
     target_probability = torch.softmax(target_energy, dim=-1)
     log_probability = torch.log_softmax(
         candidate_logits.float().masked_fill(~mask, -torch.inf), dim=-1
+    ).masked_fill(~mask, 0.0)
+    ranking = (
+        (
+            target_probability
+            * (torch.log(target_probability.clamp_min(1e-8)) - log_probability)
+        )
+        .masked_fill(~mask, 0.0)
+        .sum(dim=-1)
+        .mean()
     )
-    ranking = torch.where(
-        mask,
-        target_probability
-        * (torch.log(target_probability.clamp_min(1e-8)) - log_probability),
-        torch.zeros_like(target_probability),
-    ).sum(dim=-1).mean()
 
-    coordinate = _weighted_coordinate(candidate_logits, batch["points"], mask)
+    unary_coordinate = _weighted_coordinate(candidate_logits, batch["points"], mask)
+    coordinate = unary_coordinate
+    pair_ranking = candidate_logits.new_zeros((), dtype=torch.float32)
+    pair_negative = candidate_logits.new_zeros((), dtype=torch.float32)
+    if pair_output is not None:
+        coordinate = torch.cat(
+            [unary_coordinate[:, 0:1], pair_output["soft_coordinate"]], dim=1
+        )
+        left_distance = torch.gather(distance[:, 1], 1, pair_output["left_indices"])
+        right_distance = torch.gather(distance[:, 2], 1, pair_output["right_indices"])
+        pair_energy = -(
+            left_distance[:, :, None] ** 2 + right_distance[:, None, :] ** 2
+        ) / (2.0 * max(float(config.sigma_gonion), 1e-4) ** 2)
+        pair_energy = pair_energy.masked_fill(~pair_output["mask"], -torch.inf)
+        pair_target = torch.softmax(pair_energy.flatten(1), dim=-1).reshape_as(
+            pair_energy
+        )
+        pair_log_probability = torch.log_softmax(
+            pair_output["logits"].float().flatten(1), dim=-1
+        ).reshape_as(pair_energy)
+        pair_log_probability = pair_log_probability.masked_fill(
+            ~pair_output["mask"], 0.0
+        )
+        pair_ranking = (
+            pair_target
+            * (torch.log(pair_target.clamp_min(1e-8)) - pair_log_probability)
+        ).masked_fill(~pair_output["mask"], 0.0)
+        pair_ranking = pair_ranking.sum(dim=(1, 2)).mean()
+        pair_distance = torch.sqrt(
+            left_distance[:, :, None] ** 2 + right_distance[:, None, :] ** 2 + 1e-8
+        )
+        pair_minimum = pair_distance.masked_fill(~pair_output["mask"], torch.inf).amin(
+            dim=(1, 2), keepdim=True
+        )
+        pair_negative_mask = pair_output["mask"] & (
+            pair_distance > pair_minimum + float(config.sigma_gonion)
+        )
+        flattened_negative = (
+            pair_output["logits"]
+            .float()
+            .flatten(1)
+            .masked_fill(~pair_negative_mask.flatten(1), -torch.inf)
+        )
+        pair_negative_count = min(16, flattened_negative.shape[-1])
+        pair_negative_logits, pair_negative_indices = torch.topk(
+            flattened_negative, pair_negative_count, dim=-1
+        )
+        pair_negative_valid = torch.gather(
+            pair_negative_mask.flatten(1), 1, pair_negative_indices
+        )
+        pair_positive = (
+            pair_target
+            * pair_output["logits"].float().masked_fill(~pair_output["mask"], 0.0)
+        ).sum(dim=(1, 2), keepdim=False)[:, None]
+        pair_margin = F.softplus(
+            pair_negative_logits - pair_positive + config.negative_margin
+        )
+        pair_margin = torch.where(
+            pair_negative_valid, pair_margin, torch.zeros_like(pair_margin)
+        )
+        pair_negative = (
+            pair_margin.sum(dim=-1) / pair_negative_valid.sum(dim=-1).clamp_min(1)
+        ).mean()
     coordinate_loss = F.smooth_l1_loss(coordinate, batch["expert"].float(), beta=1.0)
     predicted_midpoint = coordinate[:, 1:3].mean(dim=1)
     expert_midpoint = batch["expert"][:, 1:3].float().mean(dim=1)
@@ -246,9 +341,9 @@ def _loss(heatmaps, candidate_logits, batch, config):
     count = min(16, candidate_logits.shape[-1])
     negatives, negative_indices = torch.topk(negative_logits, count, dim=-1)
     negative_valid = torch.gather(negative_mask, -1, negative_indices)
-    positive = (target_probability * candidate_logits.float().masked_fill(~mask, 0.0)).sum(
-        dim=-1, keepdim=True
-    )
+    positive = (
+        target_probability * candidate_logits.float().masked_fill(~mask, 0.0)
+    ).sum(dim=-1, keepdim=True)
     margin = F.softplus(negatives - positive + config.negative_margin)
     margin = torch.where(negative_valid, margin, torch.zeros_like(margin))
     margin = (margin.sum(dim=-1) / negative_valid.sum(dim=-1).clamp_min(1)).mean()
@@ -258,6 +353,8 @@ def _loss(heatmaps, candidate_logits, batch, config):
         + config.ranking_weight * ranking
         + config.coordinate_weight * coordinate_loss
         + config.pair_weight * pair
+        + config.joint_pair_weight * pair_ranking
+        + config.joint_pair_negative_weight * pair_negative
         + config.negative_weight * margin
     )
     return total, {
@@ -266,32 +363,94 @@ def _loss(heatmaps, candidate_logits, batch, config):
         "ranking": ranking,
         "coordinate": coordinate_loss,
         "pair": pair,
+        "joint_pair_ranking": pair_ranking,
+        "joint_pair_negative": pair_negative,
         "negative": margin,
     }
 
 
+def _new_model(candidate_set, config):
+    return DualViewHard3Net(
+        candidate_set.images.shape[3],
+        config.width,
+        config.dropout,
+        geometry_dim=candidate_set.canonical.shape[-1],
+        pair_topk=config.pair_topk,
+    )
+
+
 @torch.no_grad()
-def _predict_logits(model, candidate_set, indices, config, device):
+def _predict_outputs(model, candidate_set, indices, config, device):
     model.eval()
-    chunks = []
+    chunks = {
+        "logits": [],
+        "pair_soft": [],
+        "pair_argmax": [],
+        "pair_snapped": [],
+        "pair_left_indices": [],
+        "pair_right_indices": [],
+        "view_weights": [],
+    }
     for start in range(0, len(indices), config.batch_size):
-        selected = np.asarray(indices[start : start + config.batch_size], dtype=np.int64)
-        batch = _tensor_batch(candidate_set, selected, device, config)
-        heatmaps = model(batch["images"])
-        chunks.append(
-            model.candidate_logits(heatmaps, batch["grids"], batch["mask"])
-            .float()
-            .cpu()
-            .numpy()
+        selected = np.asarray(
+            indices[start : start + config.batch_size], dtype=np.int64
         )
-    return np.concatenate(chunks, axis=0)
+        batch = _tensor_batch(candidate_set, selected, device, config)
+        _, logits, pair, view_weights = _forward_model(model, batch, config)
+        chunks["logits"].append(logits.float().cpu().numpy())
+        chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
+        chunks["pair_argmax"].append(pair["argmax_coordinate"].float().cpu().numpy())
+        chunks["pair_snapped"].append(pair["snapped_coordinate"].float().cpu().numpy())
+        chunks["pair_left_indices"].append(pair["left_indices"].cpu().numpy())
+        chunks["pair_right_indices"].append(pair["right_indices"].cpu().numpy())
+        chunks["view_weights"].append(view_weights.float().cpu().numpy())
+    return {name: np.concatenate(values, axis=0) for name, values in chunks.items()}
 
 
-def _train_model(candidate_set, train_indices, val_indices, config, device, fold_number):
+def _predict_logits(model, candidate_set, indices, config, device):
+    """Compatibility wrapper retained for downstream diagnostic imports."""
+    return _predict_outputs(model, candidate_set, indices, config, device)["logits"]
+
+
+def _select_dual_coordinate_policy(candidate_set, logits, pair_outputs):
+    policy = _select_coordinate_policy(candidate_set, logits)
+    unary = _decode_policy(candidate_set, logits, policy)[:, 1:3]
+    options = {"unary": unary}
+    options.update(
+        {
+            name: np.asarray(pair_outputs[name], dtype=np.float32)
+            for name in ("pair_soft", "pair_argmax", "pair_snapped")
+        }
+    )
+    rows = []
+    for name, coordinate in options.items():
+        error = np.linalg.norm(coordinate - candidate_set.expert[:, 1:3], axis=-1)
+        rows.append(
+            {
+                "mode": name,
+                "gonion_ale": float(error.mean()),
+                "lm21_ale": float(error[:, 0].mean()),
+                "lm22_ale": float(error[:, 1].mean()),
+            }
+        )
+    selected = min(rows, key=lambda row: (row["gonion_ale"], row["mode"]))
+    policy["gonion_pair"] = {**selected, "sweep": rows}
+    return policy
+
+
+def _decode_dual_policy(candidate_set, logits, pair_outputs, policy):
+    unary = _decode_policy(candidate_set, logits, policy)
+    mode = policy.get("gonion_pair", {}).get("mode", "unary")
+    if mode != "unary":
+        unary[:, 1:3] = np.asarray(pair_outputs[mode], dtype=np.float32)
+    return unary
+
+
+def _train_model(
+    candidate_set, train_indices, val_indices, config, device, fold_number
+):
     torch.manual_seed(config.seed + fold_number * 1009)
-    model = DualViewHard3Net(
-        candidate_set.images.shape[3], config.width, config.dropout
-    ).to(device)
+    model = _new_model(candidate_set, config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
@@ -313,17 +472,22 @@ def _train_model(candidate_set, train_indices, val_indices, config, device, fold
                 "ranking",
                 "coordinate",
                 "pair",
+                "joint_pair_ranking",
+                "joint_pair_negative",
                 "negative",
             )
         }
         seen = 0
         for start in range(0, len(order), config.batch_size):
-            selected = np.asarray(order[start : start + config.batch_size], dtype=np.int64)
+            selected = np.asarray(
+                order[start : start + config.batch_size], dtype=np.int64
+            )
             batch = _tensor_batch(candidate_set, selected, device, config, True, rng)
             optimizer.zero_grad(set_to_none=True)
-            heatmaps = model(batch["images"])
-            logits = model.candidate_logits(heatmaps, batch["grids"], batch["mask"])
-            loss, components = _loss(heatmaps, logits, batch, config)
+            heatmaps, logits, pair_output, _ = _forward_model(
+                model, batch, config, training=True
+            )
+            loss, components = _loss(heatmaps, logits, batch, config, pair_output)
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite dual-view Hard3 loss")
             loss.backward()
@@ -334,17 +498,18 @@ def _train_model(candidate_set, train_indices, val_indices, config, device, fold
             totals["total"] += float(loss.detach()) * count
             for name, value in components.items():
                 totals[name] += float(value.detach()) * count
-        val_logits = _predict_logits(
+        val_outputs = _predict_outputs(
             model, candidate_set, list(val_indices), config, device
         )
-        val_prediction = _decode_numpy(
-            val_logits,
-            candidate_set.points[val_indices],
-            candidate_set.mask[val_indices],
+        val_lm0 = _decode_numpy(
+            val_outputs["logits"][:, 0:1],
+            candidate_set.points[val_indices][:, 0:1],
+            candidate_set.mask[val_indices][:, 0:1],
             5,
             0.5,
             True,
         )
+        val_prediction = np.concatenate([val_lm0, val_outputs["pair_soft"]], axis=1)
         val_error = np.linalg.norm(
             val_prediction - candidate_set.expert[val_indices], axis=-1
         )
@@ -375,17 +540,19 @@ def _train_model(candidate_set, train_indices, val_indices, config, device, fold
     if best_state is None:
         raise RuntimeError("Dual-view Hard3 refiner did not produce a checkpoint")
     model.load_state_dict(best_state)
-    logits = _predict_logits(model, candidate_set, list(val_indices), config, device)
-    return logits, best_epoch, best_score, history, {
-        key: value.detach().cpu() for key, value in best_state.items()
-    }
+    outputs = _predict_outputs(model, candidate_set, list(val_indices), config, device)
+    return (
+        outputs,
+        best_epoch,
+        best_score,
+        history,
+        {key: value.detach().cpu() for key, value in best_state.items()},
+    )
 
 
 def _train_fixed_model(candidate_set, epochs, config, device, member_number):
     torch.manual_seed(config.seed + 50_003 + member_number * 1009)
-    model = DualViewHard3Net(
-        candidate_set.images.shape[3], config.width, config.dropout
-    ).to(device)
+    model = _new_model(candidate_set, config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
@@ -400,12 +567,15 @@ def _train_fixed_model(candidate_set, epochs, config, device, member_number):
         order = rng.permutation(indices)
         total, seen = 0.0, 0
         for start in range(0, len(order), config.batch_size):
-            selected = np.asarray(order[start : start + config.batch_size], dtype=np.int64)
+            selected = np.asarray(
+                order[start : start + config.batch_size], dtype=np.int64
+            )
             batch = _tensor_batch(candidate_set, selected, device, config, True, rng)
             optimizer.zero_grad(set_to_none=True)
-            heatmaps = model(batch["images"])
-            logits = model.candidate_logits(heatmaps, batch["grids"], batch["mask"])
-            loss, _ = _loss(heatmaps, logits, batch, config)
+            heatmaps, logits, pair_output, _ = _forward_model(
+                model, batch, config, training=True
+            )
+            loss, _ = _loss(heatmaps, logits, batch, config, pair_output)
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite full-train dual-view Hard3 loss")
             loss.backward()
@@ -427,9 +597,11 @@ def _train_fixed_model(candidate_set, epochs, config, device, member_number):
                 f"train={history[-1]['train_loss']:.4f}",
                 flush=True,
             )
-    return model, history, {
-        key: value.detach().cpu() for key, value in model.state_dict().items()
-    }
+    return (
+        model,
+        history,
+        {key: value.detach().cpu() for key, value in model.state_dict().items()},
+    )
 
 
 def _cache_signature(dataset, config):
@@ -441,7 +613,9 @@ def _cache_signature(dataset, config):
         "maximum_p95_regression_mm",
         "target_hard3_ale",
     }
-    model_config = {key: value for key, value in asdict(config).items() if key not in ignored}
+    model_config = {
+        key: value for key, value in asdict(config).items() if key not in ignored
+    }
     digest = hashlib.sha256()
     records = []
     for sample in dataset.samples:
@@ -449,9 +623,11 @@ def _cache_signature(dataset, config):
         digest.update(np.asarray(dataset._coarse(sample), dtype=np.float32).tobytes())
         path = Path(dataset.records[sample.sample_id])
         stat = path.stat()
-        records.append((sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+        records.append(
+            (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
+        )
     payload = {
-        "version": 2,
+        "version": 3,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -475,7 +651,9 @@ def _ordered_baseline(candidate_set, outputs):
         sample_id: np.asarray(outputs["prediction"][index], dtype=np.float32)
         for index, sample_id in enumerate(outputs["sample_ids"])
     }
-    missing = [sample_id for sample_id in candidate_set.sample_ids if sample_id not in by_id]
+    missing = [
+        sample_id for sample_id in candidate_set.sample_ids if sample_id not in by_id
+    ]
     if missing:
         raise KeyError(f"Baseline predictions miss Hard3 samples: {missing[:5]}")
     return np.stack([by_id[sample_id] for sample_id in candidate_set.sample_ids])
@@ -488,7 +666,9 @@ def _robust_logit_scale(logits, mask):
             valid = mask[sample, landmark]
             values = logits[sample, landmark, valid].astype(np.float64)
             median = np.median(values)
-            scale = max(float(np.percentile(values, 75) - np.percentile(values, 25)), 1e-3)
+            scale = max(
+                float(np.percentile(values, 75) - np.percentile(values, 25)), 1e-3
+            )
             output[sample, landmark, valid] = np.clip(
                 (values - median) / scale, -12.0, 12.0
             )
@@ -496,14 +676,28 @@ def _robust_logit_scale(logits, mask):
     return output
 
 
-def _variant_predictions(candidate_set, logits, policy, atlas_prediction):
+def _variant_predictions(
+    candidate_set, logits, policy, atlas_prediction, joint_predictions=None
+):
+    unary_policy = _decode_policy(candidate_set, logits, policy)
+    neural_policy = unary_policy.copy()
+    if joint_predictions is not None:
+        mode = policy.get("gonion_pair", {}).get("mode", "unary")
+        if mode != "unary":
+            neural_policy[:, 1:3] = joint_predictions[mode]
     variants = {
-        "neural_policy": _decode_policy(candidate_set, logits, policy),
+        "neural_policy": neural_policy,
+        "unary_policy": unary_policy,
         "neural_argmax": _decode_numpy(
             logits, candidate_set.points, candidate_set.mask, 1, 1.0, True
         ),
         "atlas_direct": np.asarray(atlas_prediction, dtype=np.float32),
     }
+    if joint_predictions is not None:
+        for name in ("pair_soft", "pair_argmax", "pair_snapped"):
+            coordinate = unary_policy.copy()
+            coordinate[:, 1:3] = joint_predictions[name]
+            variants[f"joint_{name.removeprefix('pair_')}"] = coordinate
     neural = _robust_logit_scale(logits, candidate_set.mask)
     atlas_distance = np.linalg.norm(
         candidate_set.points - atlas_prediction[:, :, None], axis=-1
@@ -517,9 +711,7 @@ def _variant_predictions(candidate_set, logits, policy, atlas_prediction):
         for weight in (0.25, 0.5, 1.0, 2.0):
             fused = neural + weight * atlas_logits
             prefix = f"fusion_w{weight:g}_s{sigma:g}"
-            variants[f"{prefix}_policy"] = _decode_policy(
-                candidate_set, fused, policy
-            )
+            variants[f"{prefix}_policy"] = _decode_policy(candidate_set, fused, policy)
             variants[f"{prefix}_argmax"] = _decode_numpy(
                 fused, candidate_set.points, candidate_set.mask, 1, 1.0, True
             )
@@ -537,7 +729,9 @@ class FittedDualViewHard3Refiner:
 
     def predict(self, dataset, baseline_outputs, label="Hard3 dual-view inference"):
         centers = {
-            sample_id: np.asarray(baseline_outputs["prediction"][index], dtype=np.float32)
+            sample_id: np.asarray(
+                baseline_outputs["prediction"][index], dtype=np.float32
+            )
             for index, sample_id in enumerate(baseline_outputs["sample_ids"])
         }
         candidate_set = extract_dual_view_set(
@@ -548,26 +742,48 @@ class FittedDualViewHard3Refiner:
             label,
         )
         indices = list(range(len(candidate_set)))
-        member_logits = [
-            _predict_logits(model, candidate_set, indices, self.config, self.device)
+        member_outputs = [
+            _predict_outputs(model, candidate_set, indices, self.config, self.device)
             for model in self.models
         ]
+        member_logits = [values["logits"] for values in member_outputs]
         logits = np.mean(np.stack(member_logits), axis=0)
+        joint_predictions = {
+            name: np.mean(np.stack([values[name] for values in member_outputs]), axis=0)
+            for name in ("pair_soft", "pair_argmax", "pair_snapped")
+        }
         baseline = _ordered_baseline(candidate_set, baseline_outputs)
         atlas_result = self.atlas.predict(baseline, candidate_set.sample_ids)
         variants = _variant_predictions(
-            candidate_set, logits, self.policy, atlas_result["prediction"]
+            candidate_set,
+            logits,
+            self.policy,
+            atlas_result["prediction"],
+            joint_predictions,
         )
         member_coordinates = np.stack(
-            [_decode_policy(candidate_set, values, self.policy) for values in member_logits]
+            [
+                _decode_dual_policy(
+                    candidate_set, values["logits"], values, self.policy
+                )
+                for values in member_outputs
+            ]
         )
         neural_coordinate = variants["neural_policy"]
         spread = np.linalg.norm(
             member_coordinates - neural_coordinate[None], axis=-1
         ).mean(axis=0)
-        probability = np.exp(
-            logits - np.max(np.where(candidate_set.mask, logits, -np.inf), axis=-1, keepdims=True)
-        ) * candidate_set.mask
+        probability = (
+            np.exp(
+                logits
+                - np.max(
+                    np.where(candidate_set.mask, logits, -np.inf),
+                    axis=-1,
+                    keepdims=True,
+                )
+            )
+            * candidate_set.mask
+        )
         probability /= np.maximum(probability.sum(axis=-1, keepdims=True), 1e-12)
         entropy = -(probability * np.log(np.maximum(probability, 1e-12))).sum(axis=-1)
         entropy /= np.log(np.maximum(candidate_set.mask.sum(axis=-1), 2))
@@ -590,6 +806,10 @@ class FittedDualViewHard3Refiner:
             "atlas_dispersion": atlas_result["dispersion"],
             "reliability": np.clip(reliability, 0.05, 1.0).astype(np.float32),
             "oracle_error": np.min(candidate_set.target_distance, axis=-1),
+            "mean_view_weights": np.mean(
+                np.stack([values["view_weights"] for values in member_outputs]),
+                axis=0,
+            ).astype(np.float32),
         }
 
 
@@ -601,14 +821,20 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     signature = _cache_signature(dataset, config)
     if checkpoint_path.exists() and report_path.exists():
         try:
-            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            checkpoint = torch.load(
+                checkpoint_path, map_location=device, weights_only=False
+            )
         except TypeError:
             checkpoint = torch.load(checkpoint_path, map_location=device)
         if checkpoint.get("signature") == signature:
             models = []
             for state in checkpoint["model_states"]:
                 model = DualViewHard3Net(
-                    checkpoint["input_channels"], config.width, config.dropout
+                    checkpoint["input_channels"],
+                    config.width,
+                    config.dropout,
+                    geometry_dim=checkpoint["geometry_dim"],
+                    pair_topk=config.pair_topk,
                 )
                 model.load_state_dict(state)
                 models.append(model)
@@ -629,11 +855,21 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     oof_logits = np.full(
         (len(candidates), 3, candidates.points.shape[-2]), -np.inf, dtype=np.float32
     )
+    oof_pair = {
+        name: np.zeros((len(candidates), 2, 3), dtype=np.float32)
+        for name in ("pair_soft", "pair_argmax", "pair_snapped")
+    }
+    pair_count = min(config.pair_topk, candidates.points.shape[-2])
+    oof_pair_indices = {
+        name: np.full((len(candidates), pair_count), -1, dtype=np.int64)
+        for name in ("pair_left_indices", "pair_right_indices")
+    }
+    oof_view_weights = np.zeros((len(candidates), 3, 2), dtype=np.float32)
     fold_reports, oof_models, best_epochs = [], [], []
     for fold_number, (train_indices, val_indices) in enumerate(
         _splitter(candidates.strata, config.folds, config.seed), start=1
     ):
-        logits, best_epoch, best_score, history, state = _train_model(
+        fold_outputs, best_epoch, best_score, history, state = _train_model(
             candidates,
             np.asarray(train_indices),
             np.asarray(val_indices),
@@ -641,16 +877,23 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             device,
             fold_number,
         )
-        oof_logits[val_indices] = logits
+        oof_logits[val_indices] = fold_outputs["logits"]
+        for name in oof_pair:
+            oof_pair[name][val_indices] = fold_outputs[name]
+        for name in oof_pair_indices:
+            oof_pair_indices[name][val_indices] = fold_outputs[name]
+        oof_view_weights[val_indices] = fold_outputs["view_weights"]
         best_epochs.append(best_epoch)
-        model = DualViewHard3Net(candidates.images.shape[3], config.width, config.dropout)
+        model = _new_model(candidates, config)
         model.load_state_dict(state)
         oof_models.append(model)
         fold_reports.append(
             {
                 "fold": fold_number,
                 "train_sample_ids": [candidates.sample_ids[i] for i in train_indices],
-                "validation_sample_ids": [candidates.sample_ids[i] for i in val_indices],
+                "validation_sample_ids": [
+                    candidates.sample_ids[i] for i in val_indices
+                ],
                 "best_epoch": best_epoch,
                 "best_validation_hard3_ale": best_score,
                 "history": history,
@@ -658,25 +901,36 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         )
     if not np.isfinite(oof_logits[candidates.mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF logits are incomplete")
-    policy = _select_coordinate_policy(candidates, oof_logits)
-    oof_prediction = _decode_policy(candidates, oof_logits, policy)
+    policy = _select_dual_coordinate_policy(candidates, oof_logits, oof_pair)
+    oof_prediction = _decode_dual_policy(candidates, oof_logits, oof_pair, policy)
     oof_error = np.linalg.norm(oof_prediction - candidates.expert, axis=-1)
     member_predictions = np.stack(
         [
-            _decode_policy(
+            _decode_dual_policy(
                 candidates,
-                _predict_logits(
-                    model.to(device), candidates, list(range(len(candidates))), config, device
-                ),
+                (
+                    member_output := _predict_outputs(
+                        model.to(device),
+                        candidates,
+                        list(range(len(candidates))),
+                        config,
+                        device,
+                    )
+                )["logits"],
+                member_output,
                 policy,
             )
             for model in oof_models
         ]
     )
     ensemble_prediction = member_predictions.mean(axis=0)
-    spread = np.linalg.norm(member_predictions - ensemble_prediction[None], axis=-1).mean(axis=0)
+    spread = np.linalg.norm(
+        member_predictions - ensemble_prediction[None], axis=-1
+    ).mean(axis=0)
     reliability_scale = np.maximum(np.percentile(spread, 75, axis=0), 0.25)
-    fixed_epochs = int(np.clip(np.median(best_epochs), config.min_epochs, config.epochs))
+    fixed_epochs = int(
+        np.clip(np.median(best_epochs), config.min_epochs, config.epochs)
+    )
     models, states, final_histories = [], [], []
     for member_number in range(1, max(1, config.final_ensemble_members) + 1):
         model, history, state = _train_fixed_model(
@@ -690,7 +944,8 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     parameter_count = sum(parameter.numel() for parameter in models[0].parameters())
     report = {
         "signature": signature,
-        "method": "nested-OOF dual-view RGB-depth heatmap plus bilateral contour and train-only local atlas",
+        "version": "H3-DVAR-v2",
+        "method": "nested-OOF dynamic dual-view heatmap plus joint bilateral Gonion pair ranking",
         "uses_validation_labels_for_model_fit": False,
         "uses_test_labels": False,
         "sample_count": len(candidates),
@@ -710,7 +965,34 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             "hard3": summarize(oof_error),
             "lm0": summarize(oof_error[:, 0]),
             "gonion": summarize(oof_error[:, 1:3]),
-            "candidate_oracle_ale": float(np.min(candidates.target_distance, axis=-1).mean()),
+            "candidate_oracle_ale": float(
+                np.min(candidates.target_distance, axis=-1).mean()
+            ),
+            "gonion_pair_topk_recall": {
+                "lm21": float(
+                    np.mean(
+                        np.any(
+                            oof_pair_indices["pair_left_indices"]
+                            == np.argmin(candidates.target_distance[:, 1], axis=-1)[
+                                :, None
+                            ],
+                            axis=1,
+                        )
+                    )
+                ),
+                "lm22": float(
+                    np.mean(
+                        np.any(
+                            oof_pair_indices["pair_right_indices"]
+                            == np.argmin(candidates.target_distance[:, 2], axis=-1)[
+                                :, None
+                            ],
+                            axis=1,
+                        )
+                    )
+                ),
+            },
+            "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
         },
         "atlas": {
             "fit_sample_ids": candidates.sample_ids,
@@ -733,6 +1015,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         {
             "signature": signature,
             "input_channels": int(candidates.images.shape[3]),
+            "geometry_dim": int(candidates.canonical.shape[-1]),
             "coordinate_policy": policy,
             "model_states": states,
             "atlas": atlas.state_dict(),
@@ -756,11 +1039,31 @@ def _candidate_for_variants(outputs, candidate_result, lm0_variant, gonion_varia
         outputs, candidate_result, candidate_result["variant_predictions"][lm0_variant]
     )
     gonion_values = _order_values(
-        outputs, candidate_result, candidate_result["variant_predictions"][gonion_variant]
+        outputs,
+        candidate_result,
+        candidate_result["variant_predictions"][gonion_variant],
     )
     result = gonion_values.copy()
     result[:, 0] = lm0_values[:, 0]
     return result
+
+
+def _dual_blend_prediction(base, candidate, reliability, row):
+    confidence = (
+        np.asarray(reliability, dtype=np.float32)
+        if row["confidence_mode"] == "ensemble"
+        else np.ones_like(reliability, dtype=np.float32)
+    )
+    left_alpha = row.get("alpha_gonion_left", row.get("alpha_gonion", 0.0))
+    right_alpha = row.get("alpha_gonion_right", row.get("alpha_gonion", 0.0))
+    alpha = np.asarray([row["alpha_lm0"], left_alpha, right_alpha], dtype=np.float32)
+    effective_alpha = confidence * alpha[None]
+    prediction = np.asarray(base, dtype=np.float32).copy()
+    base_hard3 = prediction[:, list(HARD3)].copy()
+    prediction[:, list(HARD3)] = base_hard3 + effective_alpha[..., None] * (
+        candidate - base_hard3
+    )
+    return prediction, effective_alpha
 
 
 def calibrate_dual_view_blend(outputs, candidate_result, config):
@@ -782,17 +1085,26 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         error = np.linalg.norm(prediction - expert[:, list(HARD3)], axis=-1)
         individual[name] = {
             "lm0_ale": float(error[:, 0].mean()),
+            "lm21_ale": float(error[:, 1].mean()),
+            "lm22_ale": float(error[:, 2].mean()),
             "gonion_ale": float(error[:, 1:3].mean()),
             "hard3_ale": float(error.mean()),
         }
     # Restrict the joint sweep to the strongest predefined candidates to control
     # variance on the 48-sample outer validation fold.
     lm0_variants = sorted(variants, key=lambda name: individual[name]["lm0_ale"])[:8]
-    gonion_variants = sorted(variants, key=lambda name: individual[name]["gonion_ale"])[:8]
+    # Atlas coordinates were strongly harmful in Fold 1. They remain available
+    # as a weak logit regularizer, but are no longer eligible as direct Gonion
+    # predictions.
+    gonion_candidates = [name for name in variants if not name.startswith("atlas_")]
+    gonion_variants = sorted(
+        gonion_candidates, key=lambda name: individual[name]["gonion_ale"]
+    )[:8]
     for anchor in ("neural_policy", "atlas_direct"):
         if anchor not in lm0_variants:
             lm0_variants.append(anchor)
-        if anchor not in gonion_variants:
+    for anchor in ("neural_policy", "joint_soft", "joint_argmax", "joint_snapped"):
+        if anchor in variants and anchor not in gonion_variants:
             gonion_variants.append(anchor)
 
     limits = (
@@ -809,32 +1121,36 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
             limited, _, _ = _limited_hard3_candidate(base, raw, limits)
             for confidence_mode in ("none", "ensemble"):
                 for alpha_lm0 in (0.0, 0.25, 0.5, 0.75, 1.0):
-                    for alpha_gonion in (0.0, 0.25, 0.5, 0.75, 1.0):
-                        row = {
-                            "lm0_variant": lm0_variant,
-                            "gonion_variant": gonion_variant,
-                            "confidence_mode": confidence_mode,
-                            "alpha_lm0": alpha_lm0,
-                            "alpha_gonion": alpha_gonion,
-                        }
-                        prediction, _ = _blend_prediction(
-                            base, limited, reliability, row
-                        )
-                        error = np.linalg.norm(prediction - expert, axis=-1)
-                        rows.append(
-                            {
-                                **row,
-                                "overall_ale": float(error.mean()),
-                                "hard3_ale": float(error[:, list(HARD3)].mean()),
-                                "lm0_ale": float(error[:, 0].mean()),
-                                "gonion_ale": float(error[:, 21:23].mean()),
-                                "p95": float(np.percentile(error, 95)),
+                    for alpha_left in (0.0, 0.25, 0.5, 0.75, 1.0):
+                        for alpha_right in (0.0, 0.25, 0.5, 0.75, 1.0):
+                            alpha_gonion = 0.5 * (alpha_left + alpha_right)
+                            row = {
+                                "lm0_variant": lm0_variant,
+                                "gonion_variant": gonion_variant,
+                                "confidence_mode": confidence_mode,
+                                "alpha_lm0": alpha_lm0,
+                                "alpha_gonion": alpha_gonion,
+                                "alpha_gonion_left": alpha_left,
+                                "alpha_gonion_right": alpha_right,
                             }
-                        )
+                            prediction, _ = _dual_blend_prediction(
+                                base, limited, reliability, row
+                            )
+                            error = np.linalg.norm(prediction - expert, axis=-1)
+                            rows.append(
+                                {
+                                    **row,
+                                    "overall_ale": float(error.mean()),
+                                    "hard3_ale": float(error[:, list(HARD3)].mean()),
+                                    "lm0_ale": float(error[:, 0].mean()),
+                                    "lm21_ale": float(error[:, 21].mean()),
+                                    "lm22_ale": float(error[:, 22].mean()),
+                                    "gonion_ale": float(error[:, 21:23].mean()),
+                                    "p95": float(np.percentile(error, 95)),
+                                }
+                            )
     eligible = [
-        row
-        for row in rows
-        if row["p95"] <= base_p95 + config.maximum_p95_regression_mm
+        row for row in rows if row["p95"] <= base_p95 + config.maximum_p95_regression_mm
     ]
     proposed = min(
         eligible or rows,
@@ -847,7 +1163,9 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         proposed["gonion_variant"],
     )
     limited, raw_step, step_scale = _limited_hard3_candidate(base, raw, limits)
-    proposed_prediction, _ = _blend_prediction(base, limited, reliability, proposed)
+    proposed_prediction, _ = _dual_blend_prediction(
+        base, limited, reliability, proposed
+    )
     proposed_error = np.linalg.norm(proposed_prediction - expert, axis=-1)
     proposed_bootstrap = bootstrap_delta(
         base_error, proposed_error, config.bootstrap_iters, config.seed
@@ -863,18 +1181,24 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         >= config.minimum_improvement_probability
         and proposed["p95"] <= base_p95 + config.maximum_p95_regression_mm
     )
-    selected = proposed if accepted else {
-        "lm0_variant": "neural_policy",
-        "gonion_variant": "neural_policy",
-        "confidence_mode": "none",
-        "alpha_lm0": 0.0,
-        "alpha_gonion": 0.0,
-        "overall_ale": float(base_error.mean()),
-        "hard3_ale": float(base_error[:, list(HARD3)].mean()),
-        "lm0_ale": float(base_error[:, 0].mean()),
-        "gonion_ale": float(base_error[:, 21:23].mean()),
-        "p95": base_p95,
-    }
+    selected = (
+        proposed
+        if accepted
+        else {
+            "lm0_variant": "neural_policy",
+            "gonion_variant": "neural_policy",
+            "confidence_mode": "none",
+            "alpha_lm0": 0.0,
+            "alpha_gonion": 0.0,
+            "alpha_gonion_left": 0.0,
+            "alpha_gonion_right": 0.0,
+            "overall_ale": float(base_error.mean()),
+            "hard3_ale": float(base_error[:, list(HARD3)].mean()),
+            "lm0_ale": float(base_error[:, 0].mean()),
+            "gonion_ale": float(base_error[:, 21:23].mean()),
+            "p95": base_p95,
+        }
+    )
     selected_raw = _candidate_for_variants(
         outputs,
         candidate_result,
@@ -882,7 +1206,7 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         selected["gonion_variant"],
     )
     selected_limited, _, _ = _limited_hard3_candidate(base, selected_raw, limits)
-    blended, effective_alpha = _blend_prediction(
+    blended, effective_alpha = _dual_blend_prediction(
         base, selected_limited, reliability, selected
     )
     blended_error = np.linalg.norm(blended - expert, axis=-1)
@@ -892,7 +1216,8 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         "selected": selected,
         "target_hard3_ale": config.target_hard3_ale,
         "target_reached_on_validation": bool(
-            accepted and float(blended_error[:, list(HARD3)].mean()) < config.target_hard3_ale
+            accepted
+            and float(blended_error[:, list(HARD3)].mean()) < config.target_hard3_ale
         ),
         "limits_mm": list(limits),
         "base_overall": summarize(base_error),
@@ -901,8 +1226,7 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         "blended_hard3": summarize(blended_error[:, list(HARD3)]),
         "overall_gain_mm": float(base_error.mean() - blended_error.mean()),
         "hard3_gain_mm": float(
-            base_error[:, list(HARD3)].mean()
-            - blended_error[:, list(HARD3)].mean()
+            base_error[:, list(HARD3)].mean() - blended_error[:, list(HARD3)].mean()
         ),
         "bootstrap_vs_base": bootstrap_delta(
             base_error, blended_error, config.bootstrap_iters, config.seed
@@ -944,7 +1268,7 @@ def apply_dual_view_blend(outputs, candidate_result, policy):
         1.0,
     )
     candidate, _, _ = _limited_hard3_candidate(base, raw, policy["limits_mm"])
-    prediction, effective_alpha = _blend_prediction(
+    prediction, effective_alpha = _dual_blend_prediction(
         base, candidate, reliability, selected
     )
     full_candidate = base.copy()

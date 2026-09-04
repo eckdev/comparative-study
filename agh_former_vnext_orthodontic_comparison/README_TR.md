@@ -108,7 +108,8 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
 checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız `hard3_dual_view/` altındaki
-H3-DVAR eğitilir. Aynı komut ikinci kez çalıştırıldığında bu model de cache'den yüklenir.
+H3-DVAR v2 eğitilir. V1 checkpoint imzası bilinçli olarak geçersizdir; v2 tamamlandıktan
+sonra aynı komut yeniden çalıştırılırsa yeni model cache'den yüklenir.
 
 Beş-fold preprocessing kontrolü:
 
@@ -146,9 +147,9 @@ bir H3-DVAR kapısından geçmelidir:
 - overall p95 değeri `0.10 mm`den fazla kötüleşmemeli.
 
 Kapı geçmezse fusion alpha otomatik olarak sıfırlanır ve tam CV başlatılmaz. Bu durumda
-model büyütmek yerine patch coverage, RGB varlığı, neural/atlas candidate sonuçları ve
-Gonion kontur kanalları incelenmelidir. Fold 1 hedefi, Hard3 değerini `5.2696 mm`den
-`4.00 mm` altına indirmektir.
+model büyütmek yerine `gonion_pair_topk_recall`, örnek-bazlı görünüş ağırlıkları ve
+joint-pair aday sonuçları incelenmelidir. Fold 1 baseline Hard3 değeri `5.2358 mm`,
+v1 sonucu `4.6143 mm`, v2 kabul hedefi ise `<4.00 mm`dir.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
