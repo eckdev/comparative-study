@@ -7,6 +7,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+PROPOSAL_SOURCE_NAMES = ("geometry", "fused", "frontal", "profile")
+
+
+def diverse_topk_indices(source_logits, candidate_mask, topk):
+    """Select a balanced union of candidates ranked by multiple proposal sources."""
+    if source_logits.ndim != 3:
+        raise ValueError("source_logits must have shape [B, sources, candidates]")
+    if candidate_mask.shape != source_logits.shape[:1] + source_logits.shape[2:]:
+        raise ValueError("candidate_mask must have shape [B, candidates]")
+    candidates = source_logits.shape[-1]
+    count = min(max(1, int(topk)), candidates)
+    valid = candidate_mask[:, None].expand_as(source_logits)
+    safe = source_logits.float().masked_fill(~valid, -torch.inf)
+    order = torch.argsort(safe, dim=-1, descending=True)
+    positions = torch.arange(candidates, device=source_logits.device).view(1, 1, -1)
+    positions = positions.expand_as(order)
+    ranks = torch.empty_like(order)
+    ranks.scatter_(-1, order, positions)
+    ranks = ranks.masked_fill(~valid, candidates + 1)
+
+    # Ranking by the best source rank gives each source an equal proposal quota.
+    # Mean rank and the learned geometry score only provide deterministic ties.
+    best_rank = ranks.amin(dim=1).float()
+    mean_rank = ranks.float().mean(dim=1)
+    geometry_tie = torch.nan_to_num(
+        source_logits[:, 0].float(), nan=0.0, posinf=1e4, neginf=-1e4
+    )
+    priority = -best_rank - 1e-3 * mean_rank / max(candidates, 1)
+    priority = priority + 1e-6 * geometry_tie
+    priority = priority.masked_fill(~candidate_mask, -torch.inf)
+    return torch.topk(priority, count, dim=-1).indices
+
+
 class ConvBlock(nn.Module):
     def __init__(self, input_channels, output_channels, dropout=0.0):
         super().__init__()
@@ -106,6 +139,23 @@ class DualViewHard3Net(nn.Module):
         nn.init.zeros_(self.gonion_view_gate[-1].weight)
         nn.init.zeros_(self.gonion_view_gate[-1].bias)
 
+        proposal_input_dim = self.geometry_dim + 5
+        proposal_width = max(width * 2, 48)
+        self.gonion_geometry_proposal = nn.Sequential(
+            nn.LayerNorm(proposal_input_dim),
+            nn.Linear(proposal_input_dim, proposal_width),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(proposal_width, proposal_width // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(proposal_width // 2, 1),
+        )
+        # Preserve the v2 heatmap proposal at initialization. The all-candidate
+        # listwise loss then learns the 3D correction before any top-k pruning.
+        nn.init.zeros_(self.gonion_geometry_proposal[-1].weight)
+        nn.init.zeros_(self.gonion_geometry_proposal[-1].bias)
+
         pair_input_dim = 4 * self.geometry_dim + 4
         pair_width = max(width * 2, 48)
         self.gonion_pair_ranker = nn.Sequential(
@@ -195,7 +245,15 @@ class DualViewHard3Net(nn.Module):
         heatmaps, _ = self.forward_with_context(images)
         return heatmaps
 
-    def candidate_logits(self, heatmaps, grids, candidate_mask, view_weights=None):
+    def candidate_logits(
+        self,
+        heatmaps,
+        grids,
+        candidate_mask,
+        view_weights=None,
+        canonical=None,
+        return_evidence=False,
+    ):
         batch, landmarks, views, height, width = heatmaps.shape
         candidates = grids.shape[-2]
         sampled = F.grid_sample(
@@ -211,8 +269,52 @@ class DualViewHard3Net(nn.Module):
             view_weights = torch.stack(
                 [trichion_weights, gonion_weights, gonion_weights], dim=0
             )[None].expand(batch, -1, -1)
-        logits = (sampled * view_weights[..., None].to(sampled.dtype)).sum(dim=2)
-        return logits.masked_fill(~candidate_mask, -torch.inf)
+        fused = (sampled * view_weights[..., None].to(sampled.dtype)).sum(dim=2)
+        fused = fused.float().masked_fill(~candidate_mask, -torch.inf)
+        view_mask = candidate_mask[:, :, None].expand_as(sampled)
+        standardized_views = self._masked_standardize(sampled.float(), view_mask)
+        standardized_fused = self._masked_standardize(fused, candidate_mask)
+
+        proposal = fused.clone()
+        if canonical is not None:
+            gonion_mask = candidate_mask[:, 1:3]
+            image_evidence = standardized_views[:, 1:3].permute(0, 1, 3, 2)
+            image_evidence = image_evidence.masked_fill(
+                ~gonion_mask[..., None], 0.0
+            )
+            fused_evidence = standardized_fused[:, 1:3, :, None].masked_fill(
+                ~gonion_mask[..., None], 0.0
+            )
+            weights = view_weights[:, 1:3, None].expand(-1, -1, candidates, -1)
+            proposal_features = torch.cat(
+                [
+                    canonical[:, 1:3].float(),
+                    image_evidence,
+                    fused_evidence,
+                    weights.float(),
+                ],
+                dim=-1,
+            )
+            correction = self.gonion_geometry_proposal(proposal_features).squeeze(-1)
+            proposal[:, 1:3] = standardized_fused[:, 1:3] + correction
+        proposal = proposal.masked_fill(~candidate_mask, -torch.inf)
+        standardized_proposal = self._masked_standardize(proposal, candidate_mask)
+        sources = torch.stack(
+            [
+                standardized_proposal,
+                standardized_fused,
+                standardized_views[:, :, 0],
+                standardized_views[:, :, 1],
+            ],
+            dim=2,
+        ).masked_fill(~candidate_mask[:, :, None], -torch.inf)
+        evidence = {
+            "logits": proposal,
+            "heatmap_logits": fused,
+            "view_logits": sampled.float().masked_fill(~view_mask, -torch.inf),
+            "proposal_sources": sources,
+        }
+        return evidence if return_evidence else proposal
 
     def gonion_pair(
         self,
@@ -222,6 +324,8 @@ class DualViewHard3Net(nn.Module):
         candidate_mask,
         temperature=0.5,
         target_distance=None,
+        proposal_sources=None,
+        teacher_force_probability=0.0,
     ):
         """Rank LM21/22 jointly and return differentiable pair coordinates."""
         left_mask, right_mask = candidate_mask[:, 1], candidate_mask[:, 2]
@@ -232,19 +336,40 @@ class DualViewHard3Net(nn.Module):
             candidate_logits[:, 2].float(), right_mask
         )
         use_topk = min(self.pair_topk, candidate_logits.shape[-1])
-        left_indices = torch.topk(left_logits, use_topk, dim=-1).indices
-        right_indices = torch.topk(right_logits, use_topk, dim=-1).indices
+        if proposal_sources is None:
+            left_sources = left_logits[:, None]
+            right_sources = right_logits[:, None]
+        else:
+            left_sources = proposal_sources[:, 1]
+            right_sources = proposal_sources[:, 2]
+        left_indices = diverse_topk_indices(left_sources, left_mask, use_topk)
+        right_indices = diverse_topk_indices(right_sources, right_mask, use_topk)
 
-        # During training, always expose the closest expert candidate. At
-        # inference this branch is unavailable and the learned unary proposal is
-        # solely responsible for recall.
-        if target_distance is not None:
+        # A short, decaying warmup may expose the nearest candidate. After the
+        # warmup training uses the same proposal distribution as inference.
+        force_probability = float(teacher_force_probability)
+        if target_distance is not None and force_probability > 0.0:
             nearest_left = target_distance[:, 1].argmin(dim=-1)
             nearest_right = target_distance[:, 2].argmin(dim=-1)
+            if force_probability >= 1.0:
+                force = torch.ones(
+                    len(left_indices), dtype=torch.bool, device=left_indices.device
+                )
+            else:
+                force = (
+                    torch.rand(len(left_indices), device=left_indices.device)
+                    < force_probability
+                )
             left_indices = left_indices.clone()
             right_indices = right_indices.clone()
-            left_indices[:, -1] = nearest_left
-            right_indices[:, -1] = nearest_right
+            left_missing = force & ~torch.any(
+                left_indices == nearest_left[:, None], dim=1
+            )
+            right_missing = force & ~torch.any(
+                right_indices == nearest_right[:, None], dim=1
+            )
+            left_indices[left_missing, -1] = nearest_left[left_missing]
+            right_indices[right_missing, -1] = nearest_right[right_missing]
 
         left_valid = torch.gather(left_mask, 1, left_indices)
         right_valid = torch.gather(right_mask, 1, right_indices)
@@ -344,4 +469,5 @@ class DualViewHard3Net(nn.Module):
             "soft_coordinate": soft_coordinate,
             "argmax_coordinate": argmax_coordinate,
             "snapped_coordinate": snapped_coordinate,
+            "proposal_sources": proposal_sources,
         }

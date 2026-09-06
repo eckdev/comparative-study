@@ -181,8 +181,11 @@ def build_parser():
     parser.add_argument(
         "--hard3-dual-view-joint-pair-negative-weight", type=float, default=0.20
     )
-    parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=32)
+    parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-temperature", type=float, default=0.5)
+    parser.add_argument(
+        "--hard3-dual-view-teacher-forcing-epochs", type=int, default=5
+    )
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
     parser.add_argument(
         "--hard3-dual-view-gonion-color-dropout", type=float, default=0.25
@@ -190,6 +193,20 @@ def build_parser():
     parser.add_argument("--hard3-dual-view-atlas-neighbors", type=int, default=8)
     parser.add_argument("--hard3-dual-view-atlas-temperature", type=float, default=2.0)
     parser.add_argument("--hard3-dual-view-final-members", type=int, default=3)
+    parser.add_argument(
+        "--hard3-dual-view-final-policy",
+        choices=("inner_fold_ensemble", "median_best_refit"),
+        default="inner_fold_ensemble",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-diagnostic-topk", default="16,32,64,96"
+    )
+    parser.add_argument(
+        "--hard3-dual-view-min-proposal-recall", type=float, default=0.90
+    )
+    parser.add_argument(
+        "--hard3-dual-view-max-proposal-oracle-ale", type=float, default=1.50
+    )
     parser.add_argument("--hard3-dual-view-target-ale", type=float, default=4.0)
     parser.add_argument("--no-tta", dest="tta", action="store_false")
     parser.add_argument(
@@ -284,11 +301,20 @@ def hard3_dual_view_config_from_args(args):
         joint_pair_negative_weight=args.hard3_dual_view_joint_pair_negative_weight,
         pair_topk=args.hard3_dual_view_pair_topk,
         pair_temperature=args.hard3_dual_view_pair_temperature,
+        proposal_teacher_forcing_epochs=args.hard3_dual_view_teacher_forcing_epochs,
         negative_weight=args.hard3_dual_view_negative_weight,
         gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
         atlas_temperature=args.hard3_dual_view_atlas_temperature,
         final_ensemble_members=args.hard3_dual_view_final_members,
+        final_model_policy=args.hard3_dual_view_final_policy,
+        diagnostic_topk=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_diagnostic_topk.split(",")
+            if value.strip()
+        ),
+        minimum_proposal_recall=args.hard3_dual_view_min_proposal_recall,
+        maximum_proposal_oracle_ale=args.hard3_dual_view_max_proposal_oracle_ale,
         maximum_step_lm0=args.hard3_structured_max_step_lm0,
         maximum_step_gonion=args.hard3_structured_max_step_gonion,
         bootstrap_iters=args.bootstrap_iters,
@@ -328,6 +354,43 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             abs(final_core20 - float(baseline_metrics["core20"]["ale"])) <= 1e-6
         ),
     }
+    proposal_gate = {"applied": False}
+    if hard3_report.get("mode") == "dual_view":
+        diagnostics = (
+            hard3_report.get("training", {})
+            .get("oof", {})
+            .get("proposal_diagnostics", {})
+        )
+        candidate_count = int(diagnostics.get("candidate_count", 0))
+        gate_topk = min(int(args.hard3_dual_view_pair_topk), candidate_count)
+        gate_values = diagnostics.get("at_k", {}).get(str(gate_topk), {})
+        lm21_recall = float(gate_values.get("lm21_recall", 0.0))
+        lm22_recall = float(gate_values.get("lm22_recall", 0.0))
+        proposal_oracle = float(gate_values.get("gonion_oracle_ale", float("inf")))
+        checks.update(
+            {
+                "lm21_proposal_recall_at_gate": bool(
+                    lm21_recall >= args.hard3_dual_view_min_proposal_recall
+                ),
+                "lm22_proposal_recall_at_gate": bool(
+                    lm22_recall >= args.hard3_dual_view_min_proposal_recall
+                ),
+                "proposal_oracle_at_or_below_gate": bool(
+                    proposal_oracle
+                    <= args.hard3_dual_view_max_proposal_oracle_ale
+                ),
+            }
+        )
+        proposal_gate = {
+            "applied": True,
+            "topk": gate_topk,
+            "lm21_recall": lm21_recall,
+            "lm22_recall": lm22_recall,
+            "both_recall": float(gate_values.get("both_recall", 0.0)),
+            "gonion_oracle_ale": proposal_oracle,
+            "minimum_recall": args.hard3_dual_view_min_proposal_recall,
+            "maximum_oracle_ale": args.hard3_dual_view_max_proposal_oracle_ale,
+        }
     return {
         "baseline": {
             "overall_ale": baseline_overall,
@@ -350,6 +413,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             "remaining_hard3_gap_mm": final_hard3 - required_hard3,
             "target_reached": bool(final_overall < 2.0),
         },
+        "proposal_gate": proposal_gate,
         "checks": checks,
         "run_full_cv": bool(all(checks.values())),
         "test_labels_consumed": False,
@@ -569,7 +633,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     hard3_report = {"enabled": False, "reason": "disabled_by_argument"}
     if args.hard3_structured:
         if args.hard3_refiner_mode == "dual_view":
-            hard3_output_dir = fold_dir / "hard3_dual_view"
+            hard3_output_dir = fold_dir / "hard3_dual_view_v3"
             hard3_config = hard3_dual_view_config_from_args(args)
             hard3_refiner = fit_or_load_dual_view_refiner(
                 datasets["train"], hard3_output_dir, hard3_config, device
@@ -662,9 +726,19 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         f"{stage3_decision['two_mm_budget']['remaining_hard3_gap_mm']:.4f}",
         flush=True,
     )
+    if stage3_decision["proposal_gate"]["applied"]:
+        proposal = stage3_decision["proposal_gate"]
+        print(
+            f"Hard3 proposal gate@{proposal['topk']}: "
+            f"LM21={proposal['lm21_recall']:.3f} "
+            f"LM22={proposal['lm22_recall']:.3f} "
+            f"both={proposal['both_recall']:.3f} "
+            f"oracle={proposal['gonion_oracle_ale']:.3f} mm",
+            flush=True,
+        )
     if args.validation_only:
         result = {
-            "postprocess_version": 3 if args.hard3_refiner_mode == "dual_view" else 2,
+            "postprocess_version": 4 if args.hard3_refiner_mode == "dual_view" else 2,
             "stage2_signature": args.stage2_signature,
             "parameter_count": parameter_count,
             "total_inference_parameter_count": parameter_count + hard3_parameter_count,
@@ -761,7 +835,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         args.seed,
     )
     result = {
-        "postprocess_version": 3 if args.hard3_refiner_mode == "dual_view" else 2,
+        "postprocess_version": 4 if args.hard3_refiner_mode == "dual_view" else 2,
         "stage2_signature": args.stage2_signature,
         "parameter_count": parameter_count,
         "total_inference_parameter_count": parameter_count + hard3_parameter_count,
@@ -859,7 +933,7 @@ def load_completed_fold(fold_dir, args, splits):
     if args.hard3_structured:
         hard3_mode = getattr(args, "hard3_refiner_mode", "structured")
         if hard3_mode == "dual_view":
-            hard3_root = fold_dir / "hard3_dual_view"
+            hard3_root = fold_dir / "hard3_dual_view_v3"
             checkpoint = hard3_root / "hard3_dual_view_model.pth"
         else:
             hard3_root = fold_dir / "hard3_structured"
@@ -870,7 +944,7 @@ def load_completed_fold(fold_dir, args, splits):
             hard3_root / "metrics_test.json",
         )
         valid_postprocess_version = (
-            result.get("postprocess_version") == 3
+            result.get("postprocess_version") == 4
             if hard3_mode == "dual_view"
             else result.get("postprocess_version") in (1, 2)
         )

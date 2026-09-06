@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-DVAR v2)
+# Hard3 Anatomical Context Refinement (H3-DVAR v3)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v3/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -23,7 +23,7 @@ sonuçlar her fold altında `hard3_dual_view/` dizinine yazılır.
   üretilir. Neural heatmap, atlas ve surface candidate birleşimi yalnız validation
   fold'unda seçilir; testte politika değiştirilmez.
 
-## Fold 1 denetimi ve v2 değişikliği
+## Fold 1 denetimi ve v3 değişikliği
 
 İlk dual-view koşusu Hard3 ALE'yi `5.2358 -> 4.6143 mm` düşürmüştür. Landmark
 bazında `LM0=2.9303`, `LM21=5.6220`, `LM22=5.2905 mm` ölçülmüştür. Buna göre
@@ -32,15 +32,24 @@ gelmiştir. V1'de iki Gonion birbirinden bağımsız decode ediliyor, pair loss 
 son koordinatlara uygulanıyor ve frontal/profil ağırlıkları tüm örnekler için sabit
 kalıyordu.
 
-V2 bu iki kısıtı doğrudan değiştirir:
+V2 ortak bilateral sıralamayı eklemesine rağmen OOF top-32 proposal recall değeri
+`LM21=%57.3`, `LM22=%57.8` düzeyinde kalmıştır. Joint pair başlığının Gonion kazancı
+yalnız `0.024 mm` olmuştur. Ayrıca inner-fold en iyi epoch medyanı `10` iken final
+refit `min_epochs=30` nedeniyle 30 epocha zorlanmış ve bazı foldlarda belirgin biçimde
+overfit olmuştur.
+
+V3 bu ölçülmüş darboğazları doğrudan değiştirir:
 
 - Her mesh adayı, mirrored canonical konumu ve leakage-free `LM10/11/12` alt-orta
   hat anchor geometrisiyle temsil edilir.
-- Unary heatmaplerden seçilen en güçlü 32 sol ve 32 sağ aday, `32 x 32` ortak bir
-  bilateral dağılım içinde puanlanır. LM21 ve LM22 bu tek dağılımın marjinalleridir.
+- İki görünümün heatmap skoru ile canonical/LM10-LM12 anchor geometrisi, normal,
+  eğrilik ve yoğunluğu birleştiren 26 boyutlu shared 3B proposal head, tüm ROI
+  adaylarını top-k öncesinde puanlar.
+- Learned geometry, fused heatmap, frontal ve profil kaynaklarının rank-union'ından
+  96 proposal seçilir. Bunlar `96 x 96` ortak bilateral dağılımda puanlanır.
 - Pair ranker mesafe tabanlı soft-listwise hedef ve pair hard-negative mining ile
-  eğitilir. En yakın uzman adayı yalnız train loss hesabında proposal kümesine
-  eklenir; validation/test çıkarımında kullanılmaz.
+  eğitilir. Uzman-nearest teacher forcing ilk beş epochta doğrusal olarak sıfıra iner;
+  sonraki eğitim ile validation/test aynı proposal dağılımını kullanır.
 - Frontal/profil füzyonu heatmap kalitesi ve U-Net bağlamına göre örnek bazında
   değişir.
 - Gonion eğitiminde RGB/kontrast kanalları rastgele düşürülerek asimetrik ışık ve
@@ -49,6 +58,10 @@ V2 bu iki kısıtı doğrudan değiştirir:
   değiştirilemez.
 - Doğrudan atlas Gonion adayı seçimden çıkarılmıştır; atlas yalnız zayıf bir logit
   düzenleyicisi olarak denenebilir.
+- Aynı raster pikseline düşen ön/arka yüzeyler artık ortalanmaz; dış yüzeyi koruyan
+  z-buffer görünürlüğü kullanılır.
+- Final çıkarım varsayılan olarak beş inner-fold best checkpoint ensemble'ıdır.
+  Alternatif full-train refit gerçek medyan best epocha kadar eğitilir.
 
 ## Colab Fold 1 geliştirme koşusu
 
@@ -59,24 +72,24 @@ V2 bu iki kısıtı doğrudan değiştirir:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. V2 cache imzası eski Hard3 checkpointinden farklıdır; yalnız
-`fold_1/hard3_dual_view/` yeniden eğitilir ve aynı dizindeki eski Hard3 dosyalarının
-yerini alır.
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v3/` yeniden eğitilir; v1/v2 çıktıları
+değiştirilmez.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
 ```text
-oof.gonion_pair_topk_recall.lm21/lm22
+oof.proposal_diagnostics.at_k.16/32/64/96
+oof.gonion_pair_topk_recall.lm21/lm22/both
 oof.mean_dynamic_view_weights
+oof.std_dynamic_view_weights
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
 selected.alpha_gonion_left/right
 ```
 
-`gonion_pair_topk_recall` değerlerinden biri düşükse darboğaz pair ranker değil,
-unary proposal recall'dır. Her ikisi de yüksek olduğu halde Hard3 hedefe ulaşmazsa
-ortak aday sıralamasının genellemesi yetersizdir; bu ayrım bir sonraki deneyi
-ölçülebilir hale getirir.
+Tam CV için LM21 ve LM22 `proposal@96 recall >= %90` ve shortlist Gonion oracle
+`<=1.50 mm` olmalıdır. Recall yüksek olduğu halde Hard3 hedefe ulaşmazsa darboğazın
+proposal değil ortak aday sıralaması olduğu ölçülebilir biçimde gösterilmiş olur.
 
 Eski ranker'ı ablation olarak çalıştırmak için doğrudan ana script'e
 `--hard3-refiner-mode structured` verilebilir.
@@ -92,15 +105,17 @@ overall ALE kazancı >= 0.03 mm
 Hard3 kazancı >= 0.20 mm
 bootstrap P(improved) >= 0.90
 p95 regresyonu <= 0.10 mm
+OOF proposal@96 recall (LM21 ve LM22) >= %90
+OOF shortlist Gonion oracle ALE <= 1.50 mm
 ```
 
 Ana dosyalar:
 
 ```text
-hard3_dual_view/hard3_dual_view_model.pth
-hard3_dual_view/hard3_dual_view_training_report.json
-hard3_dual_view/hard3_blend_selection.json
-hard3_dual_view/metrics_val.json
+hard3_dual_view_v3/hard3_dual_view_model.pth
+hard3_dual_view_v3/hard3_dual_view_training_report.json
+hard3_dual_view_v3/hard3_blend_selection.json
+hard3_dual_view_v3/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

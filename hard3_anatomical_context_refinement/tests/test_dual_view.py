@@ -1,21 +1,146 @@
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
 from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3
 from hard3_anatomical_context_refinement.atlas import TrainOnlyLocalHard3Atlas
-from hard3_anatomical_context_refinement.model import DualViewHard3Net
+from hard3_anatomical_context_refinement.model import (
+    DualViewHard3Net,
+    diverse_topk_indices,
+)
 from hard3_anatomical_context_refinement.patches import (
     DualViewCandidateSet,
+    _rasterize,
     render_item,
 )
 from hard3_anatomical_context_refinement.refiner import (
     Hard3DualViewConfig,
     _dual_blend_prediction,
     _loss,
+    _median_best_epoch,
+    _proposal_diagnostics,
+    _teacher_force_probability,
     _train_model,
     apply_dual_view_blend,
     calibrate_dual_view_blend,
 )
+
+
+def test_diverse_topk_keeps_the_best_candidate_from_each_proposal_source():
+    sources = torch.full((1, 4, 12), -10.0)
+    for source, candidate in enumerate((0, 3, 6, 9)):
+        sources[0, source] = torch.linspace(-2.0, -3.1, 12)
+        sources[0, source, candidate] = 10.0
+    selected = diverse_topk_indices(
+        sources, torch.ones(1, 12, dtype=torch.bool), topk=4
+    )
+    assert set(selected[0].tolist()) == {0, 3, 6, 9}
+
+
+def test_geometry_proposal_scores_candidates_before_pair_pruning():
+    torch.manual_seed(3)
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=4)
+    images = torch.randn(2, 3, 2, 20, 16, 16)
+    grids = torch.rand(2, 3, 2, 12, 2) * 2 - 1
+    canonical = torch.randn(2, 3, 12, 18)
+    mask = torch.ones(2, 3, 12, dtype=torch.bool)
+    heatmaps, weights = model.forward_with_context(images)
+    evidence = model.candidate_logits(
+        heatmaps,
+        grids,
+        mask,
+        weights,
+        canonical=canonical,
+        return_evidence=True,
+    )
+    assert evidence["proposal_sources"].shape == (2, 3, 4, 12)
+    evidence["logits"][:, 1:3].sum().backward()
+    assert model.gonion_geometry_proposal[-1].weight.grad is not None
+    assert torch.isfinite(model.gonion_geometry_proposal[-1].weight.grad).all()
+
+
+def test_pair_teacher_forcing_is_removed_after_warmup():
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=4)
+    logits = torch.arange(8, 0, -1, dtype=torch.float32).view(1, 1, 8)
+    logits = logits.expand(1, 3, 8).clone()
+    canonical = torch.randn(1, 3, 8, 18)
+    points = torch.randn(1, 3, 8, 3)
+    mask = torch.ones(1, 3, 8, dtype=torch.bool)
+    distance = torch.ones(1, 3, 8)
+    distance[:, 1:3, 7] = 0.0
+    unforced = model.gonion_pair(
+        logits, canonical, points, mask, target_distance=distance
+    )
+    forced = model.gonion_pair(
+        logits,
+        canonical,
+        points,
+        mask,
+        target_distance=distance,
+        teacher_force_probability=1.0,
+    )
+    assert 7 not in unforced["left_indices"][0]
+    assert 7 not in unforced["right_indices"][0]
+    assert 7 in forced["left_indices"][0]
+    assert 7 in forced["right_indices"][0]
+    assert _teacher_force_probability(1, 5) == 1.0
+    assert _teacher_force_probability(6, 5) == 0.0
+
+
+def test_pair_teacher_forcing_does_not_duplicate_an_existing_nearest_candidate():
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=4)
+    logits = torch.arange(8, 0, -1, dtype=torch.float32).view(1, 1, 8)
+    logits = logits.expand(1, 3, 8).clone()
+    canonical = torch.randn(1, 3, 8, 18)
+    points = torch.randn(1, 3, 8, 3)
+    mask = torch.ones(1, 3, 8, dtype=torch.bool)
+    distance = torch.ones(1, 3, 8)
+    distance[:, 1:3, 0] = 0.0
+    forced = model.gonion_pair(
+        logits,
+        canonical,
+        points,
+        mask,
+        target_distance=distance,
+        teacher_force_probability=1.0,
+    )
+    assert torch.unique(forced["left_indices"][0]).numel() == 4
+    assert torch.unique(forced["right_indices"][0]).numel() == 4
+
+
+def test_final_refit_epoch_uses_inner_fold_best_epoch_without_minimum_floor():
+    assert _median_best_epoch([10, 10, 18, 17, 9], 90) == 10
+
+
+def test_rasterizer_uses_outer_zbuffer_instead_of_depth_averaging():
+    features = np.asarray([[1.0], [9.0]], dtype=np.float32)
+    image = _rasterize(
+        features,
+        np.zeros(2, dtype=np.float32),
+        np.zeros(2, dtype=np.float32),
+        np.asarray([-2.0, 3.0], dtype=np.float32),
+        radius=10.0,
+        image_size=5,
+        view_code=1.0,
+    )
+    assert image[0, 2, 2] == 9.0
+
+
+def test_proposal_diagnostics_reports_joint_recall_and_shortlist_oracle():
+    distances = np.full((2, 3, 8), 10.0, dtype=np.float32)
+    distances[:, 1:3, 7] = 0.5
+    sources = np.zeros((2, 3, 4, 8), dtype=np.float32)
+    sources[:, 1:3, 2, 7] = 20.0
+    candidate_set = SimpleNamespace(
+        target_distance=distances,
+        mask=np.ones((2, 3, 8), dtype=np.bool_),
+    )
+    report = _proposal_diagnostics(candidate_set, sources, (1, 4))
+    assert report["at_k"]["4"]["lm21_recall"] == 1.0
+    assert report["at_k"]["4"]["lm22_recall"] == 1.0
+    assert report["at_k"]["4"]["both_recall"] == 1.0
+    assert report["at_k"]["4"]["gonion_oracle_ale"] == 0.5
 
 
 def test_dual_view_forward_candidate_logits_and_loss_are_finite():
@@ -106,7 +231,7 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
     assert rendered[0].shape == (3, 2, 20, 32, 32)
     assert rendered[1].shape == (3, 2, 32, 32)
     assert rendered[2].shape == (3, 2, roi_points, 2)
-    assert rendered[4].shape == (3, roi_points, 18)
+    assert rendered[4].shape == (3, roi_points, 26)
     assert rendered[5].any(axis=-1).all()
     assert rendered[9].shape == (3, 2)
     assert all(np.isfinite(values).all() for values in rendered[:5])

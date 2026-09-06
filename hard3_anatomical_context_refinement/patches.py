@@ -103,19 +103,28 @@ def _rasterize(point_features, u, v, depth, radius, image_size, view_code):
     values = point_features[valid]
     depth = depth[valid]
 
+    # Keep the outermost visible surface sample at each projected pixel. The
+    # previous mean aggregation mixed front/back surfaces and erased the jaw
+    # silhouette that defines Gonion.
+    if len(row):
+        flat = row * size + column
+        order = np.lexsort((depth, flat))
+        ordered_flat = flat[order]
+        keep = np.ones(len(order), dtype=np.bool_)
+        keep[:-1] = ordered_flat[:-1] != ordered_flat[1:]
+        visible = order[keep]
+        row, column = row[visible], column[visible]
+        values, depth = values[visible], depth[visible]
+
     channels = values.shape[1] + 3
     image = np.zeros((channels, size, size), dtype=np.float32)
-    counts = np.zeros((size, size), dtype=np.float32)
-    occupied = counts > 0
+    occupied = np.zeros((size, size), dtype=np.bool_)
     if len(row):
-        for channel in range(values.shape[1]):
-            np.add.at(image[channel], (row, column), values[:, channel])
-        np.add.at(image[-3], (row, column), np.clip(depth / radius, -2.0, 2.0))
-        np.add.at(counts, (row, column), 1.0)
-        occupied = counts > 0
-        image[:-2, occupied] /= counts[occupied]
-        image[-2, occupied] = float(view_code)
-        image[-1, occupied] = 1.0
+        image[: values.shape[1], row, column] = values.T
+        image[-3, row, column] = np.clip(depth / radius, -2.0, 2.0)
+        occupied[row, column] = True
+        image[-2, row, column] = float(view_code)
+        image[-1, row, column] = 1.0
         image = _fill_sparse(image, occupied)
     contour = _contour_channels(image, occupied)
     # Keep occupancy as the final channel for downstream diagnostics.
@@ -186,11 +195,9 @@ def render_item(
             anchor_geometry.extend(
                 [anchor_vector, np.linalg.norm(anchor_vector, axis=1, keepdims=True)]
             )
-        canonical_rows.append(
-            np.concatenate(
-                [local_geometry, global_geometry, *anchor_geometry], axis=1
-            ).astype(np.float32)
-        )
+        canonical_geometry = np.concatenate(
+            [local_geometry, global_geometry, *anchor_geometry], axis=1
+        ).astype(np.float32)
 
         rgb = np.clip(raw[indices, 3:6], 0.0, 1.0)
         contrast = raw[indices, 6:9]
@@ -201,6 +208,18 @@ def render_item(
         density_median, density_scale = _robust_scale(raw[indices[mask], 12])
         density = np.clip(
             (raw[indices, 12:13] - density_median) / density_scale, -4.0, 4.0
+        )
+        canonical_rows.append(
+            np.concatenate(
+                [
+                    canonical_geometry,
+                    normal,
+                    np.abs(normal),
+                    curvature,
+                    density,
+                ],
+                axis=1,
+            ).astype(np.float32)
         )
         per_point = np.concatenate(
             [rgb, contrast, normal, intensity, chroma, curvature, density], axis=1

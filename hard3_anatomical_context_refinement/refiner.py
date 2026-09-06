@@ -24,7 +24,7 @@ from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3, NUM_LANDMARKS
 from all23_rgb_geodesic_cascade.metrics import bootstrap_delta, summarize
 
 from .atlas import TrainOnlyLocalHard3Atlas
-from .model import DualViewHard3Net
+from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
 from .patches import DualViewCandidateSet, extract_dual_view_set
 
 
@@ -55,14 +55,19 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    pair_topk: int = 32
+    pair_topk: int = 96
     pair_temperature: float = 0.5
+    proposal_teacher_forcing_epochs: int = 5
     negative_weight: float = 0.15
     negative_margin: float = 0.5
     gonion_color_dropout: float = 0.25
     atlas_neighbors: int = 8
     atlas_temperature: float = 2.0
     final_ensemble_members: int = 3
+    final_model_policy: str = "inner_fold_ensemble"
+    diagnostic_topk: tuple[int, ...] = (16, 32, 64, 96)
+    minimum_proposal_recall: float = 0.90
+    maximum_proposal_oracle_ale: float = 1.50
     maximum_step_lm0: float = 12.0
     maximum_step_gonion: float = 15.0
     bootstrap_iters: int = 2000
@@ -214,11 +219,32 @@ def _weighted_coordinate(logits, points, mask, topk=10, temperature=0.5):
     return torch.sum(weight[..., None] * selected, dim=2)
 
 
-def _forward_model(model, batch, config, training=False):
+def _teacher_force_probability(epoch, warmup_epochs):
+    warmup = max(int(warmup_epochs), 0)
+    if warmup == 0 or epoch is None:
+        return 0.0
+    return max(0.0, 1.0 - (max(int(epoch), 1) - 1) / max(warmup, 1))
+
+
+def _median_best_epoch(best_epochs, maximum_epochs):
+    if not best_epochs:
+        raise ValueError("best_epochs cannot be empty")
+    return int(np.clip(round(np.median(best_epochs)), 1, int(maximum_epochs)))
+
+
+def _forward_model(
+    model, batch, config, training=False, teacher_force_probability=0.0
+):
     heatmaps, view_weights = model.forward_with_context(batch["images"])
-    candidate_logits = model.candidate_logits(
-        heatmaps, batch["grids"], batch["mask"], view_weights
+    evidence = model.candidate_logits(
+        heatmaps,
+        batch["grids"],
+        batch["mask"],
+        view_weights,
+        canonical=batch["canonical"],
+        return_evidence=True,
     )
+    candidate_logits = evidence["logits"]
     pair = model.gonion_pair(
         candidate_logits,
         batch["canonical"],
@@ -226,6 +252,8 @@ def _forward_model(model, batch, config, training=False):
         batch["mask"],
         config.pair_temperature,
         batch["distance"] if training else None,
+        evidence["proposal_sources"],
+        teacher_force_probability,
     )
     return heatmaps, candidate_logits, pair, view_weights
 
@@ -384,6 +412,7 @@ def _predict_outputs(model, candidate_set, indices, config, device):
     model.eval()
     chunks = {
         "logits": [],
+        "proposal_sources": [],
         "pair_soft": [],
         "pair_argmax": [],
         "pair_snapped": [],
@@ -398,6 +427,9 @@ def _predict_outputs(model, candidate_set, indices, config, device):
         batch = _tensor_batch(candidate_set, selected, device, config)
         _, logits, pair, view_weights = _forward_model(model, batch, config)
         chunks["logits"].append(logits.float().cpu().numpy())
+        chunks["proposal_sources"].append(
+            pair["proposal_sources"].float().cpu().numpy()
+        )
         chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
         chunks["pair_argmax"].append(pair["argmax_coordinate"].float().cpu().numpy())
         chunks["pair_snapped"].append(pair["snapped_coordinate"].float().cpu().numpy())
@@ -410,6 +442,83 @@ def _predict_outputs(model, candidate_set, indices, config, device):
 def _predict_logits(model, candidate_set, indices, config, device):
     """Compatibility wrapper retained for downstream diagnostic imports."""
     return _predict_outputs(model, candidate_set, indices, config, device)["logits"]
+
+
+def _proposal_indices(source_logits, mask, topk):
+    with torch.no_grad():
+        return (
+            diverse_topk_indices(
+                torch.from_numpy(np.asarray(source_logits, dtype=np.float32)),
+                torch.from_numpy(np.asarray(mask, dtype=np.bool_)),
+                topk,
+            )
+            .cpu()
+            .numpy()
+        )
+
+
+def _proposal_diagnostics(candidate_set, proposal_sources, requested_topk):
+    distances = np.asarray(candidate_set.target_distance[:, 1:3], dtype=np.float32)
+    masks = np.asarray(candidate_set.mask[:, 1:3], dtype=np.bool_)
+    sources = np.asarray(proposal_sources[:, 1:3], dtype=np.float32)
+    nearest = np.argmin(distances, axis=-1)
+    candidate_count = distances.shape[-1]
+    topk_values = sorted(
+        {
+            min(max(1, int(value)), candidate_count)
+            for value in requested_topk
+        }
+    )
+    at_k = {}
+    for topk in topk_values:
+        selected = np.stack(
+            [
+                _proposal_indices(sources[:, landmark], masks[:, landmark], topk)
+                for landmark in range(2)
+            ],
+            axis=1,
+        )
+        hits = np.any(selected == nearest[..., None], axis=-1)
+        shortlisted_distance = np.take_along_axis(
+            distances, selected, axis=-1
+        ).min(axis=-1)
+        at_k[str(topk)] = {
+            "lm21_recall": float(hits[:, 0].mean()),
+            "lm22_recall": float(hits[:, 1].mean()),
+            "both_recall": float(np.all(hits, axis=1).mean()),
+            "either_missed_fraction": float((~np.all(hits, axis=1)).mean()),
+            "lm21_oracle_ale": float(shortlisted_distance[:, 0].mean()),
+            "lm22_oracle_ale": float(shortlisted_distance[:, 1].mean()),
+            "gonion_oracle_ale": float(shortlisted_distance.mean()),
+            "gonion_oracle_p95": float(np.percentile(shortlisted_distance, 95)),
+        }
+
+    source_recall = {}
+    diagnostic_k = topk_values[-1]
+    for source_index, source_name in enumerate(PROPOSAL_SOURCE_NAMES):
+        side_hits = []
+        for landmark in range(2):
+            values = np.where(
+                masks[:, landmark], sources[:, landmark, source_index], -np.inf
+            )
+            count = min(diagnostic_k, values.shape[-1])
+            selected = np.argsort(values, axis=-1)[:, -count:]
+            side_hits.append(np.any(selected == nearest[:, landmark, None], axis=-1))
+        side_hits = np.stack(side_hits, axis=1)
+        source_recall[source_name] = {
+            "lm21": float(side_hits[:, 0].mean()),
+            "lm22": float(side_hits[:, 1].mean()),
+            "both": float(np.all(side_hits, axis=1).mean()),
+        }
+    return {
+        "source_names": list(PROPOSAL_SOURCE_NAMES),
+        "candidate_count": int(candidate_count),
+        "at_k": at_k,
+        "source_recall_at_largest_k": {
+            "topk": int(diagnostic_k),
+            "sources": source_recall,
+        },
+    }
 
 
 def _select_dual_coordinate_policy(candidate_set, logits, pair_outputs):
@@ -484,8 +593,15 @@ def _train_model(
             )
             batch = _tensor_batch(candidate_set, selected, device, config, True, rng)
             optimizer.zero_grad(set_to_none=True)
+            teacher_force_probability = _teacher_force_probability(
+                epoch, config.proposal_teacher_forcing_epochs
+            )
             heatmaps, logits, pair_output, _ = _forward_model(
-                model, batch, config, training=True
+                model,
+                batch,
+                config,
+                training=True,
+                teacher_force_probability=teacher_force_probability,
             )
             loss, components = _loss(heatmaps, logits, batch, config, pair_output)
             if not torch.isfinite(loss):
@@ -520,6 +636,9 @@ def _train_model(
             "validation_hard3_ale": score,
             "validation_lm0_ale": float(val_error[:, 0].mean()),
             "validation_gonion_ale": float(val_error[:, 1:3].mean()),
+            "teacher_force_probability": _teacher_force_probability(
+                epoch, config.proposal_teacher_forcing_epochs
+            ),
             "lr": float(optimizer.param_groups[0]["lr"]),
             **{f"train_{name}": value / max(seen, 1) for name, value in totals.items()},
         }
@@ -572,8 +691,15 @@ def _train_fixed_model(candidate_set, epochs, config, device, member_number):
             )
             batch = _tensor_batch(candidate_set, selected, device, config, True, rng)
             optimizer.zero_grad(set_to_none=True)
+            teacher_force_probability = _teacher_force_probability(
+                epoch, config.proposal_teacher_forcing_epochs
+            )
             heatmaps, logits, pair_output, _ = _forward_model(
-                model, batch, config, training=True
+                model,
+                batch,
+                config,
+                training=True,
+                teacher_force_probability=teacher_force_probability,
             )
             loss, _ = _loss(heatmaps, logits, batch, config, pair_output)
             if not torch.isfinite(loss):
@@ -589,6 +715,9 @@ def _train_fixed_model(candidate_set, epochs, config, device, member_number):
                 "epoch": epoch,
                 "train_loss": total / max(seen, 1),
                 "lr": float(optimizer.param_groups[0]["lr"]),
+                "teacher_force_probability": _teacher_force_probability(
+                    epoch, config.proposal_teacher_forcing_epochs
+                ),
             }
         )
         if epoch == 1 or epoch % 10 == 0 or epoch == int(epochs):
@@ -612,6 +741,8 @@ def _cache_signature(dataset, config):
         "minimum_improvement_probability",
         "maximum_p95_regression_mm",
         "target_hard3_ale",
+        "minimum_proposal_recall",
+        "maximum_proposal_oracle_ale",
     }
     model_config = {
         key: value for key, value in asdict(config).items() if key not in ignored
@@ -627,7 +758,7 @@ def _cache_signature(dataset, config):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     payload = {
-        "version": 3,
+        "version": 5,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -855,6 +986,11 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     oof_logits = np.full(
         (len(candidates), 3, candidates.points.shape[-2]), -np.inf, dtype=np.float32
     )
+    oof_proposal_sources = np.full(
+        (len(candidates), 3, len(PROPOSAL_SOURCE_NAMES), candidates.points.shape[-2]),
+        -np.inf,
+        dtype=np.float32,
+    )
     oof_pair = {
         name: np.zeros((len(candidates), 2, 3), dtype=np.float32)
         for name in ("pair_soft", "pair_argmax", "pair_snapped")
@@ -865,7 +1001,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         for name in ("pair_left_indices", "pair_right_indices")
     }
     oof_view_weights = np.zeros((len(candidates), 3, 2), dtype=np.float32)
-    fold_reports, oof_models, best_epochs = [], [], []
+    fold_reports, oof_models, oof_states, best_epochs = [], [], [], []
     for fold_number, (train_indices, val_indices) in enumerate(
         _splitter(candidates.strata, config.folds, config.seed), start=1
     ):
@@ -878,6 +1014,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             fold_number,
         )
         oof_logits[val_indices] = fold_outputs["logits"]
+        oof_proposal_sources[val_indices] = fold_outputs["proposal_sources"]
         for name in oof_pair:
             oof_pair[name][val_indices] = fold_outputs[name]
         for name in oof_pair_indices:
@@ -887,6 +1024,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         model = _new_model(candidates, config)
         model.load_state_dict(state)
         oof_models.append(model)
+        oof_states.append(state)
         fold_reports.append(
             {
                 "fold": fold_number,
@@ -901,6 +1039,11 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         )
     if not np.isfinite(oof_logits[candidates.mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF logits are incomplete")
+    expanded_mask = np.broadcast_to(
+        candidates.mask[:, :, None], oof_proposal_sources.shape
+    )
+    if not np.isfinite(oof_proposal_sources[expanded_mask]).all():
+        raise RuntimeError("Dual-view Hard3 OOF proposal sources are incomplete")
     policy = _select_dual_coordinate_policy(candidates, oof_logits, oof_pair)
     oof_prediction = _decode_dual_policy(candidates, oof_logits, oof_pair, policy)
     oof_error = np.linalg.norm(oof_prediction - candidates.expert, axis=-1)
@@ -928,24 +1071,73 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         member_predictions - ensemble_prediction[None], axis=-1
     ).mean(axis=0)
     reliability_scale = np.maximum(np.percentile(spread, 75, axis=0), 0.25)
-    fixed_epochs = int(
-        np.clip(np.median(best_epochs), config.min_epochs, config.epochs)
+    median_best_epoch = _median_best_epoch(best_epochs, config.epochs)
+    if config.final_model_policy == "inner_fold_ensemble":
+        models = oof_models
+        states = oof_states
+        fixed_epochs = None
+        final_histories = [
+            {
+                "member": fold["fold"],
+                "epochs": fold["best_epoch"],
+                "source": "inner_fold_best_checkpoint",
+            }
+            for fold in fold_reports
+        ]
+        final_selection = (
+            "ensemble of inner-fold best checkpoints; no outer-validation labels"
+        )
+    elif config.final_model_policy == "median_best_refit":
+        fixed_epochs = median_best_epoch
+        models, states, final_histories = [], [], []
+        for member_number in range(1, max(1, config.final_ensemble_members) + 1):
+            model, history, state = _train_fixed_model(
+                candidates, fixed_epochs, config, device, member_number
+            )
+            models.append(model)
+            states.append(state)
+            final_histories.append(
+                {"member": member_number, "epochs": fixed_epochs, "history": history}
+            )
+        final_selection = (
+            "full-train refit at median inner-fold best epoch; "
+            "no outer-validation labels"
+        )
+    else:
+        raise ValueError(
+            "final_model_policy must be inner_fold_ensemble or median_best_refit"
+        )
+    diagnostics = _proposal_diagnostics(
+        candidates,
+        oof_proposal_sources,
+        tuple(config.diagnostic_topk) + (config.pair_topk,),
     )
-    models, states, final_histories = [], [], []
-    for member_number in range(1, max(1, config.final_ensemble_members) + 1):
-        model, history, state = _train_fixed_model(
-            candidates, fixed_epochs, config, device, member_number
-        )
-        models.append(model)
-        states.append(state)
-        final_histories.append(
-            {"member": member_number, "epochs": fixed_epochs, "history": history}
-        )
+    diagnostic_key = str(min(config.pair_topk, candidates.points.shape[-2]))
+    diagnostic_row = diagnostics["at_k"][diagnostic_key]
+    print(
+        f"H3-DVAR v3 proposal@{diagnostic_key}: "
+        f"LM21={diagnostic_row['lm21_recall']:.3f} "
+        f"LM22={diagnostic_row['lm22_recall']:.3f} "
+        f"both={diagnostic_row['both_recall']:.3f} "
+        f"oracle={diagnostic_row['gonion_oracle_ale']:.3f} mm",
+        flush=True,
+    )
+    nearest_left = np.argmin(candidates.target_distance[:, 1], axis=-1)
+    nearest_right = np.argmin(candidates.target_distance[:, 2], axis=-1)
+    left_pair_hit = np.any(
+        oof_pair_indices["pair_left_indices"] == nearest_left[:, None], axis=1
+    )
+    right_pair_hit = np.any(
+        oof_pair_indices["pair_right_indices"] == nearest_right[:, None], axis=1
+    )
     parameter_count = sum(parameter.numel() for parameter in models[0].parameters())
     report = {
         "signature": signature,
-        "version": "H3-DVAR-v2",
-        "method": "nested-OOF dynamic dual-view heatmap plus joint bilateral Gonion pair ranking",
+        "version": "H3-DVAR-v3",
+        "method": (
+            "nested-OOF proposal-first 3D geometry plus diversified dual-view "
+            "bilateral Gonion pair ranking"
+        ),
         "uses_validation_labels_for_model_fit": False,
         "uses_test_labels": False,
         "sample_count": len(candidates),
@@ -955,7 +1147,9 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         "folds": fold_reports,
         "oof_best_epochs": best_epochs,
         "final_training": {
-            "selection": "median inner-fold best epoch; no outer-validation labels",
+            "selection": final_selection,
+            "policy": config.final_model_policy,
+            "median_inner_fold_best_epoch": median_best_epoch,
             "fixed_epochs": fixed_epochs,
             "members": final_histories,
         },
@@ -968,31 +1162,15 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             "candidate_oracle_ale": float(
                 np.min(candidates.target_distance, axis=-1).mean()
             ),
+            "proposal_diagnostics": diagnostics,
             "gonion_pair_topk_recall": {
-                "lm21": float(
-                    np.mean(
-                        np.any(
-                            oof_pair_indices["pair_left_indices"]
-                            == np.argmin(candidates.target_distance[:, 1], axis=-1)[
-                                :, None
-                            ],
-                            axis=1,
-                        )
-                    )
-                ),
-                "lm22": float(
-                    np.mean(
-                        np.any(
-                            oof_pair_indices["pair_right_indices"]
-                            == np.argmin(candidates.target_distance[:, 2], axis=-1)[
-                                :, None
-                            ],
-                            axis=1,
-                        )
-                    )
-                ),
+                "topk": int(pair_count),
+                "lm21": float(left_pair_hit.mean()),
+                "lm22": float(right_pair_hit.mean()),
+                "both": float(np.mean(left_pair_hit & right_pair_hit)),
             },
             "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
+            "std_dynamic_view_weights": oof_view_weights.std(axis=0).tolist(),
         },
         "atlas": {
             "fit_sample_ids": candidates.sample_ids,

@@ -143,6 +143,8 @@ def command_for(preset, seed, fold_indices):
             "8",
             "--hard3-dual-view-final-members",
             "1",
+            "--hard3-dual-view-final-policy",
+            "median_best_refit",
             "--skip-oracle-gate",
             "--max-stage2-val-ale",
             "200",
@@ -208,6 +210,18 @@ def command_for(preset, seed, fold_indices):
         "20",
         "--hard3-refiner-mode",
         "dual_view",
+        "--hard3-dual-view-pair-topk",
+        "96",
+        "--hard3-dual-view-teacher-forcing-epochs",
+        "5",
+        "--hard3-dual-view-final-policy",
+        "inner_fold_ensemble",
+        "--hard3-dual-view-diagnostic-topk",
+        "16,32,64,96",
+        "--hard3-dual-view-min-proposal-recall",
+        "0.90",
+        "--hard3-dual-view-max-proposal-oracle-ale",
+        "1.50",
     ]
     if PREPROCESSING_ROOT.exists():
         command.extend(["--preprocessing-root", str(PREPROCESSING_ROOT)])

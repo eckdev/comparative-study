@@ -379,6 +379,49 @@ def test_stage3_decision_exposes_two_mm_hard3_budget():
     assert decision["test_labels_consumed"] is False
 
 
+def test_stage3_decision_blocks_full_cv_when_v3_proposal_recall_is_low():
+    args = SimpleNamespace(
+        hard3_stage3_full_cv_max_overall=2.25,
+        hard3_stage3_full_cv_max_hard3=4.0,
+        hard3_dual_view_pair_topk=96,
+        hard3_dual_view_min_proposal_recall=0.90,
+        hard3_dual_view_max_proposal_oracle_ale=1.50,
+    )
+    baseline = {
+        "overall": {"ale": 2.28, "p95": 6.4},
+        "core20": {"ale": 1.83},
+        "hard3": {"ale": 5.2},
+    }
+    final = {
+        "overall": {"ale": 2.05, "p95": 6.0},
+        "core20": {"ale": 1.83},
+        "hard3": {"ale": 3.52},
+    }
+    report = {
+        "mode": "dual_view",
+        "blend": {"accepted": True, "target_reached_on_validation": True},
+        "training": {
+            "oof": {
+                "proposal_diagnostics": {
+                    "candidate_count": 1024,
+                    "at_k": {
+                        "96": {
+                            "lm21_recall": 0.89,
+                            "lm22_recall": 0.94,
+                            "both_recall": 0.85,
+                            "gonion_oracle_ale": 1.1,
+                        }
+                    },
+                }
+            }
+        },
+    }
+    decision = build_stage3_decision(args, baseline, final, report)
+    assert decision["checks"]["lm21_proposal_recall_at_gate"] is False
+    assert decision["checks"]["lm22_proposal_recall_at_gate"] is True
+    assert decision["run_full_cv"] is False
+
+
 def test_colab_full_cv_requires_passing_hard3_gate(tmp_path):
     fold = tmp_path / "fold_1"
     fold.mkdir()
