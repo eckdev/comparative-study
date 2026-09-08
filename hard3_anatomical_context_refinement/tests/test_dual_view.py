@@ -20,6 +20,7 @@ from hard3_anatomical_context_refinement.refiner import (
     _loss,
     _median_best_epoch,
     _proposal_diagnostics,
+    _set_training_stage,
     _teacher_force_probability,
     _train_model,
     apply_dual_view_blend,
@@ -40,11 +41,15 @@ def test_diverse_topk_keeps_the_best_candidate_from_each_proposal_source():
 
 def test_geometry_proposal_scores_candidates_before_pair_pruning():
     torch.manual_seed(3)
-    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=4)
+    model = DualViewHard3Net(
+        20, width=8, dropout=0.0, geometry_dim=34, pair_topk=4
+    )
     images = torch.randn(2, 3, 2, 20, 16, 16)
     grids = torch.rand(2, 3, 2, 12, 2) * 2 - 1
-    canonical = torch.randn(2, 3, 12, 18)
+    canonical = torch.randn(2, 3, 12, 34)
     mask = torch.ones(2, 3, 12, dtype=torch.bool)
+    neighbors = torch.arange(12).view(1, 1, 12, 1).expand(2, 3, -1, -1)
+    neighbor_mask = torch.ones_like(neighbors, dtype=torch.bool)
     heatmaps, weights = model.forward_with_context(images)
     evidence = model.candidate_logits(
         heatmaps,
@@ -52,12 +57,66 @@ def test_geometry_proposal_scores_candidates_before_pair_pruning():
         mask,
         weights,
         canonical=canonical,
+        neighbor_index=neighbors,
+        neighbor_mask=neighbor_mask,
         return_evidence=True,
     )
     assert evidence["proposal_sources"].shape == (2, 3, 4, 12)
     evidence["logits"][:, 1:3].sum().backward()
-    assert model.gonion_geometry_proposal[-1].weight.grad is not None
-    assert torch.isfinite(model.gonion_geometry_proposal[-1].weight.grad).all()
+    output = model.gonion_geometry_proposal.fusion[-1]
+    assert output.weight.grad is not None
+    assert torch.isfinite(output.weight.grad).all()
+
+
+def test_surface_context_proposal_changes_when_local_neighbors_change():
+    torch.manual_seed(7)
+    model = DualViewHard3Net(
+        20, width=8, dropout=0.0, geometry_dim=18, pair_topk=2
+    )
+    torch.nn.init.normal_(model.gonion_geometry_proposal.fusion[-1].weight, std=0.2)
+    features = torch.randn(1, 2, 6, 23)
+    geometry = torch.randn(1, 2, 6, 18)
+    mask = torch.ones(1, 2, 6, dtype=torch.bool)
+    first_neighbors = torch.arange(6).view(1, 1, 6, 1).expand(1, 2, -1, -1)
+    second_neighbors = torch.flip(first_neighbors, dims=(2,))
+    neighbor_mask = torch.ones_like(first_neighbors, dtype=torch.bool)
+    first = model.gonion_geometry_proposal(
+        features, geometry, first_neighbors, neighbor_mask, mask
+    )
+    second = model.gonion_geometry_proposal(
+        features, geometry, second_neighbors, neighbor_mask, mask
+    )
+    assert not torch.allclose(first, second)
+
+
+def test_pair_decoder_uses_learned_shortlist_instead_of_rank_union():
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=2)
+    logits = torch.zeros(1, 3, 8)
+    logits[:, 1:3, 0] = 9.0
+    logits[:, 1:3, 1] = 8.0
+    sources = torch.zeros(1, 3, 4, 8)
+    sources[:, 1:3, 1:, 7] = 20.0
+    pair = model.gonion_pair(
+        logits,
+        torch.randn(1, 3, 8, 18),
+        torch.randn(1, 3, 8, 3),
+        torch.ones(1, 3, 8, dtype=torch.bool),
+        proposal_sources=sources,
+    )
+    assert set(pair["left_indices"][0].tolist()) == {0, 1}
+    assert set(pair["right_indices"][0].tolist()) == {0, 1}
+
+
+def test_pair_stage_freezes_everything_except_bilateral_ranker():
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=2)
+    _set_training_stage(model, "pair")
+    assert all(parameter.requires_grad for parameter in model.gonion_pair_ranker.parameters())
+    frozen = [
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith("gonion_pair_ranker.")
+    ]
+    assert not any(frozen)
 
 
 def test_pair_teacher_forcing_is_removed_after_warmup():
@@ -131,7 +190,7 @@ def test_proposal_diagnostics_reports_joint_recall_and_shortlist_oracle():
     distances = np.full((2, 3, 8), 10.0, dtype=np.float32)
     distances[:, 1:3, 7] = 0.5
     sources = np.zeros((2, 3, 4, 8), dtype=np.float32)
-    sources[:, 1:3, 2, 7] = 20.0
+    sources[:, 1:3, 0, 7] = 20.0
     candidate_set = SimpleNamespace(
         target_distance=distances,
         mask=np.ones((2, 3, 8), dtype=np.bool_),
@@ -141,6 +200,7 @@ def test_proposal_diagnostics_reports_joint_recall_and_shortlist_oracle():
     assert report["at_k"]["4"]["lm22_recall"] == 1.0
     assert report["at_k"]["4"]["both_recall"] == 1.0
     assert report["at_k"]["4"]["gonion_oracle_ale"] == 0.5
+    assert report["at_k"]["4"]["gonion_oracle_sdr_at_2mm"] == 1.0
 
 
 def test_dual_view_forward_candidate_logits_and_loss_are_finite():
@@ -231,9 +291,11 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
     assert rendered[0].shape == (3, 2, 20, 32, 32)
     assert rendered[1].shape == (3, 2, 32, 32)
     assert rendered[2].shape == (3, 2, roi_points, 2)
-    assert rendered[4].shape == (3, roi_points, 26)
-    assert rendered[5].any(axis=-1).all()
-    assert rendered[9].shape == (3, 2)
+    assert rendered[4].shape == (3, roi_points, 34)
+    assert rendered[5].shape == (3, roi_points, 12)
+    assert rendered[6].shape == (3, roi_points, 12)
+    assert rendered[7].any(axis=-1).all()
+    assert rendered[11].shape == (3, 2)
     assert all(np.isfinite(values).all() for values in rendered[:5])
     # CoordConv and contour/depth-gradient channels are present immediately
     # before the final occupancy channel.
@@ -294,6 +356,11 @@ def test_tiny_joint_pair_training_and_inference_complete():
         ),
         points=points,
         canonical=rng.normal(size=(samples, 3, candidates, 18)).astype(np.float32),
+        neighbor_index=np.broadcast_to(
+            np.arange(candidates)[None, None, :, None],
+            (samples, 3, candidates, 1),
+        ).copy(),
+        neighbor_mask=np.ones((samples, 3, candidates, 1), dtype=bool),
         mask=np.ones((samples, 3, candidates), dtype=bool),
         expert=expert,
         expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
@@ -311,6 +378,9 @@ def test_tiny_joint_pair_training_and_inference_complete():
             batch_size=2,
             width=8,
             pair_topk=4,
+            pair_stage_epochs=1,
+            pair_stage_min_epochs=1,
+            pair_stage_patience=1,
             translation_pixels=0,
             color_noise=0.0,
             gonion_color_dropout=0.0,
@@ -318,9 +388,9 @@ def test_tiny_joint_pair_training_and_inference_complete():
         torch.device("cpu"),
         fold_number=1,
     )
-    assert best_epoch == 1
-    assert np.isfinite(score)
-    assert len(history) == 1
+    assert best_epoch == {"proposal": 1, "pair": 1}
+    assert all(np.isfinite(value) for value in score.values())
+    assert len(history) == 2
     assert outputs["logits"].shape == (2, 3, candidates)
     assert outputs["pair_soft"].shape == (2, 2, 3)
 

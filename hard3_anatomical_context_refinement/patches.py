@@ -20,6 +20,8 @@ class DualViewCandidateSet:
     grids: np.ndarray
     points: np.ndarray
     canonical: np.ndarray
+    neighbor_index: np.ndarray
+    neighbor_mask: np.ndarray
     mask: np.ndarray
     expert: np.ndarray
     expert_full: np.ndarray
@@ -94,6 +96,39 @@ def _contour_channels(image, occupied, maximum_fill_distance=3.0):
     ).astype(np.float32)
 
 
+def _surface_neighbors(points, valid_mask, neighbor_count):
+    """Build a fixed local surface graph inside one geodesic ROI."""
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points, dtype=np.float32)
+    valid_mask = np.asarray(valid_mask, dtype=np.bool_)
+    count = max(1, int(neighbor_count))
+    indices = np.zeros((len(points), count), dtype=np.int64)
+    mask = np.zeros((len(points), count), dtype=np.bool_)
+    valid = np.flatnonzero(valid_mask)
+    if len(valid) == 0:
+        return indices, mask
+    if len(valid) == 1:
+        indices[valid[0], 0] = valid[0]
+        mask[valid[0], 0] = True
+        return indices, mask
+
+    query_count = min(count + 1, len(valid))
+    _, local_neighbors = cKDTree(points[valid]).query(
+        points[valid], k=query_count
+    )
+    if query_count == 1:
+        local_neighbors = local_neighbors[:, None]
+    for row, candidate in enumerate(valid):
+        neighbors = valid[np.atleast_1d(local_neighbors[row])]
+        neighbors = neighbors[neighbors != candidate][:count]
+        if len(neighbors) == 0:
+            neighbors = np.asarray([candidate], dtype=np.int64)
+        indices[candidate, : len(neighbors)] = neighbors
+        mask[candidate, : len(neighbors)] = True
+    return indices, mask
+
+
 def _rasterize(point_features, u, v, depth, radius, image_size, view_code):
     size = int(image_size)
     column = np.rint((u / radius + 1.0) * 0.5 * (size - 1)).astype(np.int64)
@@ -145,7 +180,13 @@ def _target_heatmap(expert_relative, axes, radius, image_size, sigma_mm):
 
 
 def render_item(
-    item, normalizer_mean, normalizer_std, image_size=64, radius_scale=1.0, centers=None
+    item,
+    normalizer_mean,
+    normalizer_std,
+    image_size=64,
+    radius_scale=1.0,
+    centers=None,
+    neighbor_count=12,
 ):
     points = item["points"].numpy().astype(np.float32)
     normalized = item["features"].numpy().astype(np.float32)
@@ -161,6 +202,7 @@ def render_item(
 
     origin, frame, face_scale = _canonical_frame(centers)
     images, targets, grids, canonical_rows, target_view_masks = [], [], [], [], []
+    neighbor_indices, neighbor_masks = [], []
     candidate_points = points[roi_index]
     for local_index, landmark in enumerate(HARD3):
         indices = roi_index[local_index]
@@ -217,6 +259,10 @@ def render_item(
                     np.abs(normal),
                     curvature,
                     density,
+                    rgb,
+                    contrast,
+                    intensity,
+                    chroma,
                 ],
                 axis=1,
             ).astype(np.float32)
@@ -241,6 +287,11 @@ def render_item(
             )
             mask[nearest] = True
         roi_mask[local_index] = mask
+        local_neighbors, local_neighbor_mask = _surface_neighbors(
+            selected, mask, neighbor_count
+        )
+        neighbor_indices.append(local_neighbors)
+        neighbor_masks.append(local_neighbor_mask)
         landmark_images, landmark_targets, landmark_grids, landmark_target_masks = (
             [],
             [],
@@ -291,6 +342,8 @@ def render_item(
         np.asarray(grids, dtype=np.float32),
         candidate_points.astype(np.float32),
         np.asarray(canonical_rows, dtype=np.float32),
+        np.asarray(neighbor_indices, dtype=np.int64),
+        np.asarray(neighbor_masks, dtype=np.bool_),
         roi_mask,
         expert,
         expert_full,
@@ -300,11 +353,16 @@ def render_item(
 
 
 def extract_dual_view_set(
-    dataset, image_size=64, radius_scale=1.0, centers_by_id=None, label="Hard3 patches"
+    dataset,
+    image_size=64,
+    radius_scale=1.0,
+    centers_by_id=None,
+    label="Hard3 patches",
+    neighbor_count=12,
 ):
     previous_training = dataset.training
     dataset.training = False
-    rows = [[] for _ in range(10)]
+    rows = [[] for _ in range(12)]
     sample_ids, strata = [], []
     try:
         for index in range(len(dataset)):
@@ -319,6 +377,7 @@ def extract_dual_view_set(
                 image_size=image_size,
                 radius_scale=radius_scale,
                 centers=centers,
+                neighbor_count=neighbor_count,
             )
             for destination, value in zip(rows, rendered):
                 destination.append(value)
@@ -336,9 +395,11 @@ def extract_dual_view_set(
         grids=np.stack(rows[2]),
         points=np.stack(rows[3]),
         canonical=np.stack(rows[4]),
-        mask=np.stack(rows[5]),
-        expert=np.stack(rows[6]),
-        expert_full=np.stack(rows[7]),
-        target_distance=np.stack(rows[8]),
-        target_view_mask=np.stack(rows[9]),
+        neighbor_index=np.stack(rows[5]),
+        neighbor_mask=np.stack(rows[6]),
+        mask=np.stack(rows[7]),
+        expert=np.stack(rows[8]),
+        expert_full=np.stack(rows[9]),
+        target_distance=np.stack(rows[10]),
+        target_view_mask=np.stack(rows[11]),
     )

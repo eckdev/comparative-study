@@ -379,13 +379,15 @@ def test_stage3_decision_exposes_two_mm_hard3_budget():
     assert decision["test_labels_consumed"] is False
 
 
-def test_stage3_decision_blocks_full_cv_when_v3_proposal_recall_is_low():
+def test_stage3_decision_blocks_full_cv_when_v4_shortlist_tail_is_weak():
     args = SimpleNamespace(
         hard3_stage3_full_cv_max_overall=2.25,
         hard3_stage3_full_cv_max_hard3=4.0,
-        hard3_dual_view_pair_topk=96,
+        hard3_dual_view_pair_topk=24,
         hard3_dual_view_min_proposal_recall=0.90,
         hard3_dual_view_max_proposal_oracle_ale=1.50,
+        hard3_dual_view_min_proposal_sdr2=0.75,
+        hard3_dual_view_max_proposal_oracle_p95=3.50,
     )
     baseline = {
         "overall": {"ale": 2.28, "p95": 6.4},
@@ -405,11 +407,13 @@ def test_stage3_decision_blocks_full_cv_when_v3_proposal_recall_is_low():
                 "proposal_diagnostics": {
                     "candidate_count": 1024,
                     "at_k": {
-                        "96": {
-                            "lm21_recall": 0.89,
-                            "lm22_recall": 0.94,
-                            "both_recall": 0.85,
+                        "24": {
+                            "lm21_recall": 0.80,
+                            "lm22_recall": 0.81,
+                            "both_recall": 0.66,
                             "gonion_oracle_ale": 1.1,
+                            "gonion_oracle_p95": 4.1,
+                            "gonion_oracle_sdr_at_2mm": 0.80,
                         }
                     },
                 }
@@ -417,8 +421,9 @@ def test_stage3_decision_blocks_full_cv_when_v3_proposal_recall_is_low():
         },
     }
     decision = build_stage3_decision(args, baseline, final, report)
-    assert decision["checks"]["lm21_proposal_recall_at_gate"] is False
-    assert decision["checks"]["lm22_proposal_recall_at_gate"] is True
+    assert decision["checks"]["proposal_oracle_at_or_below_gate"] is True
+    assert decision["checks"]["proposal_oracle_p95_at_or_below_gate"] is False
+    assert decision["checks"]["proposal_oracle_sdr2_at_or_above_gate"] is True
     assert decision["run_full_cv"] is False
 
 

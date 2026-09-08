@@ -18,12 +18,13 @@ checkpoint'leri değiştirilmez.
 - Refiner dondurulduktan sonra ayrı confidence gate eğitimi.
 - Outer-train uzman şekillerinden fit edilen PCA + Core20-to-Hard3 conditional shape-prior.
   Shape-prior hiperparametreleri yalnız validation'da seçilir; test etiketi kullanılmaz.
-- Donmuş vNext + shape-prior çıktısı üzerinde proposal-first H3-DVAR v3 aşaması:
+- Donmuş vNext + shape-prior çıktısı üzerinde iki aşamalı H3-DVAR v4:
   - `LM0` için frontal/profil RGB-depth appearance U-Net,
-  - `LM21/LM22` için ortak bilateral contour U-Net ve top-k öncesi 3B geometry proposal,
-  - geometry/fused/frontal/profile rank-union ile 96 aday ve joint pair constraint,
-  - neural surface heatmap ile train-only Core20 local-atlas prior birleşimi,
-  - nested OOF best-checkpoint ensemble ve beş epochta sönen teacher forcing,
+  - `LM21/LM22` için RGB, normal, curvature ve landmark-anchor özellikli lokal
+    surface-context proposal ranker,
+  - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 24` learned shortlist,
+  - proposal ağı dondurulduktan sonra ayrı eğitilen `24 x 24` bilateral pair ranker,
+  - nested OOF best-checkpoint ensemble ve inference ile aynı teachersız pair eğitimi,
   - görünür dış konturu koruyan z-buffer rasterizasyonu,
   - `LM0=12 mm`, Gonion=`15 mm` düzeltme sınırı ve validation-kilitli blend.
 - Önceki pointwise ranker `--hard3-refiner-mode structured` ile ablation olarak korunur.
@@ -79,7 +80,13 @@ python -u agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py \
   --hard3-dual-view-patience 1 \
   --hard3-dual-view-image-size 32 \
   --hard3-dual-view-width 8 \
+  --hard3-dual-view-pair-topk 8 \
+  --hard3-dual-view-proposal-neighbors 4 \
+  --hard3-dual-view-pair-stage-epochs 1 \
+  --hard3-dual-view-pair-stage-min-epochs 1 \
+  --hard3-dual-view-pair-stage-patience 1 \
   --hard3-dual-view-final-members 1 \
+  --hard3-dual-view-final-policy median_best_refit \
   --no-tta \
   --no-tta-validation \
   --device cpu
@@ -109,9 +116,9 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 ```
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
-checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız `hard3_dual_view_v3/`
-altındaki H3-DVAR v3 eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut tekrar
-çalıştırılırsa v3 model cache'den yüklenir.
+checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız `hard3_dual_view_v4/`
+altındaki H3-DVAR v4 eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut tekrar
+çalıştırılırsa v4 model cache'den yüklenir.
 
 Beş-fold preprocessing kontrolü:
 
@@ -147,13 +154,15 @@ bir H3-DVAR kapısından geçmelidir:
 - Hard3 kazancı en az `0.20 mm`, overall kazanç en az `0.03 mm` olmalı,
 - bootstrap iyileşme olasılığı en az `0.90` olmalı,
 - overall p95 değeri `0.10 mm`den fazla kötüleşmemeli.
-- OOF proposal@96 recall LM21 ve LM22 için en az `%90` olmalı,
 - OOF shortlist Gonion oracle ALE en fazla `1.50 mm` olmalı.
+- OOF shortlist Gonion oracle p95 en fazla `3.50 mm` olmalı,
+- OOF shortlist Gonion SDR@2mm en az `%75` olmalı.
 
 Kapı geçmezse fusion alpha otomatik olarak sıfırlanır ve tam CV başlatılmaz. Bu durumda
-model büyütmek yerine `gonion_pair_topk_recall`, örnek-bazlı görünüş ağırlıkları ve
-joint-pair aday sonuçları incelenmelidir. Fold 1 baseline Hard3 değeri `5.2358 mm`,
-v1 sonucu `4.6143 mm`, v2 sonucu `4.8017 mm`, v3 kabul hedefi ise `<4.00 mm`dir.
+model büyütmek yerine `gonion_pair_topk_recall`, shortlist oracle kuyruğu,
+örnek-bazlı görünüş ağırlıkları ve joint-pair aday sonuçları incelenmelidir. Fold 1
+baseline Hard3 değeri `5.2358 mm`, v1 sonucu `4.6143 mm`, v2 sonucu `4.8017 mm`,
+v3 sonucu `4.7045 mm`, v4 kabul hedefi ise `<4.00 mm`dir.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
@@ -169,10 +178,10 @@ fold_*/group_metrics_*.csv
 fold_*/predictions_*.csv
 fold_*/shape_prior_selection.json
 fold_*/shape_prior_only/metrics_val.json
-fold_*/hard3_dual_view_v3/hard3_dual_view_model.pth
-fold_*/hard3_dual_view_v3/hard3_dual_view_training_report.json
-fold_*/hard3_dual_view_v3/hard3_blend_selection.json
-fold_*/hard3_dual_view_v3/metrics_val.json
+fold_*/hard3_dual_view_v4/hard3_dual_view_model.pth
+fold_*/hard3_dual_view_v4/hard3_dual_view_training_report.json
+fold_*/hard3_dual_view_v4/hard3_blend_selection.json
+fold_*/hard3_dual_view_v4/metrics_val.json
 fold_*/hard3_stage3_decision.json
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
@@ -180,5 +189,6 @@ summary_metrics.json
 ```
 
 `neural_only/` shape-prior öncesi AGH vNext sonucunu, `shape_prior_only/` mevcut
-`2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar. `hard3_dual_view_v3/` ve ana
-fold dosyaları validation'da kilitlenen H3-DVAR v3 dahil nihai sonucu içerir.
+`2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar.
+`hard3_dual_view_v4/` ve ana fold dosyaları validation'da kilitlenen H3-DVAR v4
+dahil nihai sonucu içerir.

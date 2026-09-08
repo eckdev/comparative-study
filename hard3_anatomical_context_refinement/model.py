@@ -99,6 +99,84 @@ class CompactUNet(nn.Module):
         return heatmap
 
 
+class SurfaceContextRanker(nn.Module):
+    """Score each candidate from its features and a fixed local surface graph."""
+
+    def __init__(self, input_dim, width=48, dropout=0.10):
+        super().__init__()
+        hidden = max(int(width), 32)
+        self.point_encoder = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(hidden * 2 + 3, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        # Start from the fused heatmap ranking. Context is introduced by the
+        # all-candidate listwise objective during the proposal stage.
+        nn.init.zeros_(self.fusion[-1].weight)
+        nn.init.zeros_(self.fusion[-1].bias)
+
+    @staticmethod
+    def _gather_neighbors(values, indices):
+        batch, landmarks, candidates, channels = values.shape
+        flat = values.reshape(batch * landmarks, candidates, channels)
+        flat_indices = indices.reshape(batch * landmarks, candidates, -1)
+        batch_index = torch.arange(
+            batch * landmarks, device=values.device
+        )[:, None, None]
+        return flat[batch_index, flat_indices].reshape(
+            batch, landmarks, candidates, flat_indices.shape[-1], channels
+        )
+
+    def forward(
+        self,
+        features,
+        geometry,
+        neighbor_index,
+        neighbor_mask,
+        candidate_mask,
+    ):
+        encoded = self.point_encoder(features.float())
+        neighbors = self._gather_neighbors(encoded, neighbor_index.long())
+        neighbor_geometry = self._gather_neighbors(
+            geometry[..., :3].float(), neighbor_index.long()
+        )
+        center = encoded[..., None, :].expand_as(neighbors)
+        delta = neighbor_geometry - geometry[..., None, :3].float()
+        edge = self.edge_encoder(
+            torch.cat([center, neighbors - center, delta], dim=-1)
+        )
+        gathered_valid = self._gather_neighbors(
+            candidate_mask[..., None].float(), neighbor_index.long()
+        ).squeeze(-1).bool()
+        valid = neighbor_mask.bool() & gathered_valid & candidate_mask[..., None]
+        maximum = edge.masked_fill(~valid[..., None], -torch.inf).amax(dim=-2)
+        maximum = torch.nan_to_num(maximum, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_float = valid[..., None].to(edge.dtype)
+        mean = (edge * valid_float).sum(dim=-2) / valid_float.sum(dim=-2).clamp_min(
+            1.0
+        )
+        score = self.fusion(torch.cat([encoded, maximum, mean], dim=-1)).squeeze(-1)
+        return score.masked_fill(~candidate_mask, -torch.inf)
+
+
 class DualViewHard3Net(nn.Module):
     """Dual-view heatmaps plus a jointly decoded bilateral Gonion pair."""
 
@@ -141,20 +219,11 @@ class DualViewHard3Net(nn.Module):
 
         proposal_input_dim = self.geometry_dim + 5
         proposal_width = max(width * 2, 48)
-        self.gonion_geometry_proposal = nn.Sequential(
-            nn.LayerNorm(proposal_input_dim),
-            nn.Linear(proposal_input_dim, proposal_width),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proposal_width, proposal_width // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proposal_width // 2, 1),
+        self.gonion_geometry_proposal = SurfaceContextRanker(
+            proposal_input_dim,
+            proposal_width,
+            dropout,
         )
-        # Preserve the v2 heatmap proposal at initialization. The all-candidate
-        # listwise loss then learns the 3D correction before any top-k pruning.
-        nn.init.zeros_(self.gonion_geometry_proposal[-1].weight)
-        nn.init.zeros_(self.gonion_geometry_proposal[-1].bias)
 
         pair_input_dim = 4 * self.geometry_dim + 4
         pair_width = max(width * 2, 48)
@@ -252,6 +321,8 @@ class DualViewHard3Net(nn.Module):
         candidate_mask,
         view_weights=None,
         canonical=None,
+        neighbor_index=None,
+        neighbor_mask=None,
         return_evidence=False,
     ):
         batch, landmarks, views, height, width = heatmaps.shape
@@ -295,7 +366,21 @@ class DualViewHard3Net(nn.Module):
                 ],
                 dim=-1,
             )
-            correction = self.gonion_geometry_proposal(proposal_features).squeeze(-1)
+            if neighbor_index is None:
+                self_index = torch.arange(candidates, device=canonical.device)
+                neighbor_index = self_index.view(1, 1, candidates, 1).expand(
+                    batch, landmarks, -1, -1
+                )
+                neighbor_mask = candidate_mask[..., None]
+            elif neighbor_mask is None:
+                neighbor_mask = torch.ones_like(neighbor_index, dtype=torch.bool)
+            correction = self.gonion_geometry_proposal(
+                proposal_features,
+                canonical[:, 1:3],
+                neighbor_index[:, 1:3],
+                neighbor_mask[:, 1:3],
+                gonion_mask,
+            )
             proposal[:, 1:3] = standardized_fused[:, 1:3] + correction
         proposal = proposal.masked_fill(~candidate_mask, -torch.inf)
         standardized_proposal = self._masked_standardize(proposal, candidate_mask)
@@ -336,14 +421,14 @@ class DualViewHard3Net(nn.Module):
             candidate_logits[:, 2].float(), right_mask
         )
         use_topk = min(self.pair_topk, candidate_logits.shape[-1])
-        if proposal_sources is None:
-            left_sources = left_logits[:, None]
-            right_sources = right_logits[:, None]
-        else:
-            left_sources = proposal_sources[:, 1]
-            right_sources = proposal_sources[:, 2]
-        left_indices = diverse_topk_indices(left_sources, left_mask, use_topk)
-        right_indices = diverse_topk_indices(right_sources, right_mask, use_topk)
+        # V4 performs an explicit unary proposal stage. The bilateral decoder
+        # consumes only the learned shortlist instead of a 96 x 96 rank-union.
+        left_indices = torch.topk(
+            left_logits.masked_fill(~left_mask, -torch.inf), use_topk, dim=-1
+        ).indices
+        right_indices = torch.topk(
+            right_logits.masked_fill(~right_mask, -torch.inf), use_topk, dim=-1
+        ).indices
 
         # A short, decaying warmup may expose the nearest candidate. After the
         # warmup training uses the same proposal distribution as inference.
