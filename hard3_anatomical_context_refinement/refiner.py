@@ -55,14 +55,30 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    pair_topk: int = 24
+    proposal_topk: int = 96
+    pair_topk: int = 32
     pair_temperature: float = 0.5
     proposal_neighbors: int = 12
     proposal_teacher_forcing_epochs: int = 0
+    rerank_sigma: float = 2.0
+    rerank_temperature: float = 0.75
+    rerank_listwise_weight: float = 1.0
+    rerank_expected_distance_weight: float = 0.5
+    rerank_coordinate_weight: float = 0.25
+    rerank_ordinal_weight: float = 0.25
+    rerank_negative_count: int = 32
+    rerank_negative_radius_mm: float = 3.0
+    rerank_stage_epochs: int = 40
+    rerank_stage_min_epochs: int = 10
+    rerank_stage_patience: int = 10
+    rerank_stage_lr: float = 5e-4
     pair_stage_epochs: int = 40
     pair_stage_min_epochs: int = 10
     pair_stage_patience: int = 10
     pair_stage_lr: float = 5e-4
+    pair_target_sigma: float = 2.0
+    pair_expected_distance_weight: float = 0.5
+    distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
     gonion_color_dropout: float = 0.25
@@ -70,7 +86,7 @@ class Hard3DualViewConfig:
     atlas_temperature: float = 2.0
     final_ensemble_members: int = 3
     final_model_policy: str = "inner_fold_ensemble"
-    diagnostic_topk: tuple[int, ...] = (24, 48, 96)
+    diagnostic_topk: tuple[int, ...] = (32, 48, 96)
     minimum_proposal_recall: float = 0.90
     maximum_proposal_oracle_ale: float = 1.50
     minimum_proposal_sdr2: float = 0.75
@@ -113,12 +129,12 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
         "grids": grids,
         "points": torch.from_numpy(candidate_set.points[indices]).to(device),
         "canonical": torch.from_numpy(candidate_set.canonical[indices]).to(device),
-        "neighbor_index": torch.from_numpy(
-            candidate_set.neighbor_index[indices]
-        ).to(device),
-        "neighbor_mask": torch.from_numpy(
-            candidate_set.neighbor_mask[indices]
-        ).to(device),
+        "neighbor_index": torch.from_numpy(candidate_set.neighbor_index[indices]).to(
+            device
+        ),
+        "neighbor_mask": torch.from_numpy(candidate_set.neighbor_mask[indices]).to(
+            device
+        ),
         "mask": torch.from_numpy(candidate_set.mask[indices]).to(device),
         "expert": torch.from_numpy(candidate_set.expert[indices]).to(device),
         "distance": torch.from_numpy(candidate_set.target_distance[indices]).to(device),
@@ -143,8 +159,8 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
             )
             result["canonical"][..., 26:29] = rgb
             result["canonical"][..., 32:33] = rgb.mean(dim=-1, keepdim=True)
-            result["canonical"][..., 33:34] = (
-                rgb.amax(dim=-1, keepdim=True) - rgb.amin(dim=-1, keepdim=True)
+            result["canonical"][..., 33:34] = rgb.amax(dim=-1, keepdim=True) - rgb.amin(
+                dim=-1, keepdim=True
             )
     if training and config.gonion_color_dropout > 0:
         # Gonion is geometry/contour defined. Randomly withholding RGB and local
@@ -154,9 +170,7 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
         )
         result["images"][:, 1:3, :, :6] *= (~drop)[:, :, None, None, None, None]
         if result["canonical"].shape[-1] >= 34:
-            result["canonical"][:, 1:3, :, 26:34] *= (~drop)[
-                :, :, None, None
-            ]
+            result["canonical"][:, 1:3, :, 26:34] *= (~drop)[:, :, None, None]
     if training and config.translation_pixels > 0:
         rng = rng or np.random.default_rng(config.seed)
         height, width = images.shape[-2:]
@@ -249,6 +263,52 @@ def _weighted_coordinate(logits, points, mask, topk=10, temperature=0.5):
     return torch.sum(weight[..., None] * selected, dim=2)
 
 
+def _distance_distribution(logits, distance, mask, sigma, temperature=1.0):
+    safe_distance = torch.where(mask, distance.float(), torch.zeros_like(distance))
+    target_energy = -(safe_distance**2) / (2.0 * max(float(sigma), 1e-4) ** 2)
+    target_energy = target_energy.masked_fill(~mask, -torch.inf)
+    target = torch.softmax(target_energy, dim=-1)
+    log_probability = torch.log_softmax(
+        logits.float().masked_fill(~mask, -torch.inf) / max(float(temperature), 1e-4),
+        dim=-1,
+    ).masked_fill(~mask, 0.0)
+    listwise = (
+        target * (torch.log(target.clamp_min(1e-8)) - log_probability)
+    ).masked_fill(~mask, 0.0)
+    listwise = listwise.sum(dim=-1).mean()
+    probability = torch.softmax(
+        logits.float().masked_fill(~mask, -torch.inf) / max(float(temperature), 1e-4),
+        dim=-1,
+    )
+    expected_distance = (probability * safe_distance).sum(dim=-1).mean()
+    return listwise, expected_distance, probability
+
+
+def _ordinal_distance_loss(
+    logits,
+    distance,
+    mask,
+    negative_radius_mm,
+    negative_count,
+    margin,
+):
+    minimum = distance.float().masked_fill(~mask, torch.inf).amin(dim=-1, keepdim=True)
+    positive_mask = mask & (distance <= minimum + 1.0)
+    positive_logits = logits.float().masked_fill(~positive_mask, -torch.inf)
+    positive = torch.logsumexp(positive_logits, dim=-1, keepdim=True)
+    positive = positive - torch.log(
+        positive_mask.sum(dim=-1, keepdim=True).clamp_min(1).float()
+    )
+    negative_mask = mask & (distance > minimum + float(negative_radius_mm))
+    negatives = logits.float().masked_fill(~negative_mask, -torch.inf)
+    count = min(max(1, int(negative_count)), logits.shape[-1])
+    values, indices = torch.topk(negatives, count, dim=-1)
+    valid = torch.gather(negative_mask, -1, indices)
+    loss = F.softplus(values - positive + float(margin))
+    loss = torch.where(valid, loss, torch.zeros_like(loss))
+    return (loss.sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)).mean()
+
+
 def _teacher_force_probability(epoch, warmup_epochs):
     warmup = max(int(warmup_epochs), 0)
     if warmup == 0 or epoch is None:
@@ -268,6 +328,7 @@ def _forward_model(
     config,
     training=False,
     teacher_force_probability=0.0,
+    compute_rerank=True,
     compute_pair=True,
 ):
     heatmaps, view_weights = model.forward_with_context(batch["images"])
@@ -281,7 +342,17 @@ def _forward_model(
         neighbor_mask=batch["neighbor_mask"],
         return_evidence=True,
     )
-    candidate_logits = evidence["logits"]
+    proposal_logits = evidence["logits"]
+    rerank = None
+    candidate_logits = proposal_logits
+    if compute_rerank:
+        rerank = model.rerank_gonion(
+            proposal_logits,
+            batch["canonical"],
+            batch["mask"],
+            evidence["proposal_sources"],
+        )
+        candidate_logits = rerank["logits"]
     pair = None
     if compute_pair:
         pair = model.gonion_pair(
@@ -294,7 +365,17 @@ def _forward_model(
             evidence["proposal_sources"],
             teacher_force_probability,
         )
-    return heatmaps, candidate_logits, pair, view_weights
+    return (
+        heatmaps,
+        candidate_logits,
+        pair,
+        view_weights,
+        {
+            "proposal_logits": proposal_logits,
+            "proposal_sources": evidence["proposal_sources"],
+            "rerank": rerank,
+        },
+    )
 
 
 def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
@@ -333,6 +414,7 @@ def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
     coordinate = unary_coordinate
     pair_ranking = candidate_logits.new_zeros((), dtype=torch.float32)
     pair_negative = candidate_logits.new_zeros((), dtype=torch.float32)
+    pair_expected = candidate_logits.new_zeros((), dtype=torch.float32)
     if pair_output is not None:
         coordinate = torch.cat(
             [unary_coordinate[:, 0:1], pair_output["soft_coordinate"]], dim=1
@@ -341,7 +423,7 @@ def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
         right_distance = torch.gather(distance[:, 2], 1, pair_output["right_indices"])
         pair_energy = -(
             left_distance[:, :, None] ** 2 + right_distance[:, None, :] ** 2
-        ) / (2.0 * max(float(config.sigma_gonion), 1e-4) ** 2)
+        ) / (2.0 * max(float(config.pair_target_sigma), 1e-4) ** 2)
         pair_energy = pair_energy.masked_fill(~pair_output["mask"], -torch.inf)
         pair_target = torch.softmax(pair_energy.flatten(1), dim=-1).reshape_as(
             pair_energy
@@ -357,14 +439,16 @@ def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
             * (torch.log(pair_target.clamp_min(1e-8)) - pair_log_probability)
         ).masked_fill(~pair_output["mask"], 0.0)
         pair_ranking = pair_ranking.sum(dim=(1, 2)).mean()
-        pair_distance = torch.sqrt(
-            left_distance[:, :, None] ** 2 + right_distance[:, None, :] ** 2 + 1e-8
-        )
+        pair_distance = 0.5 * (left_distance[:, :, None] + right_distance[:, None, :])
+        pair_expected = (
+            pair_output["probability"]
+            * pair_distance.masked_fill(~pair_output["mask"], 0.0)
+        ).sum(dim=(1, 2)).mean() / max(float(config.distance_normalizer_mm), 1e-4)
         pair_minimum = pair_distance.masked_fill(~pair_output["mask"], torch.inf).amin(
             dim=(1, 2), keepdim=True
         )
         pair_negative_mask = pair_output["mask"] & (
-            pair_distance > pair_minimum + float(config.sigma_gonion)
+            pair_distance > pair_minimum + float(config.pair_target_sigma)
         )
         flattened_negative = (
             pair_output["logits"]
@@ -422,6 +506,7 @@ def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
         + config.pair_weight * pair
         + config.joint_pair_weight * pair_ranking
         + config.joint_pair_negative_weight * pair_negative
+        + config.pair_expected_distance_weight * pair_expected
         + config.negative_weight * margin
     )
     return total, {
@@ -432,7 +517,52 @@ def _loss(heatmaps, candidate_logits, batch, config, pair_output=None):
         "pair": pair,
         "joint_pair_ranking": pair_ranking,
         "joint_pair_negative": pair_negative,
+        "pair_expected_distance": pair_expected,
         "negative": margin,
+    }
+
+
+def _sharp_rerank_loss(rerank_output, batch, config):
+    indices = rerank_output["proposal_indices"]
+    mask = rerank_output["proposal_mask"]
+    logits = rerank_output["shortlist_logits"]
+    distance = torch.gather(batch["distance"][:, 1:3], 2, indices)
+    points = torch.gather(
+        batch["points"][:, 1:3],
+        2,
+        indices[..., None].expand(-1, -1, -1, 3),
+    )
+    listwise, expected, probability = _distance_distribution(
+        logits,
+        distance,
+        mask,
+        config.rerank_sigma,
+        config.rerank_temperature,
+    )
+    coordinate = (probability[..., None] * points).sum(dim=2)
+    coordinate_loss = F.smooth_l1_loss(
+        coordinate, batch["expert"][:, 1:3].float(), beta=1.0
+    )
+    ordinal = _ordinal_distance_loss(
+        logits,
+        distance,
+        mask,
+        config.rerank_negative_radius_mm,
+        config.rerank_negative_count,
+        config.negative_margin,
+    )
+    normalized_expected = expected / max(float(config.distance_normalizer_mm), 1e-4)
+    total = (
+        config.rerank_listwise_weight * listwise
+        + config.rerank_expected_distance_weight * normalized_expected
+        + config.rerank_coordinate_weight * coordinate_loss
+        + config.rerank_ordinal_weight * ordinal
+    )
+    return total, {
+        "rerank_listwise": listwise,
+        "rerank_expected_distance": normalized_expected,
+        "rerank_coordinate": coordinate_loss,
+        "rerank_ordinal": ordinal,
     }
 
 
@@ -442,6 +572,7 @@ def _new_model(candidate_set, config):
         config.width,
         config.dropout,
         geometry_dim=candidate_set.canonical.shape[-1],
+        proposal_topk=config.proposal_topk,
         pair_topk=config.pair_topk,
     )
 
@@ -451,7 +582,9 @@ def _predict_outputs(model, candidate_set, indices, config, device):
     model.eval()
     chunks = {
         "logits": [],
+        "proposal_logits": [],
         "proposal_sources": [],
+        "rerank_proposal_indices": [],
         "pair_soft": [],
         "pair_argmax": [],
         "pair_snapped": [],
@@ -464,10 +597,16 @@ def _predict_outputs(model, candidate_set, indices, config, device):
             indices[start : start + config.batch_size], dtype=np.int64
         )
         batch = _tensor_batch(candidate_set, selected, device, config)
-        _, logits, pair, view_weights = _forward_model(model, batch, config)
+        _, logits, pair, view_weights, evidence = _forward_model(model, batch, config)
         chunks["logits"].append(logits.float().cpu().numpy())
+        chunks["proposal_logits"].append(
+            evidence["proposal_logits"].float().cpu().numpy()
+        )
         chunks["proposal_sources"].append(
             pair["proposal_sources"].float().cpu().numpy()
+        )
+        chunks["rerank_proposal_indices"].append(
+            evidence["rerank"]["proposal_indices"].cpu().numpy()
         )
         chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
         chunks["pair_argmax"].append(pair["argmax_coordinate"].float().cpu().numpy())
@@ -508,9 +647,7 @@ def _learned_proposal_indices(source_logits, mask, topk):
 
 def _shortlist_metrics(distances, selected, nearest):
     hits = np.any(selected == nearest[..., None], axis=-1)
-    shortlisted_distance = np.take_along_axis(distances, selected, axis=-1).min(
-        axis=-1
-    )
+    shortlisted_distance = np.take_along_axis(distances, selected, axis=-1).min(axis=-1)
     return {
         "lm21_recall": float(hits[:, 0].mean()),
         "lm22_recall": float(hits[:, 1].mean()),
@@ -532,10 +669,7 @@ def _proposal_diagnostics(candidate_set, proposal_sources, requested_topk):
     nearest = np.argmin(distances, axis=-1)
     candidate_count = distances.shape[-1]
     topk_values = sorted(
-        {
-            min(max(1, int(value)), candidate_count)
-            for value in requested_topk
-        }
+        {min(max(1, int(value)), candidate_count) for value in requested_topk}
     )
     at_k, diverse_at_k = {}, {}
     for topk in topk_values:
@@ -624,15 +758,23 @@ def _decode_dual_policy(candidate_set, logits, pair_outputs, policy):
 
 def _set_training_stage(model, stage):
     for parameter in model.parameters():
-        parameter.requires_grad_(stage == "proposal")
+        parameter.requires_grad_(False)
     if stage == "proposal":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+        for parameter in model.gonion_unary_reranker.parameters():
+            parameter.requires_grad_(False)
         for parameter in model.gonion_pair_ranker.parameters():
             parameter.requires_grad_(False)
         model.train()
+        model.gonion_unary_reranker.eval()
         model.gonion_pair_ranker.eval()
+    elif stage == "rerank":
+        for parameter in model.gonion_unary_reranker.parameters():
+            parameter.requires_grad_(True)
+        model.eval()
+        model.gonion_unary_reranker.train()
     elif stage == "pair":
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
         for parameter in model.gonion_pair_ranker.parameters():
             parameter.requires_grad_(True)
         model.eval()
@@ -643,8 +785,9 @@ def _set_training_stage(model, stage):
 
 def _validation_stage_metrics(model, candidate_set, val_indices, config, device, stage):
     outputs = _predict_outputs(model, candidate_set, list(val_indices), config, device)
+    logits = outputs["proposal_logits"] if stage == "proposal" else outputs["logits"]
     unary = _decode_numpy(
-        outputs["logits"],
+        logits,
         candidate_set.points[val_indices],
         candidate_set.mask[val_indices],
         5,
@@ -665,6 +808,7 @@ def _pair_stage_loss(heatmaps, logits, batch, config, pair_output):
         + config.pair_weight * components["pair"]
         + config.joint_pair_weight * components["joint_pair_ranking"]
         + config.joint_pair_negative_weight * components["joint_pair_negative"]
+        + config.pair_expected_distance_weight * components["pair_expected_distance"]
     )
     return total, components
 
@@ -680,29 +824,53 @@ def _fit_stage(
     stage,
 ):
     is_pair = stage == "pair"
-    epochs = config.pair_stage_epochs if is_pair else config.epochs
-    min_epochs = config.pair_stage_min_epochs if is_pair else config.min_epochs
-    patience = config.pair_stage_patience if is_pair else config.patience
-    lr = config.pair_stage_lr if is_pair else config.lr
+    is_rerank = stage == "rerank"
+    if is_pair:
+        epochs, min_epochs = config.pair_stage_epochs, config.pair_stage_min_epochs
+        patience, lr = config.pair_stage_patience, config.pair_stage_lr
+    elif is_rerank:
+        epochs, min_epochs = (
+            config.rerank_stage_epochs,
+            config.rerank_stage_min_epochs,
+        )
+        patience, lr = config.rerank_stage_patience, config.rerank_stage_lr
+    else:
+        epochs, min_epochs = config.epochs, config.min_epochs
+        patience, lr = config.patience, config.lr
     _set_training_stage(model, stage)
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable, lr=lr, weight_decay=config.weight_decay
-    )
+    trainable = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
     )
-    offset = 40_009 if is_pair else 0
+    offset = 40_009 if is_pair else (20_003 if is_rerank else 0)
     rng = np.random.default_rng(config.seed + fold_number * 7919 + offset)
     best_score, best_epoch, stale, best_state = float("inf"), 0, 0, None
     history = []
     for epoch in range(1, int(epochs) + 1):
         _set_training_stage(model, stage)
         order = rng.permutation(train_indices)
-        totals = {name: 0.0 for name in (
-            "total", "heatmap", "poss", "ranking", "coordinate", "pair",
-            "joint_pair_ranking", "joint_pair_negative", "negative",
-        )}
+        totals = {
+            name: 0.0
+            for name in (
+                "total",
+                "heatmap",
+                "poss",
+                "ranking",
+                "coordinate",
+                "pair",
+                "joint_pair_ranking",
+                "joint_pair_negative",
+                "pair_expected_distance",
+                "negative",
+                "rerank_listwise",
+                "rerank_expected_distance",
+                "rerank_coordinate",
+                "rerank_ordinal",
+            )
+        }
         seen = 0
         for start in range(0, len(order), config.batch_size):
             selected = np.asarray(
@@ -713,22 +881,25 @@ def _fit_stage(
                 selected,
                 device,
                 config,
-                training=not is_pair,
+                training=stage == "proposal",
                 rng=rng,
             )
             optimizer.zero_grad(set_to_none=True)
-            heatmaps, logits, pair_output, _ = _forward_model(
+            heatmaps, logits, pair_output, _, evidence = _forward_model(
                 model,
                 batch,
                 config,
                 training=False,
                 teacher_force_probability=0.0,
+                compute_rerank=stage != "proposal",
                 compute_pair=is_pair,
             )
             if is_pair:
                 loss, components = _pair_stage_loss(
                     heatmaps, logits, batch, config, pair_output
                 )
+            elif is_rerank:
+                loss, components = _sharp_rerank_loss(evidence["rerank"], batch, config)
             else:
                 loss, components = _loss(heatmaps, logits, batch, config, None)
             if not torch.isfinite(loss):
@@ -740,6 +911,7 @@ def _fit_stage(
             seen += count
             totals["total"] += float(loss.detach()) * count
             for name, value in components.items():
+                totals.setdefault(name, 0.0)
                 totals[name] += float(value.detach()) * count
         _, val_error = _validation_stage_metrics(
             model, candidate_set, val_indices, config, device, stage
@@ -791,6 +963,17 @@ def _train_model(
         "proposal",
     )
     model.load_state_dict(proposal_state)
+    rerank_epoch, rerank_score, rerank_history, rerank_state = _fit_stage(
+        model,
+        candidate_set,
+        train_indices,
+        val_indices,
+        config,
+        device,
+        fold_number,
+        "rerank",
+    )
+    model.load_state_dict(rerank_state)
     pair_epoch, pair_score, pair_history, pair_state = _fit_stage(
         model,
         candidate_set,
@@ -803,19 +986,33 @@ def _train_model(
     )
     model.load_state_dict(pair_state)
     outputs = _predict_outputs(model, candidate_set, list(val_indices), config, device)
-    stage_epochs = {"proposal": proposal_epoch, "pair": pair_epoch}
-    stage_scores = {"proposal": proposal_score, "pair": pair_score}
+    stage_epochs = {
+        "proposal": proposal_epoch,
+        "rerank": rerank_epoch,
+        "pair": pair_epoch,
+    }
+    stage_scores = {
+        "proposal": proposal_score,
+        "rerank": rerank_score,
+        "pair": pair_score,
+    }
     return (
         outputs,
         stage_epochs,
         stage_scores,
-        proposal_history + pair_history,
+        proposal_history + rerank_history + pair_history,
         {key: value.detach().cpu() for key, value in pair_state.items()},
     )
 
 
 def _train_fixed_model(
-    candidate_set, proposal_epochs, pair_epochs, config, device, member_number
+    candidate_set,
+    proposal_epochs,
+    rerank_epochs,
+    pair_epochs,
+    config,
+    device,
+    member_number,
 ):
     torch.manual_seed(config.seed + 50_003 + member_number * 1009)
     model = _new_model(candidate_set, config).to(device)
@@ -824,6 +1021,7 @@ def _train_fixed_model(
     history = []
     for stage, epochs, lr in (
         ("proposal", int(proposal_epochs), config.lr),
+        ("rerank", int(rerank_epochs), config.rerank_stage_lr),
         ("pair", int(pair_epochs), config.pair_stage_lr),
     ):
         _set_training_stage(model, stage)
@@ -851,13 +1049,19 @@ def _train_fixed_model(
                     rng=rng,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                heatmaps, logits, pair_output, _ = _forward_model(
-                    model, batch, config, compute_pair=stage == "pair"
+                heatmaps, logits, pair_output, _, evidence = _forward_model(
+                    model,
+                    batch,
+                    config,
+                    compute_rerank=stage != "proposal",
+                    compute_pair=stage == "pair",
                 )
                 if stage == "pair":
                     loss, _ = _pair_stage_loss(
                         heatmaps, logits, batch, config, pair_output
                     )
+                elif stage == "rerank":
+                    loss, _ = _sharp_rerank_loss(evidence["rerank"], batch, config)
                 else:
                     loss, _ = _loss(heatmaps, logits, batch, config, None)
                 if not torch.isfinite(loss):
@@ -918,7 +1122,7 @@ def _cache_signature(dataset, config):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     payload = {
-        "version": 7,
+        "version": 8,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -1126,6 +1330,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                     config.width,
                     config.dropout,
                     geometry_dim=checkpoint["geometry_dim"],
+                    proposal_topk=config.proposal_topk,
                     pair_topk=config.pair_topk,
                 )
                 model.load_state_dict(state)
@@ -1200,6 +1405,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                 "best_epochs": stage_epochs,
                 "best_validation_hard3_ale": stage_scores["pair"],
                 "best_validation_proposal_ale": stage_scores["proposal"],
+                "best_validation_rerank_ale": stage_scores["rerank"],
                 "history": history,
             }
         )
@@ -1240,6 +1446,9 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     median_proposal_epoch = _median_best_epoch(
         [values["proposal"] for values in best_epochs], config.epochs
     )
+    median_rerank_epoch = _median_best_epoch(
+        [values["rerank"] for values in best_epochs], config.rerank_stage_epochs
+    )
     median_pair_epoch = _median_best_epoch(
         [values["pair"] for values in best_epochs], config.pair_stage_epochs
     )
@@ -1251,6 +1460,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             {
                 "member": fold["fold"],
                 "proposal_epochs": fold["best_epochs"]["proposal"],
+                "rerank_epochs": fold["best_epochs"]["rerank"],
                 "pair_epochs": fold["best_epochs"]["pair"],
                 "source": "inner_fold_best_checkpoint",
             }
@@ -1262,6 +1472,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     elif config.final_model_policy == "median_best_refit":
         fixed_epochs = {
             "proposal": median_proposal_epoch,
+            "rerank": median_rerank_epoch,
             "pair": median_pair_epoch,
         }
         models, states, final_histories = [], [], []
@@ -1269,6 +1480,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             model, history, state = _train_fixed_model(
                 candidates,
                 median_proposal_epoch,
+                median_rerank_epoch,
                 median_pair_epoch,
                 config,
                 device,
@@ -1280,6 +1492,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                 {
                     "member": member_number,
                     "proposal_epochs": median_proposal_epoch,
+                    "rerank_epochs": median_rerank_epoch,
                     "pair_epochs": median_pair_epoch,
                     "history": history,
                 }
@@ -1295,12 +1508,12 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     diagnostics = _proposal_diagnostics(
         candidates,
         oof_proposal_sources,
-        tuple(config.diagnostic_topk) + (config.pair_topk,),
+        tuple(config.diagnostic_topk) + (config.proposal_topk, config.pair_topk),
     )
-    diagnostic_key = str(min(config.pair_topk, candidates.points.shape[-2]))
+    diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     print(
-        f"H3-DVAR v4 proposal@{diagnostic_key}: "
+        f"H3-DVAR v5 broad proposal@{diagnostic_key}: "
         f"LM21={diagnostic_row['lm21_recall']:.3f} "
         f"LM22={diagnostic_row['lm22_recall']:.3f} "
         f"both={diagnostic_row['both_recall']:.3f} "
@@ -1332,13 +1545,23 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         ],
         axis=1,
     )
+    print(
+        f"H3-DVAR v5 reranked shortlist@{pair_count}: "
+        f"LM21={left_pair_hit.mean():.3f} "
+        f"LM22={right_pair_hit.mean():.3f} "
+        f"both={np.mean(left_pair_hit & right_pair_hit):.3f} "
+        f"oracle={pair_shortlist_distance.mean():.3f} mm "
+        f"p95={np.percentile(pair_shortlist_distance, 95):.3f} "
+        f"SDR2={(pair_shortlist_distance <= 2.0).mean():.3f}",
+        flush=True,
+    )
     parameter_count = sum(parameter.numel() for parameter in models[0].parameters())
     report = {
         "signature": signature,
-        "version": "H3-DVAR-v4",
+        "version": "H3-DVAR-v5",
         "method": (
-            "nested-OOF surface-context proposal ranking followed by frozen "
-            "shortlist bilateral Gonion pair ranking"
+            "nested-OOF broad surface-context proposal, frozen sharp unary "
+            "reranking, and bilateral Gonion pair decoding"
         ),
         "uses_validation_labels_for_model_fit": False,
         "uses_test_labels": False,
@@ -1353,6 +1576,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             "policy": config.final_model_policy,
             "median_inner_fold_best_epochs": {
                 "proposal": median_proposal_epoch,
+                "rerank": median_rerank_epoch,
                 "pair": median_pair_epoch,
             },
             "fixed_epochs": fixed_epochs,
@@ -1375,12 +1599,8 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                 "both": float(np.mean(left_pair_hit & right_pair_hit)),
                 "oracle_ale": float(pair_shortlist_distance.mean()),
                 "oracle_p95": float(np.percentile(pair_shortlist_distance, 95)),
-                "oracle_sdr_at_2mm": float(
-                    (pair_shortlist_distance <= 2.0).mean()
-                ),
-                "oracle_sdr_at_3mm": float(
-                    (pair_shortlist_distance <= 3.0).mean()
-                ),
+                "oracle_sdr_at_2mm": float((pair_shortlist_distance <= 2.0).mean()),
+                "oracle_sdr_at_3mm": float((pair_shortlist_distance <= 3.0).mean()),
             },
             "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
             "std_dynamic_view_weights": oof_view_weights.std(axis=0).tolist(),

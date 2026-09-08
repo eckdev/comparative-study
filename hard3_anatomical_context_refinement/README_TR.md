@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-DVAR v4)
+# Hard3 Anatomical Context Refinement (H3-DVAR v5)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v4/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v5/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -23,7 +23,7 @@ sonuçlar her fold altında `hard3_dual_view_v4/` dizinine yazılır.
   üretilir. Neural heatmap, atlas ve surface candidate birleşimi yalnız validation
   fold'unda seçilir; testte politika değiştirilmez.
 
-## Fold 1 denetimi ve v4 değişikliği
+## Fold 1 denetimi ve v5 değişikliği
 
 İlk dual-view koşusu Hard3 ALE'yi `5.2358 -> 4.6143 mm` düşürmüştür. Landmark
 bazında `LM0=2.9303`, `LM21=5.6220`, `LM22=5.2905 mm` ölçülmüştür. Buna göre
@@ -43,7 +43,7 @@ oracle ise `1.225 mm` olmuştur. Buna rağmen seçilmiş Hard3 sonucu yalnız
 `5.2643 -> 4.7045 mm` düzeyine inmiştir. İyi adayların mevcut olduğu, fakat
 `96 x 96` ortak decoder'ın bunları doğru sıralayamadığı görülmüştür.
 
-V4 bu seçim darboğazını iki ayrı eğitim aşamasına böler:
+V4 seçim darboğazını proposal ve pair eğitimine ayırmıştır:
 
 - Her adayın canonical konumu, `LM10/11/12` anchor geometrisi, normal, eğrilik,
   yoğunluk, RGB, lokal kontrast, intensity ve chroma özellikleri kullanılır.
@@ -53,8 +53,7 @@ V4 bu seçim darboğazını iki ayrı eğitim aşamasına böler:
 - Proposal aşaması tüm 1024 aday üzerinde mesafe tabanlı listwise hedefle eğitilir;
   bilateral pair başlığı bu sırada dondurulur.
 - En yüksek learned proposal skoruna sahip 24 sol ve 24 sağ aday seçilir. Proposal
-  ağı dondurulduktan sonra pair ranker yalnız bu `24 x 24` dağılım üzerinde ayrı
-  40 epochluk aşamada eğitilir.
+  ağı dondurulduktan sonra pair ranker yalnız bu `24 x 24` dağılım üzerinde eğitilir.
 - Pair aşamasında expert-nearest teacher forcing kullanılmaz; eğitim ve çıkarım aynı
   shortlist dağılımını görür.
 - Frontal/profil füzyonu heatmap kalitesi ve U-Net bağlamına göre örnek bazında
@@ -67,9 +66,31 @@ V4 bu seçim darboğazını iki ayrı eğitim aşamasına böler:
   düzenleyicisi olarak denenebilir.
 - Aynı raster pikseline düşen ön/arka yüzeyler artık ortalanmaz; dış yüzeyi koruyan
   z-buffer görünürlüğü kullanılır.
-- Final çıkarım varsayılan olarak proposal ve pair aşamalarının kendi inner-fold en
-  iyi checkpointlerinden oluşan beş model ensemble'ıdır. Alternatif full-train refit,
-  iki aşamanın medyan en iyi epoch sayılarını ayrı ayrı kullanır.
+- Final çıkarım inner-fold en iyi checkpointlerinden oluşan beş model ensemble'ıdır.
+
+V4 Fold 1'de Hard3 ALE'yi `5.2593 -> 4.6402 mm`, overall ALE'yi `2.2810 ->
+2.2002 mm` düşürmüştür. Ancak top-24 shortlist oracle ALE `2.455 mm`, p95
+`7.400 mm` ve SDR@2 `%63.5` iken aynı proposal'ın top-96 değerleri sırasıyla
+`1.097 mm`, `2.603 mm` ve `%92.4` olmuştur. Pair-soft decoder unary Gonion
+tahminine yalnız `0.046 mm` kazandırmıştır. Sonuç, iyi adayın geniş listede mevcut
+olduğunu; doğrudan `1024 -> 24` sıkıştırma ve geniş pair hedefinin sınırlayıcı
+olduğunu göstermiştir.
+
+V5 bu nedenle üç ayrı, leakage-safe eğitim aşaması kullanır:
+
+- Broad proposal tüm 1024 aday üzerinde v4 yüzey bağlamını öğrenir ve en iyi 96
+  adayı korur.
+- Proposal dondurulur. Sharp unary reranker canonical/RGB/yüzey özellikleri ile
+  dört proposal kaynağını örnek-bazlı set context içinde işler ve `96 -> 32`
+  sıralaması üretir.
+- Reranker hedefi `sigma=2 mm` soft-listwise loss, doğrudan beklenen mesafe,
+  Smooth L1 koordinat ve ordinal hard-negative loss birleşimidir.
+- Proposal ve reranker dondurulduktan sonra `32 x 32` bilateral pair decoder ayrı
+  eğitilir. Pair hedefi de `sigma=2 mm` ve beklenen ALE terimi kullanır.
+- Reranker düzeltmesi sınırlıdır; shortlist dışındaki broad logit varyasyonu
+  korunur. Böylece beş model ensemble'ında kalibrasyon bozulmaz.
+- Expert-nearest teacher forcing hiçbir aşamada kullanılmaz.
+- Proposal, reranker ve pair için inner-fold en iyi epochlar ayrı saklanır.
 
 ## Colab Fold 1 geliştirme koşusu
 
@@ -80,14 +101,14 @@ V4 bu seçim darboğazını iki ayrı eğitim aşamasına böler:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v4/` yeniden eğitilir; v1/v2/v3 çıktıları
-değiştirilmez.
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v5/` yeniden eğitilir; eski sürüm
+çıktıları değiştirilmez.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
 ```text
-oof.proposal_diagnostics.at_k.24/48/96
-oof.proposal_diagnostics.diverse_rank_union_at_k.24/48/96
+oof.proposal_diagnostics.at_k.32/48/96
+oof.proposal_diagnostics.diverse_rank_union_at_k.32/48/96
 oof.gonion_pair_topk_recall.lm21/lm22/both
 oof.gonion_pair_topk_recall.oracle_ale/oracle_p95/oracle_sdr_at_2mm
 oof.mean_dynamic_view_weights
@@ -97,8 +118,9 @@ candidate_metrics.joint_soft/joint_argmax/joint_snapped
 selected.alpha_gonion_left/right
 ```
 
-Exact-nearest vertex recall artık yalnız tanısaldır. Tam CV için gerçek pair
-shortlist'inin Gonion oracle ALE değeri `<=1.50 mm`, p95 değeri `<=3.50 mm` ve
+`proposal_diagnostics` broad aşamayı, `gonion_pair_topk_recall` ise sharp reranker
+sonrası gerçek pair girdisini ölçer. Exact-nearest vertex recall yalnız tanısaldır.
+Tam CV için reranked shortlist'in Gonion oracle ALE değeri `<=1.50 mm`, p95 değeri `<=3.50 mm` ve
 SDR@2mm değeri `>=%75` olmalıdır. Bu ölçüler yoğun mesh üzerinde komşu iki vertex
 arasındaki önemsiz indeks değişimlerinden etkilenmez.
 
@@ -124,10 +146,10 @@ OOF shortlist Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v4/hard3_dual_view_model.pth
-hard3_dual_view_v4/hard3_dual_view_training_report.json
-hard3_dual_view_v4/hard3_blend_selection.json
-hard3_dual_view_v4/metrics_val.json
+hard3_dual_view_v5/hard3_dual_view_model.pth
+hard3_dual_view_v5/hard3_dual_view_training_report.json
+hard3_dual_view_v5/hard3_blend_selection.json
+hard3_dual_view_v5/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

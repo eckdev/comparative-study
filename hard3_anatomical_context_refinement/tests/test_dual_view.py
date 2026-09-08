@@ -20,6 +20,7 @@ from hard3_anatomical_context_refinement.refiner import (
     _loss,
     _median_best_epoch,
     _proposal_diagnostics,
+    _sharp_rerank_loss,
     _set_training_stage,
     _teacher_force_probability,
     _train_model,
@@ -41,9 +42,7 @@ def test_diverse_topk_keeps_the_best_candidate_from_each_proposal_source():
 
 def test_geometry_proposal_scores_candidates_before_pair_pruning():
     torch.manual_seed(3)
-    model = DualViewHard3Net(
-        20, width=8, dropout=0.0, geometry_dim=34, pair_topk=4
-    )
+    model = DualViewHard3Net(20, width=8, dropout=0.0, geometry_dim=34, pair_topk=4)
     images = torch.randn(2, 3, 2, 20, 16, 16)
     grids = torch.rand(2, 3, 2, 12, 2) * 2 - 1
     canonical = torch.randn(2, 3, 12, 34)
@@ -70,9 +69,7 @@ def test_geometry_proposal_scores_candidates_before_pair_pruning():
 
 def test_surface_context_proposal_changes_when_local_neighbors_change():
     torch.manual_seed(7)
-    model = DualViewHard3Net(
-        20, width=8, dropout=0.0, geometry_dim=18, pair_topk=2
-    )
+    model = DualViewHard3Net(20, width=8, dropout=0.0, geometry_dim=18, pair_topk=2)
     torch.nn.init.normal_(model.gonion_geometry_proposal.fusion[-1].weight, std=0.2)
     features = torch.randn(1, 2, 6, 23)
     geometry = torch.randn(1, 2, 6, 18)
@@ -110,13 +107,57 @@ def test_pair_decoder_uses_learned_shortlist_instead_of_rank_union():
 def test_pair_stage_freezes_everything_except_bilateral_ranker():
     model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=2)
     _set_training_stage(model, "pair")
-    assert all(parameter.requires_grad for parameter in model.gonion_pair_ranker.parameters())
+    assert all(
+        parameter.requires_grad for parameter in model.gonion_pair_ranker.parameters()
+    )
     frozen = [
         parameter.requires_grad
         for name, parameter in model.named_parameters()
         if not name.startswith("gonion_pair_ranker.")
     ]
     assert not any(frozen)
+
+
+def test_rerank_stage_freezes_everything_except_sharp_unary_ranker():
+    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=2)
+    _set_training_stage(model, "rerank")
+    assert all(
+        parameter.requires_grad
+        for parameter in model.gonion_unary_reranker.parameters()
+    )
+    frozen = [
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith("gonion_unary_reranker.")
+    ]
+    assert not any(frozen)
+
+
+def test_sharp_reranker_preserves_broad_topk_then_reorders_candidates():
+    model = DualViewHard3Net(
+        20,
+        width=8,
+        dropout=0.0,
+        geometry_dim=18,
+        proposal_topk=4,
+        pair_topk=2,
+    )
+    logits = torch.zeros(1, 3, 8)
+    logits[:, 1:3] = torch.arange(8, dtype=torch.float32)
+    canonical = torch.randn(1, 3, 8, 18)
+    mask = torch.ones(1, 3, 8, dtype=torch.bool)
+    sources = torch.zeros(1, 3, 4, 8)
+    sources[:, 1:3, 0] = logits[:, 1:3]
+    reranked = model.rerank_gonion(logits, canonical, mask, sources)
+    assert set(reranked["proposal_indices"][0, 0].tolist()) == {4, 5, 6, 7}
+    pair = model.gonion_pair(
+        reranked["logits"],
+        canonical,
+        torch.randn(1, 3, 8, 3),
+        mask,
+    )
+    assert set(pair["left_indices"][0].tolist()).issubset({4, 5, 6, 7})
+    assert set(pair["right_indices"][0].tolist()).issubset({4, 5, 6, 7})
 
 
 def test_pair_teacher_forcing_is_removed_after_warmup():
@@ -253,6 +294,38 @@ def test_dual_view_forward_candidate_logits_and_loss_are_finite():
     assert model.gonion_view_gate[-1].weight.grad is not None
 
 
+def test_sharp_rerank_loss_is_finite_and_updates_only_reranker():
+    generator = torch.Generator().manual_seed(31)
+    batch_size, candidates = 2, 12
+    model = DualViewHard3Net(
+        20,
+        width=8,
+        dropout=0.0,
+        geometry_dim=18,
+        proposal_topk=8,
+        pair_topk=4,
+    )
+    _set_training_stage(model, "rerank")
+    logits = torch.randn(batch_size, 3, candidates)
+    canonical = torch.randn(batch_size, 3, candidates, 18)
+    mask = torch.ones(batch_size, 3, candidates, dtype=torch.bool)
+    sources = torch.randn(batch_size, 3, 4, candidates)
+    reranked = model.rerank_gonion(logits, canonical, mask, sources)
+    points = torch.randn(batch_size, 3, candidates, 3, generator=generator)
+    expert = points[:, :, 0].clone()
+    distance = torch.linalg.norm(points - expert[:, :, None], dim=-1)
+    loss, components = _sharp_rerank_loss(
+        reranked,
+        {"points": points, "expert": expert, "distance": distance},
+        Hard3DualViewConfig(width=8, proposal_topk=8, pair_topk=4),
+    )
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(value) for value in components.values())
+    loss.backward()
+    assert model.gonion_unary_reranker.score[-1].weight.grad is not None
+    assert model.gonion_pair_ranker[-1].weight.grad is None
+
+
 def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
     rng = np.random.default_rng(5)
     vertices, roi_points = 96, 24
@@ -378,6 +451,10 @@ def test_tiny_joint_pair_training_and_inference_complete():
             batch_size=2,
             width=8,
             pair_topk=4,
+            proposal_topk=8,
+            rerank_stage_epochs=1,
+            rerank_stage_min_epochs=1,
+            rerank_stage_patience=1,
             pair_stage_epochs=1,
             pair_stage_min_epochs=1,
             pair_stage_patience=1,
@@ -388,9 +465,9 @@ def test_tiny_joint_pair_training_and_inference_complete():
         torch.device("cpu"),
         fold_number=1,
     )
-    assert best_epoch == {"proposal": 1, "pair": 1}
+    assert best_epoch == {"proposal": 1, "rerank": 1, "pair": 1}
     assert all(np.isfinite(value) for value in score.values())
-    assert len(history) == 2
+    assert len(history) == 3
     assert outputs["logits"].shape == (2, 3, candidates)
     assert outputs["pair_soft"].shape == (2, 2, 3)
 

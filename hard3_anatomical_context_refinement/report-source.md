@@ -107,8 +107,9 @@ frozen AGH-vNext + shape-prior prediction
   -> canonical profile RGB-depth-normal patch
   -> LM0 appearance U-Net / shared bilateral Gonion contour U-Net
   -> 12-neighbor local surface-context ranker over all 1024 candidates
-  -> learned top-24 shortlist per Gonion side
-  -> frozen proposal + separately trained 24 x 24 bilateral pair decoder
+  -> recall-preserving broad top-96 proposal per Gonion side
+  -> frozen proposal + sharp distance-aware 96-to-32 unary reranker
+  -> frozen reranker + separately trained 32 x 32 bilateral pair decoder
   -> Core20-conditioned train-only local atlas prior
   -> validation-locked candidate/alpha selection
   -> LM0/21/22 replacement; Core20 byte-for-byte unchanged
@@ -121,12 +122,14 @@ mesafeli nearest fill ile tamamlanır ve occupancy kanalı gerçek/interpolated 
 ayrımını korur. CoordConv/sınır kanalları Gonion'un kontur tanımını doğrudan görünür
 kılar; PossLoss ise peak kayması yüksek örneklerin gradyan katkısını artırır. Gonion
 proposal başlığı ayrıca canonical konum, `LM10/11/12` anchor geometrisi, RGB/kontrast,
-normal, eğrilik ve yoğunluğu geodezik ROI içindeki yerel komşuluklarla işler. Pair
-başlığı proposal ağı dondurulduktan sonra eğitilir; expert-nearest teacher forcing
-kullanılmadığı için eğitim ve çıkarım aynı shortlist dağılımını görür.
+normal, eğrilik ve yoğunluğu geodezik ROI içindeki yerel komşuluklarla işler. Sharp
+reranker `sigma=2 mm` listwise hedefi, beklenen mesafe ve ordinal hard-negative
+denetimini birleştirir. Pair başlığı proposal ile reranker dondurulduktan sonra
+eğitilir; expert-nearest teacher forcing kullanılmadığı için eğitim ve çıkarım aynı
+shortlist dağılımını görür.
 
-Model seçimi için inner OOF kullanılır. Proposal ve pair aşamalarının en iyi epochları
-ayrı belirlenir. Varsayılan final model, inner-fold en iyi checkpointlerinden oluşan
+Model seçimi için inner OOF kullanılır. Proposal, reranker ve pair aşamalarının en iyi
+epochları ayrı belirlenir. Varsayılan final model, inner-fold en iyi checkpointlerinden oluşan
 ensemble'dır; alternatif full-train refit her aşamanın medyan epochunu ayrı kullanır.
 Outer validation model ağırlığına girmez; yalnız neural/atlas fusion ve blend seçer.
 Test etiketi, bu politika kilitlenmeden okunmaz.

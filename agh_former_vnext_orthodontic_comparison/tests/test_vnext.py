@@ -131,18 +131,19 @@ def test_shape_prior_uses_train_fit_and_validation_selection():
     validation_latent = rng.normal(size=(16, 5))
     expert = mean + np.einsum("nf,flc->nlc", validation_latent, basis) * 0.5
     prediction = expert + rng.normal(0.0, 1.5, size=expert.shape)
-    prior = TrainOnlyShapePrior(
-        component_grid=(5, 10), l2_grid=(1.0, 10.0)
-    ).fit(train, [f"train_{index}" for index in range(len(train))])
+    prior = TrainOnlyShapePrior(component_grid=(5, 10), l2_grid=(1.0, 10.0)).fit(
+        train, [f"train_{index}" for index in range(len(train))]
+    )
     prior.calibrate(
         prediction,
         expert,
         [f"val_{index}" for index in range(len(expert))],
     )
     refined = prior.transform(prediction)
-    assert np.linalg.norm(refined - expert, axis=-1).mean() < np.linalg.norm(
-        prediction - expert, axis=-1
-    ).mean()
+    assert (
+        np.linalg.norm(refined - expert, axis=-1).mean()
+        < np.linalg.norm(prediction - expert, axis=-1).mean()
+    )
     report = prior.report()
     assert report["uses_test_labels"] is False
     assert len(report["fit_sample_ids"]) == len(train)
@@ -155,11 +156,11 @@ def synthetic_hard3_candidates(samples=8, candidates=16, feature_dim=24):
     expert = np.empty((samples, 3, 3), dtype=np.float32)
     for sample in range(samples):
         for landmark in range(3):
-            expert[sample, landmark] = points[sample, landmark, target_index[sample, landmark]]
+            expert[sample, landmark] = points[
+                sample, landmark, target_index[sample, landmark]
+            ]
     distance = np.linalg.norm(points - expert[:, :, None], axis=-1).astype(np.float32)
-    features = rng.normal(
-        size=(samples, 3, candidates, feature_dim)
-    ).astype(np.float32)
+    features = rng.normal(size=(samples, 3, candidates, feature_dim)).astype(np.float32)
     # Give the test ranker a learnable signal tied to expert distance.
     features[..., 0] = -distance
     mask = np.ones((samples, 3, candidates), dtype=bool)
@@ -167,7 +168,10 @@ def synthetic_hard3_candidates(samples=8, candidates=16, feature_dim=24):
     distance[~mask] = np.inf
     return Hard3CandidateSet(
         sample_ids=[f"hard_{index}" for index in range(samples)],
-        strata=[f"Class{index % 2 + 1}|{'women' if index % 2 else 'men'}" for index in range(samples)],
+        strata=[
+            f"Class{index % 2 + 1}|{'women' if index % 2 else 'men'}"
+            for index in range(samples)
+        ],
         features=features,
         canonical=points / 100.0,
         points=points,
@@ -235,9 +239,12 @@ def test_hard3_blend_is_validation_gated_and_never_changes_core20():
     refined = apply_hard3_blend(outputs, candidate_result, policy)
     assert policy["accepted"] is True
     np.testing.assert_array_equal(refined["prediction"][:, CORE20], base[:, CORE20])
-    assert np.linalg.norm(
-        refined["prediction"][:, [0, 21, 22]] - expert[:, [0, 21, 22]], axis=-1
-    ).mean() < 1e-6
+    assert (
+        np.linalg.norm(
+            refined["prediction"][:, [0, 21, 22]] - expert[:, [0, 21, 22]], axis=-1
+        ).mean()
+        < 1e-6
+    )
 
 
 def test_hard3_blend_caps_large_candidate_steps_and_applies_reliability():
@@ -272,7 +279,9 @@ def test_hard3_blend_caps_large_candidate_steps_and_applies_reliability():
     np.testing.assert_array_equal(refined["prediction"][:, CORE20], base[:, CORE20])
 
 
-def test_hard3_cache_signature_tracks_training_inputs_not_acceptance_thresholds(tmp_path):
+def test_hard3_cache_signature_tracks_training_inputs_not_acceptance_thresholds(
+    tmp_path,
+):
     record = tmp_path / "sample.npz"
     record.write_bytes(b"record")
     sample = SimpleNamespace(sample_id="sample")
@@ -294,9 +303,7 @@ def test_hard3_cache_signature_tracks_training_inputs_not_acceptance_thresholds(
 
     dataset = DatasetStub()
     base = Hard3StructuredConfig(bootstrap_iters=10, minimum_hard3_gain_mm=0.1)
-    recalibrated = Hard3StructuredConfig(
-        bootstrap_iters=500, minimum_hard3_gain_mm=0.5
-    )
+    recalibrated = Hard3StructuredConfig(bootstrap_iters=500, minimum_hard3_gain_mm=0.5)
     assert _cache_signature(dataset, base) == _cache_signature(dataset, recalibrated)
     original = _cache_signature(dataset, base)
     dataset.coarse = np.ones((23, 3), dtype=np.float32)
@@ -319,14 +326,39 @@ def test_completed_fold_cache_requires_stage3_artifacts_when_enabled(tmp_path):
         "stage2_signature": vnext_signature(args, splits),
         "hard3_structured": {"enabled": True},
     }
-    (tmp_path / "run_summary.json").write_text(
-        json.dumps(result), encoding="utf-8"
-    )
+    (tmp_path / "run_summary.json").write_text(json.dumps(result), encoding="utf-8")
     assert load_completed_fold(tmp_path, args, splits) is None
 
     hard3 = tmp_path / "hard3_structured"
     hard3.mkdir()
     for name in ("hard3_structured_model.pth", "metrics_val.json", "metrics_test.json"):
+        (hard3 / name).write_bytes(b"artifact")
+    assert load_completed_fold(tmp_path, args, splits) == result
+
+
+def test_completed_dual_view_fold_requires_v5_artifacts_and_version(tmp_path):
+    args = SimpleNamespace(
+        resume_stage2=True,
+        force_stage2_retrain=False,
+        validation_only=False,
+        hard3_structured=True,
+        hard3_refiner_mode="dual_view",
+        output_dir="ignored",
+    )
+    splits = {"train": ["a"], "val": ["b"], "test": ["c"]}
+    for name in ("metrics_val.json", "metrics_test.json", "predictions_test.csv"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    result = {
+        "postprocess_version": 6,
+        "stage2_signature": vnext_signature(args, splits),
+        "hard3_structured": {"enabled": True, "mode": "dual_view"},
+    }
+    (tmp_path / "run_summary.json").write_text(json.dumps(result), encoding="utf-8")
+    assert load_completed_fold(tmp_path, args, splits) is None
+
+    hard3 = tmp_path / "hard3_dual_view_v5"
+    hard3.mkdir()
+    for name in ("hard3_dual_view_model.pth", "metrics_val.json", "metrics_test.json"):
         (hard3 / name).write_bytes(b"artifact")
     assert load_completed_fold(tmp_path, args, splits) == result
 
@@ -371,15 +403,18 @@ def test_stage3_decision_exposes_two_mm_hard3_budget():
         args, baseline, final, {"blend": {"accepted": True}}
     )
     expected_budget = (23.0 * 2.0 - 20.0 * 1.8356) / 3.0
-    assert abs(
-        decision["two_mm_budget"]["required_hard3_ale_at_current_core20"]
-        - expected_budget
-    ) < 1e-9
+    assert (
+        abs(
+            decision["two_mm_budget"]["required_hard3_ale_at_current_core20"]
+            - expected_budget
+        )
+        < 1e-9
+    )
     assert decision["run_full_cv"] is True
     assert decision["test_labels_consumed"] is False
 
 
-def test_stage3_decision_blocks_full_cv_when_v4_shortlist_tail_is_weak():
+def test_stage3_decision_blocks_full_cv_when_v5_shortlist_tail_is_weak():
     args = SimpleNamespace(
         hard3_stage3_full_cv_max_overall=2.25,
         hard3_stage3_full_cv_max_hard3=4.0,
@@ -404,19 +439,15 @@ def test_stage3_decision_blocks_full_cv_when_v4_shortlist_tail_is_weak():
         "blend": {"accepted": True, "target_reached_on_validation": True},
         "training": {
             "oof": {
-                "proposal_diagnostics": {
-                    "candidate_count": 1024,
-                    "at_k": {
-                        "24": {
-                            "lm21_recall": 0.80,
-                            "lm22_recall": 0.81,
-                            "both_recall": 0.66,
-                            "gonion_oracle_ale": 1.1,
-                            "gonion_oracle_p95": 4.1,
-                            "gonion_oracle_sdr_at_2mm": 0.80,
-                        }
-                    },
-                }
+                "gonion_pair_topk_recall": {
+                    "topk": 24,
+                    "lm21": 0.80,
+                    "lm22": 0.81,
+                    "both": 0.66,
+                    "oracle_ale": 1.1,
+                    "oracle_p95": 4.1,
+                    "oracle_sdr_at_2mm": 0.80,
+                },
             }
         },
     }

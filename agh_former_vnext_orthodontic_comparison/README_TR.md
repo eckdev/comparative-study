@@ -18,12 +18,14 @@ checkpoint'leri değiştirilmez.
 - Refiner dondurulduktan sonra ayrı confidence gate eğitimi.
 - Outer-train uzman şekillerinden fit edilen PCA + Core20-to-Hard3 conditional shape-prior.
   Shape-prior hiperparametreleri yalnız validation'da seçilir; test etiketi kullanılmaz.
-- Donmuş vNext + shape-prior çıktısı üzerinde iki aşamalı H3-DVAR v4:
+- Donmuş vNext + shape-prior çıktısı üzerinde üç aşamalı H3-DVAR v5:
   - `LM0` için frontal/profil RGB-depth appearance U-Net,
   - `LM21/LM22` için RGB, normal, curvature ve landmark-anchor özellikli lokal
     surface-context proposal ranker,
-  - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 24` learned shortlist,
-  - proposal ağı dondurulduktan sonra ayrı eğitilen `24 x 24` bilateral pair ranker,
+  - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 96` broad proposal,
+  - dondurulmuş proposal üzerinde `96 -> 32` sharp unary reranker,
+  - dondurulmuş reranker üzerinde ayrı eğitilen `32 x 32` bilateral pair ranker,
+  - keskin `sigma=2 mm` hedef, expected-distance ve ordinal hard-negative loss,
   - nested OOF best-checkpoint ensemble ve inference ile aynı teachersız pair eğitimi,
   - görünür dış konturu koruyan z-buffer rasterizasyonu,
   - `LM0=12 mm`, Gonion=`15 mm` düzeltme sınırı ve validation-kilitli blend.
@@ -80,8 +82,12 @@ python -u agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py \
   --hard3-dual-view-patience 1 \
   --hard3-dual-view-image-size 32 \
   --hard3-dual-view-width 8 \
+  --hard3-dual-view-proposal-topk 16 \
   --hard3-dual-view-pair-topk 8 \
   --hard3-dual-view-proposal-neighbors 4 \
+  --hard3-dual-view-rerank-stage-epochs 1 \
+  --hard3-dual-view-rerank-stage-min-epochs 1 \
+  --hard3-dual-view-rerank-stage-patience 1 \
   --hard3-dual-view-pair-stage-epochs 1 \
   --hard3-dual-view-pair-stage-min-epochs 1 \
   --hard3-dual-view-pair-stage-patience 1 \
@@ -116,9 +122,9 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 ```
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
-checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız `hard3_dual_view_v4/`
-altındaki H3-DVAR v4 eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut tekrar
-çalıştırılırsa v4 model cache'den yüklenir.
+checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız `hard3_dual_view_v5/`
+altındaki H3-DVAR v5 eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut tekrar
+çalıştırılırsa v5 model cache'den yüklenir.
 
 Beş-fold preprocessing kontrolü:
 
@@ -162,7 +168,7 @@ Kapı geçmezse fusion alpha otomatik olarak sıfırlanır ve tam CV başlatılm
 model büyütmek yerine `gonion_pair_topk_recall`, shortlist oracle kuyruğu,
 örnek-bazlı görünüş ağırlıkları ve joint-pair aday sonuçları incelenmelidir. Fold 1
 baseline Hard3 değeri `5.2358 mm`, v1 sonucu `4.6143 mm`, v2 sonucu `4.8017 mm`,
-v3 sonucu `4.7045 mm`, v4 kabul hedefi ise `<4.00 mm`dir.
+v3 sonucu `4.7045 mm`, v4 sonucu `4.6402 mm`, v5 kabul hedefi ise `<4.00 mm`dir.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
@@ -178,10 +184,10 @@ fold_*/group_metrics_*.csv
 fold_*/predictions_*.csv
 fold_*/shape_prior_selection.json
 fold_*/shape_prior_only/metrics_val.json
-fold_*/hard3_dual_view_v4/hard3_dual_view_model.pth
-fold_*/hard3_dual_view_v4/hard3_dual_view_training_report.json
-fold_*/hard3_dual_view_v4/hard3_blend_selection.json
-fold_*/hard3_dual_view_v4/metrics_val.json
+fold_*/hard3_dual_view_v5/hard3_dual_view_model.pth
+fold_*/hard3_dual_view_v5/hard3_dual_view_training_report.json
+fold_*/hard3_dual_view_v5/hard3_blend_selection.json
+fold_*/hard3_dual_view_v5/metrics_val.json
 fold_*/hard3_stage3_decision.json
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
@@ -190,5 +196,5 @@ summary_metrics.json
 
 `neural_only/` shape-prior öncesi AGH vNext sonucunu, `shape_prior_only/` mevcut
 `2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar.
-`hard3_dual_view_v4/` ve ana fold dosyaları validation'da kilitlenen H3-DVAR v4
+`hard3_dual_view_v5/` ve ana fold dosyaları validation'da kilitlenen H3-DVAR v5
 dahil nihai sonucu içerir.

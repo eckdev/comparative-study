@@ -138,9 +138,9 @@ class SurfaceContextRanker(nn.Module):
         batch, landmarks, candidates, channels = values.shape
         flat = values.reshape(batch * landmarks, candidates, channels)
         flat_indices = indices.reshape(batch * landmarks, candidates, -1)
-        batch_index = torch.arange(
-            batch * landmarks, device=values.device
-        )[:, None, None]
+        batch_index = torch.arange(batch * landmarks, device=values.device)[
+            :, None, None
+        ]
         return flat[batch_index, flat_indices].reshape(
             batch, landmarks, candidates, flat_indices.shape[-1], channels
         )
@@ -160,21 +160,63 @@ class SurfaceContextRanker(nn.Module):
         )
         center = encoded[..., None, :].expand_as(neighbors)
         delta = neighbor_geometry - geometry[..., None, :3].float()
-        edge = self.edge_encoder(
-            torch.cat([center, neighbors - center, delta], dim=-1)
+        edge = self.edge_encoder(torch.cat([center, neighbors - center, delta], dim=-1))
+        gathered_valid = (
+            self._gather_neighbors(
+                candidate_mask[..., None].float(), neighbor_index.long()
+            )
+            .squeeze(-1)
+            .bool()
         )
-        gathered_valid = self._gather_neighbors(
-            candidate_mask[..., None].float(), neighbor_index.long()
-        ).squeeze(-1).bool()
         valid = neighbor_mask.bool() & gathered_valid & candidate_mask[..., None]
         maximum = edge.masked_fill(~valid[..., None], -torch.inf).amax(dim=-2)
         maximum = torch.nan_to_num(maximum, nan=0.0, posinf=0.0, neginf=0.0)
         valid_float = valid[..., None].to(edge.dtype)
-        mean = (edge * valid_float).sum(dim=-2) / valid_float.sum(dim=-2).clamp_min(
-            1.0
-        )
+        mean = (edge * valid_float).sum(dim=-2) / valid_float.sum(dim=-2).clamp_min(1.0)
         score = self.fusion(torch.cat([encoded, maximum, mean], dim=-1)).squeeze(-1)
         return score.masked_fill(~candidate_mask, -torch.inf)
+
+
+class SharpUnaryReranker(nn.Module):
+    """Rerank a recall-preserving proposal set with sample-level context."""
+
+    def __init__(self, input_dim, width=48, dropout=0.10):
+        super().__init__()
+        hidden = max(int(width), 32)
+        self.candidate_encoder = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.score = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        # The broad proposal remains the initial ranking. The sharp stage learns
+        # only a residual after its own loss becomes active.
+        nn.init.zeros_(self.score[-1].weight)
+        nn.init.zeros_(self.score[-1].bias)
+
+    def forward(self, features, candidate_mask):
+        encoded = self.candidate_encoder(features.float())
+        valid = candidate_mask[..., None].to(encoded.dtype)
+        mean = (encoded * valid).sum(dim=-2) / valid.sum(dim=-2).clamp_min(1.0)
+        maximum = encoded.masked_fill(~candidate_mask[..., None], -torch.inf).amax(
+            dim=-2
+        )
+        maximum = torch.nan_to_num(maximum, nan=0.0, posinf=0.0, neginf=0.0)
+        context = torch.cat([mean, maximum], dim=-1)[..., None, :].expand(
+            *encoded.shape[:-1], mean.shape[-1] * 2
+        )
+        raw = self.score(torch.cat([encoded, context], dim=-1)).squeeze(-1)
+        correction = 3.0 * torch.tanh(raw / 3.0)
+        return correction.masked_fill(~candidate_mask, -torch.inf)
 
 
 class DualViewHard3Net(nn.Module):
@@ -186,9 +228,11 @@ class DualViewHard3Net(nn.Module):
         width=24,
         dropout=0.10,
         geometry_dim=18,
+        proposal_topk=96,
         pair_topk=32,
     ):
         super().__init__()
+        self.proposal_topk = max(2, int(proposal_topk))
         self.pair_topk = max(2, int(pair_topk))
         self.geometry_dim = int(geometry_dim)
         self.trichion = CompactUNet(input_channels, width, dropout)
@@ -221,6 +265,12 @@ class DualViewHard3Net(nn.Module):
         proposal_width = max(width * 2, 48)
         self.gonion_geometry_proposal = SurfaceContextRanker(
             proposal_input_dim,
+            proposal_width,
+            dropout,
+        )
+        reranker_input_dim = self.geometry_dim + len(PROPOSAL_SOURCE_NAMES)
+        self.gonion_unary_reranker = SharpUnaryReranker(
+            reranker_input_dim,
             proposal_width,
             dropout,
         )
@@ -350,9 +400,7 @@ class DualViewHard3Net(nn.Module):
         if canonical is not None:
             gonion_mask = candidate_mask[:, 1:3]
             image_evidence = standardized_views[:, 1:3].permute(0, 1, 3, 2)
-            image_evidence = image_evidence.masked_fill(
-                ~gonion_mask[..., None], 0.0
-            )
+            image_evidence = image_evidence.masked_fill(~gonion_mask[..., None], 0.0)
             fused_evidence = standardized_fused[:, 1:3, :, None].masked_fill(
                 ~gonion_mask[..., None], 0.0
             )
@@ -401,6 +449,54 @@ class DualViewHard3Net(nn.Module):
         }
         return evidence if return_evidence else proposal
 
+    def rerank_gonion(
+        self,
+        candidate_logits,
+        canonical,
+        candidate_mask,
+        proposal_sources,
+    ):
+        """Preserve broad recall, then produce a sharper Gonion distribution."""
+        gonion_mask = candidate_mask[:, 1:3]
+        broad = self._masked_standardize(candidate_logits[:, 1:3].float(), gonion_mask)
+        proposal_count = min(self.proposal_topk, candidate_logits.shape[-1])
+        proposal_indices = torch.topk(
+            broad.masked_fill(~gonion_mask, -torch.inf), proposal_count, dim=-1
+        ).indices
+        proposal_mask = torch.gather(gonion_mask, 2, proposal_indices)
+        geometry = torch.gather(
+            canonical[:, 1:3],
+            2,
+            proposal_indices[..., None].expand(-1, -1, -1, canonical.shape[-1]),
+        )
+        source_features = torch.gather(
+            proposal_sources[:, 1:3].permute(0, 1, 3, 2),
+            2,
+            proposal_indices[..., None].expand(-1, -1, -1, proposal_sources.shape[2]),
+        )
+        broad_selected = torch.gather(broad, 2, proposal_indices).masked_fill(
+            ~proposal_mask, 0.0
+        )
+        features = torch.cat([geometry.float(), source_features.float()], dim=-1)
+        correction = self.gonion_unary_reranker(features, proposal_mask)
+        reranked_selected = broad_selected + correction.masked_fill(~proposal_mask, 0.0)
+
+        # Retain broad-score variation for ensemble calibration. A five-logit
+        # penalty is larger than the bounded reranker correction, so candidates
+        # outside the broad shortlist cannot re-enter the bilateral top-k.
+        reranked_gonion = broad - 5.0
+        reranked_gonion = reranked_gonion.scatter(
+            2, proposal_indices, reranked_selected
+        ).masked_fill(~gonion_mask, -torch.inf)
+        logits = candidate_logits.clone()
+        logits[:, 1:3] = reranked_gonion
+        return {
+            "logits": logits,
+            "proposal_indices": proposal_indices,
+            "proposal_mask": proposal_mask,
+            "shortlist_logits": reranked_selected,
+        }
+
     def gonion_pair(
         self,
         candidate_logits,
@@ -421,8 +517,9 @@ class DualViewHard3Net(nn.Module):
             candidate_logits[:, 2].float(), right_mask
         )
         use_topk = min(self.pair_topk, candidate_logits.shape[-1])
-        # V4 performs an explicit unary proposal stage. The bilateral decoder
-        # consumes only the learned shortlist instead of a 96 x 96 rank-union.
+        # V5 consumes only the sharp reranker's shortlist. The broad top-96
+        # proposal is retained one stage earlier and is never pruned directly to
+        # the bilateral search space.
         left_indices = torch.topk(
             left_logits.masked_fill(~left_mask, -torch.inf), use_topk, dim=-1
         ).indices
@@ -549,6 +646,7 @@ class DualViewHard3Net(nn.Module):
         return {
             "logits": pair_logits,
             "mask": pair_mask,
+            "probability": probability,
             "left_indices": left_indices,
             "right_indices": right_indices,
             "soft_coordinate": soft_coordinate,
