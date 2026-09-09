@@ -55,7 +55,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "full_pair"
+    decoder_mode: str = "contour_coordinate"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -87,6 +87,10 @@ class Hard3DualViewConfig:
     pair_hard_negative_radius_mm: float = 4.0
     pair_hard_negative_count: int = 64
     pair_validation_mode: str = "pair_argmax"
+    contour_state_weight: float = 1.0
+    contour_moment_weight: float = 0.5
+    contour_state_scale: float = 0.03
+    contour_residual_limit: float = 0.20
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -132,12 +136,32 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
         device
     )
     grids = torch.from_numpy(candidate_set.grids[indices]).to(device)
+    canonical = candidate_set.canonical[indices]
+    shape_context = (
+        candidate_set.shape_context[indices]
+        if candidate_set.shape_context is not None
+        else np.zeros((len(indices), 69), dtype=np.float32)
+    )
+    if candidate_set.base_gonion is not None:
+        base_gonion = candidate_set.base_gonion[indices]
+    else:
+        valid = candidate_set.mask[indices, 1:3][..., None].astype(np.float32)
+        global_geometry = canonical[:, 1:3, :, 3:6]
+        base_gonion = (global_geometry * valid).sum(axis=2) / np.maximum(
+            valid.sum(axis=2), 1.0
+        )
     result = {
         "images": images,
         "targets": targets,
         "grids": grids,
         "points": torch.from_numpy(candidate_set.points[indices]).to(device),
-        "canonical": torch.from_numpy(candidate_set.canonical[indices]).to(device),
+        "canonical": torch.from_numpy(canonical).to(device),
+        "shape_context": torch.from_numpy(
+            np.asarray(shape_context, dtype=np.float32)
+        ).to(device),
+        "base_gonion": torch.from_numpy(np.asarray(base_gonion, dtype=np.float32)).to(
+            device
+        ),
         "neighbor_index": torch.from_numpy(candidate_set.neighbor_index[indices]).to(
             device
         ),
@@ -151,6 +175,10 @@ def _tensor_batch(candidate_set, indices, device, config, training=False, rng=No
             candidate_set.target_view_mask[indices]
         ).to(device),
     }
+    if candidate_set.expert_gonion_context is not None:
+        result["expert_gonion_context"] = torch.from_numpy(
+            candidate_set.expert_gonion_context[indices]
+        ).to(device)
     if training and config.color_noise > 0:
         result["images"][:, :, :, :3] = torch.clamp(
             result["images"][:, :, :, :3]
@@ -326,8 +354,14 @@ def _teacher_force_probability(epoch, warmup_epochs):
 
 
 def _uses_unary_reranker(config):
-    if config.decoder_mode not in ("full_pair", "sharp_pruned"):
-        raise ValueError("decoder_mode must be full_pair or sharp_pruned")
+    if config.decoder_mode not in (
+        "contour_coordinate",
+        "full_pair",
+        "sharp_pruned",
+    ):
+        raise ValueError(
+            "decoder_mode must be contour_coordinate, full_pair or sharp_pruned"
+        )
     return config.decoder_mode == "sharp_pruned"
 
 
@@ -381,6 +415,8 @@ def _forward_model(
             batch["distance"] if training else None,
             evidence["proposal_sources"],
             teacher_force_probability,
+            batch.get("shape_context"),
+            batch.get("base_gonion"),
         )
     return (
         heatmaps,
@@ -687,6 +723,68 @@ def _clinical_full_pair_loss(pair_output, batch, config):
     }
 
 
+def _contour_coordinate_loss(pair_output, batch, config):
+    """Supervise a joint mean/asymmetry state in canonical jaw coordinates."""
+    clinical, components = _clinical_full_pair_loss(pair_output, batch, config)
+    left_distance = torch.gather(
+        batch["distance"][:, 1], 1, pair_output["left_indices"]
+    ).float()
+    right_distance = torch.gather(
+        batch["distance"][:, 2], 1, pair_output["right_indices"]
+    ).float()
+    if "expert_gonion_context" in batch:
+        left_target = batch["expert_gonion_context"][:, 0].float()
+        right_target = batch["expert_gonion_context"][:, 1].float()
+    else:
+        left_target_index = left_distance.argmin(dim=-1)
+        right_target_index = right_distance.argmin(dim=-1)
+        left_target = torch.gather(
+            pair_output["left_global"],
+            1,
+            left_target_index[:, None, None].expand(-1, 1, 3),
+        ).squeeze(1)
+        right_target = torch.gather(
+            pair_output["right_global"],
+            1,
+            right_target_index[:, None, None].expand(-1, 1, 3),
+        ).squeeze(1)
+    target_mean = 0.5 * (left_target + right_target)
+    target_asymmetry = 0.5 * (left_target - right_target)
+    scale = max(float(config.contour_state_scale), 1e-4)
+    state = F.smooth_l1_loss(
+        pair_output["predicted_mean"] / scale,
+        target_mean / scale,
+    ) + F.smooth_l1_loss(
+        pair_output["predicted_asymmetry"] / scale,
+        target_asymmetry / scale,
+    )
+
+    probability = pair_output["probability"]
+    left_weight = probability.sum(dim=2)
+    right_weight = probability.sum(dim=1)
+    expected_left = (left_weight[..., None] * pair_output["left_global"]).sum(dim=1)
+    expected_right = (right_weight[..., None] * pair_output["right_global"]).sum(dim=1)
+    expected_mean = 0.5 * (expected_left + expected_right)
+    expected_asymmetry = 0.5 * (expected_left - expected_right)
+    moment = F.smooth_l1_loss(
+        expected_mean / scale,
+        target_mean / scale,
+    ) + F.smooth_l1_loss(
+        expected_asymmetry / scale,
+        target_asymmetry / scale,
+    )
+    total = (
+        clinical
+        + float(config.contour_state_weight) * state
+        + float(config.contour_moment_weight) * moment
+    )
+    return total, {
+        **components,
+        "contour_state": state,
+        "contour_moment": moment,
+    }
+
+
 def _new_model(candidate_set, config):
     return DualViewHard3Net(
         candidate_set.images.shape[3],
@@ -696,6 +794,13 @@ def _new_model(candidate_set, config):
         proposal_topk=config.proposal_topk,
         pair_topk=config.pair_topk,
         enable_unary_reranker=_uses_unary_reranker(config),
+        decoder_mode=config.decoder_mode,
+        shape_context_dim=(
+            candidate_set.shape_context.shape[-1]
+            if candidate_set.shape_context is not None
+            else 69
+        ),
+        contour_residual_limit=config.contour_residual_limit,
     )
 
 
@@ -732,7 +837,19 @@ def _predict_outputs(model, candidate_set, indices, config, device):
         chunks["pair_left_indices"].append(pair["left_indices"].cpu().numpy())
         chunks["pair_right_indices"].append(pair["right_indices"].cpu().numpy())
         chunks["view_weights"].append(view_weights.float().cpu().numpy())
-    return {name: np.concatenate(values, axis=0) for name, values in chunks.items()}
+        for name in (
+            "predicted_mean",
+            "predicted_asymmetry",
+            "base_mean",
+            "base_asymmetry",
+        ):
+            if name in pair:
+                chunks.setdefault(name, []).append(pair[name].float().cpu().numpy())
+    return {
+        name: np.concatenate(values, axis=0)
+        for name, values in chunks.items()
+        if values
+    }
 
 
 def _predict_logits(model, candidate_set, indices, config, device):
@@ -932,6 +1049,8 @@ def _validation_stage_metrics(model, candidate_set, val_indices, config, device,
 
 
 def _pair_stage_loss(heatmaps, logits, batch, config, pair_output):
+    if config.decoder_mode == "contour_coordinate":
+        return _contour_coordinate_loss(pair_output, batch, config)
     if config.decoder_mode == "full_pair":
         return _clinical_full_pair_loss(pair_output, batch, config)
     _, components = _loss(heatmaps, logits, batch, config, pair_output)
@@ -1239,7 +1358,7 @@ def _train_fixed_model(
     )
 
 
-def _cache_signature(dataset, config):
+def _cache_signature(dataset, config, centers_by_id=None):
     ignored = {
         "bootstrap_iters",
         "minimum_overall_gain_mm",
@@ -1252,6 +1371,16 @@ def _cache_signature(dataset, config):
         "minimum_proposal_sdr2",
         "maximum_proposal_oracle_p95",
     }
+    is_contour = config.decoder_mode == "contour_coordinate"
+    if not is_contour:
+        ignored.update(
+            {
+                "contour_state_weight",
+                "contour_moment_weight",
+                "contour_state_scale",
+                "contour_residual_limit",
+            }
+        )
     model_config = {
         key: value for key, value in asdict(config).items() if key not in ignored
     }
@@ -1259,14 +1388,19 @@ def _cache_signature(dataset, config):
     records = []
     for sample in dataset.samples:
         digest.update(sample.sample_id.encode("utf-8"))
-        digest.update(np.asarray(dataset._coarse(sample), dtype=np.float32).tobytes())
+        center = (
+            centers_by_id[sample.sample_id]
+            if centers_by_id is not None
+            else dataset._coarse(sample)
+        )
+        digest.update(np.asarray(center, dtype=np.float32).tobytes())
         path = Path(dataset.records[sample.sample_id])
         stat = path.stat()
         records.append(
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     payload = {
-        "version": 11,
+        "version": 13 if is_contour else 11,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -1380,6 +1514,7 @@ class FittedDualViewHard3Refiner:
             centers,
             label,
             neighbor_count=self.config.proposal_neighbors,
+            include_contour_features=(self.config.decoder_mode == "contour_coordinate"),
         )
         indices = list(range(len(candidate_set)))
         member_outputs = [
@@ -1453,12 +1588,36 @@ class FittedDualViewHard3Refiner:
         }
 
 
-def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
+def fit_or_load_dual_view_refiner(
+    dataset,
+    output_dir,
+    config,
+    device,
+    training_baseline_outputs=None,
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "hard3_dual_view_model.pth"
     report_path = output_dir / "hard3_dual_view_training_report.json"
-    signature = _cache_signature(dataset, config)
+    training_centers = None
+    if training_baseline_outputs is not None:
+        training_centers = {
+            sample_id: np.asarray(
+                training_baseline_outputs["prediction"][index], dtype=np.float32
+            )
+            for index, sample_id in enumerate(training_baseline_outputs["sample_ids"])
+        }
+        missing = [
+            sample.sample_id
+            for sample in dataset.samples
+            if sample.sample_id not in training_centers
+        ]
+        if missing:
+            raise KeyError(
+                "Training baseline outputs miss Hard3 samples: "
+                + ", ".join(missing[:5])
+            )
+    signature = _cache_signature(dataset, config, training_centers)
     if checkpoint_path.exists() and report_path.exists():
         try:
             checkpoint = torch.load(
@@ -1477,6 +1636,9 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                     proposal_topk=config.proposal_topk,
                     pair_topk=config.pair_topk,
                     enable_unary_reranker=_uses_unary_reranker(config),
+                    decoder_mode=config.decoder_mode,
+                    shape_context_dim=checkpoint.get("shape_context_dim", 69),
+                    contour_residual_limit=config.contour_residual_limit,
                 )
                 model.load_state_dict(state)
                 models.append(model)
@@ -1491,8 +1653,10 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         dataset,
         config.image_size,
         config.radius_scale,
+        centers_by_id=training_centers,
         label="Hard3 train patches",
         neighbor_count=config.proposal_neighbors,
+        include_contour_features=(config.decoder_mode == "contour_coordinate"),
     )
     atlas = TrainOnlyLocalHard3Atlas(
         config.atlas_neighbors, config.atlas_temperature
@@ -1568,6 +1732,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     policy = _select_dual_coordinate_policy(candidates, oof_logits, oof_pair)
     oof_prediction = _decode_dual_policy(candidates, oof_logits, oof_pair, policy)
     oof_error = np.linalg.norm(oof_prediction - candidates.expert, axis=-1)
+    oof_axis_error = np.abs(oof_prediction - candidates.expert).mean(axis=0)
     member_predictions = np.stack(
         [
             _decode_dual_policy(
@@ -1666,7 +1831,11 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     )
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
-    revision = "H3-DVAR-v6" if config.decoder_mode == "full_pair" else "H3-DVAR-v5"
+    revision = {
+        "contour_coordinate": "H3-DVAR-v7",
+        "full_pair": "H3-DVAR-v6",
+        "sharp_pruned": "H3-DVAR-v5",
+    }[config.decoder_mode]
     print(
         f"{revision} broad proposal@{diagnostic_key}: "
         f"LM21={diagnostic_row['lm21_recall']:.3f} "
@@ -1702,9 +1871,14 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     )
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
+    search_name = {
+        "contour_coordinate": "shape-conditioned contour search",
+        "full_pair": "full-pair search",
+        "sharp_pruned": "reranked shortlist",
+    }[config.decoder_mode]
     print(
         f"{revision} "
-        f"{'full-pair search' if config.decoder_mode == 'full_pair' else 'reranked shortlist'}"
+        f"{search_name}"
         f"@{pair_count}: "
         f"LM21={left_pair_hit.mean():.3f} "
         f"LM22={right_pair_hit.mean():.3f} "
@@ -1720,11 +1894,16 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         "signature": signature,
         "version": revision,
         "method": (
-            "nested-OOF broad surface-context proposal and recall-preserving "
-            "clinical full-pair Gonion decoding"
-            if config.decoder_mode == "full_pair"
-            else "nested-OOF broad surface-context proposal, frozen sharp unary "
-            "reranking, and bilateral Gonion pair decoding"
+            "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
+            "contour-state regression, and non-separable bilateral Gonion decoding"
+            if config.decoder_mode == "contour_coordinate"
+            else (
+                "nested-OOF broad surface-context proposal and recall-preserving "
+                "clinical full-pair Gonion decoding"
+                if config.decoder_mode == "full_pair"
+                else "nested-OOF broad surface-context proposal, frozen sharp unary "
+                "reranking, and bilateral Gonion pair decoding"
+            )
         ),
         "uses_validation_labels_for_model_fit": False,
         "uses_test_labels": False,
@@ -1770,6 +1949,23 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                     np.mean(left_clinical_hit & right_clinical_hit)
                 ),
             },
+            "selection_diagnostics": {
+                "actual_gonion_ale": float(oof_error[:, 1:3].mean()),
+                "oracle_gonion_ale": float(pair_shortlist_distance.mean()),
+                "selector_regret_mm": float(
+                    oof_error[:, 1:3].mean() - pair_shortlist_distance.mean()
+                ),
+                "oracle_to_actual_ratio": float(
+                    pair_shortlist_distance.mean()
+                    / max(float(oof_error[:, 1:3].mean()), 1e-8)
+                ),
+                "axis_mae_xyz": {
+                    "lm0": oof_axis_error[0].tolist(),
+                    "lm21": oof_axis_error[1].tolist(),
+                    "lm22": oof_axis_error[2].tolist(),
+                },
+                "pair_policy_selected": policy["gonion_pair"]["mode"],
+            },
             "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
             "std_dynamic_view_weights": oof_view_weights.std(axis=0).tolist(),
         },
@@ -1787,6 +1983,25 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             "gonion_frontal": float(candidates.target_view_mask[:, 1:3, 0].mean()),
             "gonion_profile": float(candidates.target_view_mask[:, 1:3, 1].mean()),
         },
+        "training_center_source": (
+            "stage2_shape_prior_prediction"
+            if training_centers is not None
+            else "dataset_stage1_coarse"
+        ),
+        "training_center_metrics": {
+            "hard3_ale": float(
+                np.linalg.norm(
+                    candidates.centers[:, list(HARD3)] - candidates.expert,
+                    axis=-1,
+                ).mean()
+            ),
+            "gonion_ale": float(
+                np.linalg.norm(
+                    candidates.centers[:, [21, 22]] - candidates.expert[:, 1:3],
+                    axis=-1,
+                ).mean()
+            ),
+        },
         "training_seconds": float(time.time() - started),
         "config": asdict(config),
     }
@@ -1795,6 +2010,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
             "signature": signature,
             "input_channels": int(candidates.images.shape[3]),
             "geometry_dim": int(candidates.canonical.shape[-1]),
+            "shape_context_dim": int(candidates.shape_context.shape[-1]),
             "coordinate_policy": policy,
             "model_states": states,
             "atlas": atlas.state_dict(),

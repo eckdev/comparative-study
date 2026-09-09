@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-DVAR v6)
+# Hard3 Anatomical Context Refinement (H3-DVAR v7)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v6/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v7/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -23,7 +23,7 @@ sonuçlar her fold altında `hard3_dual_view_v6/` dizinine yazılır.
   üretilir. Neural heatmap, atlas ve surface candidate birleşimi yalnız validation
   fold'unda seçilir; testte politika değiştirilmez.
 
-## Fold 1 denetimi ve v6 değişikliği
+## Fold 1 denetimi ve v4-v7 geliştirmeleri
 
 İlk dual-view koşusu Hard3 ALE'yi `5.2358 -> 4.6143 mm` düşürmüştür. Landmark
 bazında `LM0=2.9303`, `LM21=5.6220`, `LM22=5.2905 mm` ölçülmüştür. Buna göre
@@ -115,6 +115,27 @@ V6 bu nedenle `96 -> 32` hard pruning aşamasını kaldırır:
 - Eğitim ve çıkarım aynı broad top-96 aday uzayını görür; expert-nearest aday
   enjeksiyonu yapılmaz.
 
+V6 Fold 1'de broad top-96 oracle `1.089 mm` olmasına karşın Hard3 sonucu
+`4.6994 mm`de kalmıştır. Kod denetimi iki temel neden göstermiştir: eski çift hedefi
+matematiksel olarak iki bağımsız landmark dağılımına ayrışmakta ve Hard3 eğitim
+ROI'leri Stage 1 merkezlerinden, validation ROI'leri ise Stage 2 + shape-prior
+merkezlerinden üretilmekteydi.
+
+V7 bu seçim ve dağılım uyuşmazlığını hedefler:
+
+- Outer-train örneklerinde donmuş Stage 2, gate ve shape-prior cascade'i yeniden
+  çalıştırılır; Hard3 eğitim merkezleri bu çıktılardan alınır.
+- Geodezik/hybrid ROI cache'inde hem koordinat çerçevesi hem aday vertex havuzu bu
+  merkezler çevresinde yeniden kurulur. Validation/test aynı yolu kullanır.
+- Adaylara iki görünümden signed silhouette distance, depth-gradient ve occupancy
+  örnekleri eklenir.
+- Tüm 23 cascade tahmini canonical shape context olarak bilateral ranker'a verilir.
+- Ranker, Gonion çiftini ortak `mean + asymmetry` contour state'i olarak tahmin eder;
+  bu state doğrudan uzman koordinatlarıyla denetlenir.
+- Mean ve asymmetry enerjileri farklı öğrenilebilir ölçekler kullanır. Böylece joint
+  skor, V6'daki gibi iki bağımsız unary skora cebirsel olarak ayrılamaz.
+- OOF raporu selector regret ve `x/y/z` hata bileşenlerini ayrıca kaydeder.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -124,7 +145,7 @@ V6 bu nedenle `96 -> 32` hard pruning aşamasını kaldırır:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v6/` yeniden eğitilir; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v7/` yeniden eğitilir; eski sürüm
 çıktıları değiştirilmez.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
@@ -135,6 +156,8 @@ oof.proposal_diagnostics.diverse_rank_union_at_k.32/48/96
 oof.gonion_pair_topk_recall.lm21/lm22/both
 oof.gonion_pair_topk_recall.oracle_ale/oracle_p95/oracle_sdr_at_2mm
 oof.gonion_pair_topk_recall.clinical_both_coverage
+oof.selection_diagnostics.selector_regret_mm
+oof.selection_diagnostics.axis_mae_xyz
 oof.mean_dynamic_view_weights
 oof.std_dynamic_view_weights
 coordinate_policy.gonion_pair
@@ -142,8 +165,8 @@ candidate_metrics.joint_soft/joint_argmax/joint_snapped
 selected.alpha_gonion_left/right
 ```
 
-`proposal_diagnostics` broad aşamayı, `gonion_pair_topk_recall` ise v6'da doğrudan
-full-pair arama uzayını ölçer. Exact-nearest vertex recall yalnız tanısaldır. Tam
+`proposal_diagnostics` broad aşamayı, `gonion_pair_topk_recall` ise V7'de doğrudan
+contour-pair arama uzayını ölçer. Exact-nearest vertex recall yalnız tanısaldır. Tam
 CV için arama uzayının Gonion oracle ALE değeri `<=1.50 mm`, p95 değeri
 `<=3.50 mm` ve SDR@2mm değeri `>=%75` olmalıdır. Bu ölçüler yoğun mesh üzerinde
 komşu iki vertex arasındaki önemsiz indeks değişimlerinden etkilenmez.
@@ -170,10 +193,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v6/hard3_dual_view_model.pth
-hard3_dual_view_v6/hard3_dual_view_training_report.json
-hard3_dual_view_v6/hard3_blend_selection.json
-hard3_dual_view_v6/metrics_val.json
+hard3_dual_view_v7/hard3_dual_view_model.pth
+hard3_dual_view_v7/hard3_dual_view_training_report.json
+hard3_dual_view_v7/hard3_blend_selection.json
+hard3_dual_view_v7/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

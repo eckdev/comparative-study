@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import csv
 import hashlib
 import json
@@ -183,8 +184,8 @@ def build_parser():
     )
     parser.add_argument(
         "--hard3-dual-view-decoder-mode",
-        choices=("full_pair", "sharp_pruned"),
-        default="full_pair",
+        choices=("contour_coordinate", "full_pair", "sharp_pruned"),
+        default="contour_coordinate",
     )
     parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
@@ -247,6 +248,18 @@ def build_parser():
         "--hard3-dual-view-pair-validation-mode",
         choices=("pair_soft", "pair_argmax", "pair_snapped"),
         default="pair_argmax",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-state-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-moment-weight", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-state-scale", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--hard3-dual-view-contour-residual-limit", type=float, default=0.20
     )
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
     parser.add_argument(
@@ -398,6 +411,10 @@ def hard3_dual_view_config_from_args(args):
         ),
         pair_hard_negative_count=args.hard3_dual_view_pair_hard_negative_count,
         pair_validation_mode=args.hard3_dual_view_pair_validation_mode,
+        contour_state_weight=args.hard3_dual_view_contour_state_weight,
+        contour_moment_weight=args.hard3_dual_view_contour_moment_weight,
+        contour_state_scale=args.hard3_dual_view_contour_state_scale,
+        contour_residual_limit=args.hard3_dual_view_contour_residual_limit,
         negative_weight=args.hard3_dual_view_negative_weight,
         gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
@@ -426,7 +443,10 @@ def hard3_dual_view_config_from_args(args):
 
 
 def hard3_dual_view_revision(args):
-    if getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned") == "full_pair":
+    mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "contour_coordinate":
+        return "hard3_dual_view_v7", 8
+    if mode == "full_pair":
         return "hard3_dual_view_v6", 7
     return "hard3_dual_view_v5", 6
 
@@ -484,11 +504,13 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
         )
         proposal_gate = {
             "applied": True,
-            "source": (
-                "recall_preserving_full_pair_search"
-                if getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
-                == "full_pair"
-                else "sharp_reranked_pair_shortlist"
+            "source": {
+                "contour_coordinate": "shape_conditioned_contour_search",
+                "full_pair": "recall_preserving_full_pair_search",
+                "sharp_pruned": "sharp_reranked_pair_shortlist",
+            }.get(
+                getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned"),
+                "unknown",
             ),
             "topk": gate_topk,
             "lm21_recall": lm21_recall,
@@ -613,6 +635,40 @@ def fit_shape_prior(args, dataset, validation, fold_dir):
         json.dumps(report, indent=2), encoding="utf-8"
     )
     return prior, report
+
+
+def collect_training_cascade_outputs(
+    dataset,
+    model,
+    device,
+    args,
+    normalizer,
+    force_refined,
+    refinement_calibration,
+    shape_prior,
+):
+    """Recreate the inference cascade on train samples for Stage 3 centers."""
+    evaluation_dataset = copy.copy(dataset)
+    evaluation_dataset.training = False
+    loader = make_loader(
+        evaluation_dataset,
+        args.eval_batch_size,
+        False,
+        args,
+    )
+    outputs = collect_outputs(
+        model,
+        loader,
+        device,
+        args,
+        normalizer,
+        use_tta=args.tta_validation,
+        force_refined=force_refined,
+    )
+    outputs = apply_refinement_calibration(outputs, refinement_calibration)
+    if shape_prior is not None:
+        outputs = apply_shape_prior(outputs, shape_prior)
+    return outputs
 
 
 def model_from_args(args, normalizer, device):
@@ -750,8 +806,28 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             hard3_name, _ = hard3_dual_view_revision(args)
             hard3_output_dir = fold_dir / hard3_name
             hard3_config = hard3_dual_view_config_from_args(args)
+            hard3_training_baseline = None
+            if hard3_config.decoder_mode == "contour_coordinate":
+                print(
+                    "Collecting train-fold Stage 2 + shape-prior centers for Hard3...",
+                    flush=True,
+                )
+                hard3_training_baseline = collect_training_cascade_outputs(
+                    datasets["train"],
+                    model,
+                    device,
+                    args,
+                    normalizer,
+                    force_refined,
+                    refinement_calibration,
+                    prior,
+                )
             hard3_refiner = fit_or_load_dual_view_refiner(
-                datasets["train"], hard3_output_dir, hard3_config, device
+                datasets["train"],
+                hard3_output_dir,
+                hard3_config,
+                device,
+                training_baseline_outputs=hard3_training_baseline,
             )
             hard3_validation = hard3_refiner.predict(
                 datasets["val"], validation, "Hard3 validation dual-view patches"

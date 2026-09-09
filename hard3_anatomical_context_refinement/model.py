@@ -327,6 +327,210 @@ class ClinicalBilateralPairRanker(nn.Module):
         }
 
 
+class ShapeConditionedContourPairRanker(nn.Module):
+    """Decode Gonion as a shared contour state plus patient-specific asymmetry."""
+
+    def __init__(
+        self,
+        input_dim,
+        geometry_dim,
+        shape_context_dim=69,
+        width=48,
+        dropout=0.10,
+        residual_limit=0.20,
+    ):
+        super().__init__()
+        hidden = max(int(width), 32)
+        heads = 4 if hidden % 4 == 0 else 1
+        self.geometry_dim = int(geometry_dim)
+        self.shape_context_dim = int(shape_context_dim)
+        self.residual_limit = float(residual_limit)
+        self.candidate_encoder = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.side_embedding = nn.Parameter(torch.zeros(2, hidden))
+        self.self_attention = nn.MultiheadAttention(
+            hidden, heads, dropout=dropout, batch_first=True
+        )
+        self.cross_attention = nn.MultiheadAttention(
+            hidden, heads, dropout=dropout, batch_first=True
+        )
+        self.self_norm = nn.LayerNorm(hidden)
+        self.cross_norm = nn.LayerNorm(hidden)
+        self.shape_encoder = nn.Sequential(
+            nn.LayerNorm(self.shape_context_dim),
+            nn.Linear(self.shape_context_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.context_encoder = nn.Sequential(
+            nn.Linear(hidden * 5, hidden * 2),
+            nn.LayerNorm(hidden * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden),
+            nn.GELU(),
+        )
+        self.state_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 6),
+        )
+        self.local_score = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.pair_query = nn.Linear(hidden, hidden, bias=False)
+        self.pair_key = nn.Linear(hidden, hidden, bias=False)
+        self.candidate_axis_weights = nn.Parameter(torch.zeros(3))
+        self.mean_axis_weights = nn.Parameter(torch.zeros(3))
+        self.asymmetry_axis_weights = nn.Parameter(torch.zeros(3))
+        self.candidate_scale = nn.Parameter(torch.tensor(-1.0))
+        # Different initial strengths make the mean/asymmetry energy genuinely
+        # bilateral. With one shared scale, the squared terms algebraically
+        # collapse into two independent unary distances.
+        self.mean_scale = nn.Parameter(torch.tensor(-0.75))
+        self.asymmetry_scale = nn.Parameter(torch.tensor(-1.25))
+        self.compatibility_scale = nn.Parameter(torch.tensor(0.5))
+
+        # The initial state is the upstream all-23 prediction. Learning begins as
+        # a bounded residual correction, which is substantially more stable than
+        # predicting an absolute jaw location from 192 samples.
+        nn.init.zeros_(self.state_head[-1].weight)
+        nn.init.zeros_(self.state_head[-1].bias)
+        nn.init.zeros_(self.local_score[-1].weight)
+        nn.init.zeros_(self.local_score[-1].bias)
+
+    @staticmethod
+    def _masked_pool(values, mask):
+        valid = mask[..., None].to(values.dtype)
+        mean = (values * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        maximum = values.masked_fill(~mask[..., None], -torch.inf).amax(dim=1)
+        maximum = torch.nan_to_num(maximum, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.cat([mean, maximum], dim=-1)
+
+    def forward(
+        self,
+        left_features,
+        right_features,
+        left_geometry,
+        right_geometry,
+        left_mask,
+        right_mask,
+        shape_context,
+        base_gonion,
+    ):
+        left = self.candidate_encoder(torch.nan_to_num(left_features.float()))
+        right = self.candidate_encoder(torch.nan_to_num(right_features.float()))
+        left = left + self.side_embedding[0]
+        right = right + self.side_embedding[1]
+
+        left_self, _ = self.self_attention(
+            left, left, left, key_padding_mask=~left_mask, need_weights=False
+        )
+        right_self, _ = self.self_attention(
+            right, right, right, key_padding_mask=~right_mask, need_weights=False
+        )
+        left = self.self_norm(left + left_self)
+        right = self.self_norm(right + right_self)
+        left_cross, _ = self.cross_attention(
+            left, right, right, key_padding_mask=~right_mask, need_weights=False
+        )
+        right_cross, _ = self.cross_attention(
+            right, left, left, key_padding_mask=~left_mask, need_weights=False
+        )
+        left = self.cross_norm(left + left_cross)
+        right = self.cross_norm(right + right_cross)
+
+        shape = self.shape_encoder(torch.nan_to_num(shape_context.float()))
+        context = self.context_encoder(
+            torch.cat(
+                [
+                    self._masked_pool(left, left_mask),
+                    self._masked_pool(right, right_mask),
+                    shape,
+                ],
+                dim=-1,
+            )
+        )
+        state_delta = self.residual_limit * torch.tanh(self.state_head(context))
+        base_mean = 0.5 * (base_gonion[:, 0] + base_gonion[:, 1])
+        base_asymmetry = 0.5 * (base_gonion[:, 0] - base_gonion[:, 1])
+        predicted_mean = base_mean + state_delta[:, :3]
+        predicted_asymmetry = base_asymmetry + state_delta[:, 3:]
+        predicted_left = predicted_mean + predicted_asymmetry
+        predicted_right = predicted_mean - predicted_asymmetry
+
+        expanded_context_left = context[:, None].expand(-1, left.shape[1], -1)
+        expanded_context_right = context[:, None].expand(-1, right.shape[1], -1)
+        left_local = self.local_score(
+            torch.cat([left, expanded_context_left], dim=-1)
+        ).squeeze(-1)
+        right_local = self.local_score(
+            torch.cat([right, expanded_context_right], dim=-1)
+        ).squeeze(-1)
+        left_local = 3.0 * torch.tanh(left_local / 3.0)
+        right_local = 3.0 * torch.tanh(right_local / 3.0)
+
+        if left_geometry.shape[-1] < 6 or right_geometry.shape[-1] < 6:
+            raise ValueError("Contour decoder requires canonical global XYZ features")
+        left_global = left_geometry[..., 3:6].float()
+        right_global = right_geometry[..., 3:6].float()
+        candidate_weights = torch.softmax(self.candidate_axis_weights, dim=0) * 3.0
+        left_distance = (
+            (left_global - predicted_left[:, None]).square() * candidate_weights
+        ).sum(dim=-1)
+        right_distance = (
+            (right_global - predicted_right[:, None]).square() * candidate_weights
+        ).sum(dim=-1)
+        candidate_scale = F.softplus(self.candidate_scale)
+        left_correction = left_local - candidate_scale * left_distance
+        right_correction = right_local - candidate_scale * right_distance
+
+        pair_mean = 0.5 * (left_global[:, :, None] + right_global[:, None, :])
+        pair_asymmetry = 0.5 * (left_global[:, :, None] - right_global[:, None, :])
+        mean_weights = torch.softmax(self.mean_axis_weights, dim=0) * 3.0
+        asymmetry_weights = torch.softmax(self.asymmetry_axis_weights, dim=0) * 3.0
+        mean_error = (
+            (pair_mean - predicted_mean[:, None, None]).square() * mean_weights
+        ).sum(dim=-1)
+        asymmetry_error = (
+            (pair_asymmetry - predicted_asymmetry[:, None, None]).square()
+            * asymmetry_weights
+        ).sum(dim=-1)
+        query = F.normalize(self.pair_query(left), dim=-1)
+        key = F.normalize(self.pair_key(right), dim=-1)
+        compatibility = torch.einsum("bih,bjh->bij", query, key)
+        pair_correction = (
+            -(
+                F.softplus(self.mean_scale) * mean_error
+                + F.softplus(self.asymmetry_scale) * asymmetry_error
+            )
+            + 2.0 * torch.tanh(self.compatibility_scale) * compatibility
+        )
+        pair_mask = left_mask[:, :, None] & right_mask[:, None, :]
+        return {
+            "left_correction": left_correction.masked_fill(~left_mask, 0.0),
+            "right_correction": right_correction.masked_fill(~right_mask, 0.0),
+            "pair_correction": pair_correction.masked_fill(~pair_mask, 0.0),
+            "predicted_mean": predicted_mean,
+            "predicted_asymmetry": predicted_asymmetry,
+            "base_mean": base_mean,
+            "base_asymmetry": base_asymmetry,
+            "left_global": left_global,
+            "right_global": right_global,
+        }
+
+
 class DualViewHard3Net(nn.Module):
     """Dual-view heatmaps plus a jointly decoded bilateral Gonion pair."""
 
@@ -339,11 +543,15 @@ class DualViewHard3Net(nn.Module):
         proposal_topk=96,
         pair_topk=96,
         enable_unary_reranker=False,
+        decoder_mode="full_pair",
+        shape_context_dim=69,
+        contour_residual_limit=0.20,
     ):
         super().__init__()
         self.proposal_topk = max(2, int(proposal_topk))
         self.pair_topk = max(2, int(pair_topk))
         self.geometry_dim = int(geometry_dim)
+        self.decoder_mode = str(decoder_mode)
         self.trichion = CompactUNet(input_channels, width, dropout)
         self.gonion = CompactUNet(input_channels, width, dropout)
         # These biases preserve the useful initialization from v1. The small
@@ -389,12 +597,23 @@ class DualViewHard3Net(nn.Module):
         )
 
         pair_width = max(width * 2, 48)
-        self.gonion_pair_ranker = ClinicalBilateralPairRanker(
-            self.geometry_dim + len(PROPOSAL_SOURCE_NAMES),
-            self.geometry_dim,
-            pair_width,
-            dropout,
-        )
+        pair_input_dim = self.geometry_dim + len(PROPOSAL_SOURCE_NAMES)
+        if self.decoder_mode == "contour_coordinate":
+            self.gonion_pair_ranker = ShapeConditionedContourPairRanker(
+                pair_input_dim,
+                self.geometry_dim,
+                shape_context_dim,
+                pair_width,
+                dropout,
+                contour_residual_limit,
+            )
+        else:
+            self.gonion_pair_ranker = ClinicalBilateralPairRanker(
+                pair_input_dim,
+                self.geometry_dim,
+                pair_width,
+                dropout,
+            )
 
     @staticmethod
     def _heatmap_statistics(heatmaps):
@@ -615,6 +834,8 @@ class DualViewHard3Net(nn.Module):
         target_distance=None,
         proposal_sources=None,
         teacher_force_probability=0.0,
+        shape_context=None,
+        base_gonion=None,
     ):
         """Rank LM21/22 jointly and return differentiable pair coordinates."""
         left_mask, right_mask = candidate_mask[:, 1], candidate_mask[:, 2]
@@ -691,7 +912,7 @@ class DualViewHard3Net(nn.Module):
         right_sources = torch.nan_to_num(right_sources).masked_fill(
             ~right_valid[..., None], 0.0
         )
-        ranked = self.gonion_pair_ranker(
+        pair_arguments = (
             torch.cat([left_geometry.float(), left_sources.float()], dim=-1),
             torch.cat([right_geometry.float(), right_sources.float()], dim=-1),
             left_geometry.float(),
@@ -699,6 +920,22 @@ class DualViewHard3Net(nn.Module):
             left_valid,
             right_valid,
         )
+        if self.decoder_mode == "contour_coordinate":
+            if shape_context is None:
+                shape_context = canonical.new_zeros(
+                    canonical.shape[0], self.gonion_pair_ranker.shape_context_dim
+                )
+            if base_gonion is None:
+                left_base = left_geometry[..., 3:6].mean(dim=1)
+                right_base = right_geometry[..., 3:6].mean(dim=1)
+                base_gonion = torch.stack([left_base, right_base], dim=1)
+            ranked = self.gonion_pair_ranker(
+                *pair_arguments,
+                shape_context,
+                base_gonion,
+            )
+        else:
+            ranked = self.gonion_pair_ranker(*pair_arguments)
         left_unary = left_unary + ranked["left_correction"]
         right_unary = right_unary + ranked["right_correction"]
         pair_logits = (
@@ -758,7 +995,7 @@ class DualViewHard3Net(nn.Module):
             ],
             dim=1,
         )
-        return {
+        result = {
             "logits": pair_logits,
             "mask": pair_mask,
             "probability": probability,
@@ -770,3 +1007,14 @@ class DualViewHard3Net(nn.Module):
             "snapped_coordinate": snapped_coordinate,
             "proposal_sources": proposal_sources,
         }
+        for name in (
+            "predicted_mean",
+            "predicted_asymmetry",
+            "base_mean",
+            "base_asymmetry",
+            "left_global",
+            "right_global",
+        ):
+            if name in ranked:
+                result[name] = ranked[name]
+        return result

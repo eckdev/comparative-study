@@ -391,6 +391,36 @@ def test_completed_full_pair_fold_requires_v6_artifacts_and_version(tmp_path):
     assert load_completed_fold(tmp_path, args, splits) == result
 
 
+def test_completed_contour_coordinate_fold_requires_v7_artifacts_and_version(
+    tmp_path,
+):
+    args = SimpleNamespace(
+        resume_stage2=True,
+        force_stage2_retrain=False,
+        validation_only=False,
+        hard3_structured=True,
+        hard3_refiner_mode="dual_view",
+        hard3_dual_view_decoder_mode="contour_coordinate",
+        output_dir="ignored",
+    )
+    splits = {"train": ["a"], "val": ["b"], "test": ["c"]}
+    for name in ("metrics_val.json", "metrics_test.json", "predictions_test.csv"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    result = {
+        "postprocess_version": 8,
+        "stage2_signature": vnext_signature(args, splits),
+        "hard3_structured": {"enabled": True, "mode": "dual_view"},
+    }
+    (tmp_path / "run_summary.json").write_text(json.dumps(result), encoding="utf-8")
+    assert load_completed_fold(tmp_path, args, splits) is None
+
+    hard3 = tmp_path / "hard3_dual_view_v7"
+    hard3.mkdir()
+    for name in ("hard3_dual_view_model.pth", "metrics_val.json", "metrics_test.json"):
+        (hard3 / name).write_bytes(b"artifact")
+    assert load_completed_fold(tmp_path, args, splits) == result
+
+
 def test_hard3_options_do_not_invalidate_expensive_stage2_signature():
     splits = {"train": ["a"], "val": ["b"], "test": ["c"]}
     first = SimpleNamespace(

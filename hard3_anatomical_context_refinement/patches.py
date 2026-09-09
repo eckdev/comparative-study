@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,6 +28,10 @@ class DualViewCandidateSet:
     expert_full: np.ndarray
     target_distance: np.ndarray
     target_view_mask: np.ndarray
+    centers: np.ndarray | None = None
+    shape_context: np.ndarray | None = None
+    base_gonion: np.ndarray | None = None
+    expert_gonion_context: np.ndarray | None = None
 
     def __len__(self):
         return len(self.sample_ids)
@@ -114,9 +119,7 @@ def _surface_neighbors(points, valid_mask, neighbor_count):
         return indices, mask
 
     query_count = min(count + 1, len(valid))
-    _, local_neighbors = cKDTree(points[valid]).query(
-        points[valid], k=query_count
-    )
+    _, local_neighbors = cKDTree(points[valid]).query(points[valid], k=query_count)
     if query_count == 1:
         local_neighbors = local_neighbors[:, None]
     for row, candidate in enumerate(valid):
@@ -179,6 +182,27 @@ def _target_heatmap(expert_relative, axes, radius, image_size, sigma_mm):
     )
 
 
+def _sample_contour_features(images, relative, radius):
+    """Sample explicit boundary evidence at every 3D candidate projection."""
+    size = images[0].shape[-1]
+    rows = []
+    for image, axes in zip(images, ((0, 1), (2, 1))):
+        u = relative[:, axes[0]]
+        v = relative[:, axes[1]]
+        column = np.rint((u / radius + 1.0) * 0.5 * (size - 1)).astype(np.int64)
+        row = np.rint((1.0 - v / radius) * 0.5 * (size - 1)).astype(np.int64)
+        valid = (column >= 0) & (column < size) & (row >= 0) & (row < size)
+        sampled = np.zeros((len(relative), 3), dtype=np.float32)
+        if np.any(valid):
+            # The final channels are signed silhouette distance, depth gradient,
+            # and measured/interpolated occupancy.
+            sampled[valid, 0] = image[-3, row[valid], column[valid]]
+            sampled[valid, 1] = image[-2, row[valid], column[valid]]
+            sampled[valid, 2] = image[-1, row[valid], column[valid]]
+        rows.append(sampled)
+    return np.concatenate(rows, axis=1).astype(np.float32)
+
+
 def render_item(
     item,
     normalizer_mean,
@@ -187,6 +211,7 @@ def render_item(
     radius_scale=1.0,
     centers=None,
     neighbor_count=12,
+    include_contour_features=False,
 ):
     points = item["points"].numpy().astype(np.float32)
     normalized = item["features"].numpy().astype(np.float32)
@@ -201,6 +226,14 @@ def render_item(
     roi_mask = item["roi_mask"].numpy().astype(bool)[list(HARD3)]
 
     origin, frame, face_scale = _canonical_frame(centers)
+    center_context = ((centers - origin) @ frame) / max(float(face_scale), 1e-4)
+    base_gonion = center_context[[21, 22]].copy()
+    expert_gonion_context = ((expert_full[[21, 22]] - origin) @ frame) / max(
+        float(face_scale), 1e-4
+    )
+    for row, landmark in enumerate((21, 22)):
+        base_gonion[row, 0] *= _side_sign(landmark, centers, origin, frame)
+        expert_gonion_context[row, 0] *= _side_sign(landmark, centers, origin, frame)
     images, targets, grids, canonical_rows, target_view_masks = [], [], [], [], []
     neighbor_indices, neighbor_masks = [], []
     candidate_points = points[roi_index]
@@ -251,22 +284,20 @@ def render_item(
         density = np.clip(
             (raw[indices, 12:13] - density_median) / density_scale, -4.0, 4.0
         )
-        canonical_rows.append(
-            np.concatenate(
-                [
-                    canonical_geometry,
-                    normal,
-                    np.abs(normal),
-                    curvature,
-                    density,
-                    rgb,
-                    contrast,
-                    intensity,
-                    chroma,
-                ],
-                axis=1,
-            ).astype(np.float32)
-        )
+        candidate_features = np.concatenate(
+            [
+                canonical_geometry,
+                normal,
+                np.abs(normal),
+                curvature,
+                density,
+                rgb,
+                contrast,
+                intensity,
+                chroma,
+            ],
+            axis=1,
+        ).astype(np.float32)
         per_point = np.concatenate(
             [rgb, contrast, normal, intensity, chroma, curvature, density], axis=1
         ).astype(np.float32)
@@ -329,6 +360,14 @@ def render_item(
                 axis=-1,
             )
             landmark_grids.append(np.clip(grid, -2.0, 2.0).astype(np.float32))
+        if include_contour_features:
+            contour_features = _sample_contour_features(
+                landmark_images, relative, radius
+            )
+            candidate_features = np.concatenate(
+                [candidate_features, contour_features], axis=1
+            )
+        canonical_rows.append(candidate_features.astype(np.float32))
         images.append(landmark_images)
         targets.append(landmark_targets)
         grids.append(landmark_grids)
@@ -349,6 +388,10 @@ def render_item(
         expert_full,
         target_distance.astype(np.float32),
         np.asarray(target_view_masks, dtype=np.bool_),
+        np.asarray(centers, dtype=np.float32),
+        center_context.reshape(-1).astype(np.float32),
+        base_gonion.astype(np.float32),
+        expert_gonion_context.astype(np.float32),
     )
 
 
@@ -359,34 +402,58 @@ def extract_dual_view_set(
     centers_by_id=None,
     label="Hard3 patches",
     neighbor_count=12,
+    include_contour_features=False,
 ):
-    previous_training = dataset.training
-    dataset.training = False
-    rows = [[] for _ in range(12)]
+    working_dataset = dataset
+    if centers_by_id is not None and hasattr(dataset, "coarse_predictions"):
+        missing = [
+            sample.sample_id
+            for sample in dataset.samples
+            if sample.sample_id not in centers_by_id
+        ]
+        if missing:
+            raise KeyError(f"Hard3 centers miss samples: {missing[:5]}")
+        # Rebuild the dynamic ROI around the exact cascade output used at
+        # inference. A shallow copy keeps the expensive mesh record cache while
+        # isolating coarse coordinates and ROI memory from the parent dataset.
+        working_dataset = copy.copy(dataset)
+        working_dataset.coarse_predictions = {
+            sample.sample_id: np.asarray(
+                centers_by_id[sample.sample_id], dtype=np.float32
+            ).copy()
+            for sample in dataset.samples
+        }
+        working_dataset.coarse_in_target_space = True
+        working_dataset._roi_memory = {}
+
+    previous_training = working_dataset.training
+    working_dataset.training = False
+    rows = [[] for _ in range(16)]
     sample_ids, strata = [], []
     try:
-        for index in range(len(dataset)):
-            item = dataset[index]
+        for index in range(len(working_dataset)):
+            item = working_dataset[index]
             centers = None
             if centers_by_id is not None:
                 centers = centers_by_id[item["sample_id"]]
             rendered = render_item(
                 item,
-                dataset.mean,
-                dataset.std,
+                working_dataset.mean,
+                working_dataset.std,
                 image_size=image_size,
                 radius_scale=radius_scale,
                 centers=centers,
                 neighbor_count=neighbor_count,
+                include_contour_features=include_contour_features,
             )
             for destination, value in zip(rows, rendered):
                 destination.append(value)
             sample_ids.append(item["sample_id"])
             strata.append(f"{item['class']}|{item['gender']}")
-            if (index + 1) % 20 == 0 or index + 1 == len(dataset):
-                print(f"{label} {index + 1}/{len(dataset)}", flush=True)
+            if (index + 1) % 20 == 0 or index + 1 == len(working_dataset):
+                print(f"{label} {index + 1}/{len(working_dataset)}", flush=True)
     finally:
-        dataset.training = previous_training
+        working_dataset.training = previous_training
     return DualViewCandidateSet(
         sample_ids=sample_ids,
         strata=strata,
@@ -402,4 +469,8 @@ def extract_dual_view_set(
         expert_full=np.stack(rows[9]),
         target_distance=np.stack(rows[10]),
         target_view_mask=np.stack(rows[11]),
+        centers=np.stack(rows[12]),
+        shape_context=np.stack(rows[13]),
+        base_gonion=np.stack(rows[14]),
+        expert_gonion_context=np.stack(rows[15]),
     )

@@ -7,6 +7,7 @@ from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3
 from hard3_anatomical_context_refinement.atlas import TrainOnlyLocalHard3Atlas
 from hard3_anatomical_context_refinement.model import (
     DualViewHard3Net,
+    ShapeConditionedContourPairRanker,
     diverse_topk_indices,
 )
 from hard3_anatomical_context_refinement.patches import (
@@ -16,7 +17,9 @@ from hard3_anatomical_context_refinement.patches import (
 )
 from hard3_anatomical_context_refinement.refiner import (
     Hard3DualViewConfig,
+    _cache_signature,
     _clinical_full_pair_loss,
+    _contour_coordinate_loss,
     _dual_blend_prediction,
     _loss,
     _median_best_epoch,
@@ -365,21 +368,151 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
         np.zeros(14, dtype=np.float32),
         np.ones(14, dtype=np.float32),
         image_size=32,
+        include_contour_features=True,
     )
     assert rendered[0].shape == (3, 2, 20, 32, 32)
     assert rendered[1].shape == (3, 2, 32, 32)
     assert rendered[2].shape == (3, 2, roi_points, 2)
-    assert rendered[4].shape == (3, roi_points, 34)
+    assert rendered[4].shape == (3, roi_points, 40)
     assert rendered[5].shape == (3, roi_points, 12)
     assert rendered[6].shape == (3, roi_points, 12)
     assert rendered[7].any(axis=-1).all()
     assert rendered[11].shape == (3, 2)
+    assert rendered[12].shape == (23, 3)
+    assert rendered[13].shape == (69,)
+    assert rendered[14].shape == (2, 3)
+    assert rendered[15].shape == (2, 3)
     assert all(np.isfinite(values).all() for values in rendered[:5])
     # CoordConv and contour/depth-gradient channels are present immediately
     # before the final occupancy channel.
     assert rendered[0][..., -5, :, :].min() >= -1.0
     assert rendered[0][..., -5, :, :].max() <= 1.0
     assert rendered[0][..., -2, :, :].min() >= 0.0
+    legacy = render_item(
+        item,
+        np.zeros(14, dtype=np.float32),
+        np.ones(14, dtype=np.float32),
+        image_size=32,
+    )
+    assert legacy[4].shape == (3, roi_points, 34)
+
+
+def test_contour_pair_ranker_uses_shape_context_and_true_bilateral_energy():
+    torch.manual_seed(47)
+    ranker = ShapeConditionedContourPairRanker(
+        input_dim=44,
+        geometry_dim=40,
+        shape_context_dim=69,
+        width=16,
+        dropout=0.0,
+    )
+    torch.nn.init.normal_(ranker.state_head[-1].weight, std=0.05)
+    left_features = torch.randn(2, 7, 44)
+    right_features = torch.randn(2, 7, 44)
+    left_geometry = torch.randn(2, 7, 40)
+    right_geometry = torch.randn(2, 7, 40)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    base = torch.randn(2, 2, 3) * 0.1
+    first = ranker(
+        left_features,
+        right_features,
+        left_geometry,
+        right_geometry,
+        mask,
+        mask,
+        torch.zeros(2, 69),
+        base,
+    )
+    second = ranker(
+        left_features,
+        right_features,
+        left_geometry,
+        right_geometry,
+        mask,
+        mask,
+        torch.randn(2, 69),
+        base,
+    )
+    assert not torch.allclose(first["predicted_mean"], second["predicted_mean"])
+
+    pair = first["pair_correction"][0]
+    interaction = pair[0, 0] + pair[1, 1] - pair[0, 1] - pair[1, 0]
+    assert abs(float(interaction)) > 1e-6
+
+
+def test_dual_view_cache_signature_tracks_cascade_center_overrides(tmp_path):
+    record = tmp_path / "sample.npz"
+    record.write_bytes(b"record")
+    sample = SimpleNamespace(sample_id="sample")
+
+    class DatasetStub:
+        samples = [sample]
+        records = {"sample": record}
+        mean = np.zeros(14, dtype=np.float32)
+        std = np.ones(14, dtype=np.float32)
+        roi_points = 32
+        roi_radius_scale = 1.5
+        roi_mode = "hybrid"
+        roi_euclidean_scale = 1.25
+        roi_multi_seeds = 3
+
+        def _coarse(self, _sample):
+            return np.zeros((23, 3), dtype=np.float32)
+
+    dataset = DatasetStub()
+    config = Hard3DualViewConfig(width=8)
+    first = {"sample": np.zeros((23, 3), dtype=np.float32)}
+    second = {"sample": np.ones((23, 3), dtype=np.float32)}
+    assert _cache_signature(dataset, config, first) != _cache_signature(
+        dataset, config, second
+    )
+
+
+def test_contour_coordinate_loss_is_finite_and_updates_state_head():
+    torch.manual_seed(53)
+    batch_size, candidates = 2, 10
+    model = DualViewHard3Net(
+        20,
+        width=8,
+        dropout=0.0,
+        geometry_dim=40,
+        proposal_topk=candidates,
+        pair_topk=candidates,
+        decoder_mode="contour_coordinate",
+    )
+    _set_training_stage(model, "pair")
+    logits = torch.randn(batch_size, 3, candidates)
+    canonical = torch.randn(batch_size, 3, candidates, 40)
+    points = torch.randn(batch_size, 3, candidates, 3)
+    expert = points[:, :, 0].clone()
+    distance = torch.linalg.norm(points - expert[:, :, None], dim=-1)
+    mask = torch.ones(batch_size, 3, candidates, dtype=torch.bool)
+    pair = model.gonion_pair(
+        logits,
+        canonical,
+        points,
+        mask,
+        proposal_sources=torch.randn(batch_size, 3, 4, candidates),
+        shape_context=torch.randn(batch_size, 69),
+        base_gonion=torch.randn(batch_size, 2, 3) * 0.1,
+    )
+    loss, components = _contour_coordinate_loss(
+        pair,
+        {"distance": distance, "mask": mask},
+        Hard3DualViewConfig(
+            width=8,
+            proposal_topk=candidates,
+            pair_topk=candidates,
+            decoder_mode="contour_coordinate",
+        ),
+    )
+    assert torch.isfinite(loss)
+    assert torch.isfinite(components["contour_state"])
+    assert torch.isfinite(components["contour_moment"])
+    loss.backward()
+    gradient = model.gonion_pair_ranker.state_head[-1].weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
 
 
 def test_joint_pair_decoder_uses_both_gonion_candidate_sets():
@@ -524,6 +657,7 @@ def test_tiny_joint_pair_training_and_inference_complete():
         expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
         target_distance=distance,
         target_view_mask=np.ones((samples, 3, 2), dtype=bool),
+        expert_gonion_context=rng.normal(size=(samples, 2, 3)).astype(np.float32),
     )
     outputs, best_epoch, score, history, _ = _train_model(
         candidate_set,
