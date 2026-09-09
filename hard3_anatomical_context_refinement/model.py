@@ -219,6 +219,114 @@ class SharpUnaryReranker(nn.Module):
         return correction.masked_fill(~candidate_mask, -torch.inf)
 
 
+class ClinicalBilateralPairRanker(nn.Module):
+    """Condition both Gonion candidate sets before scoring every retained pair."""
+
+    def __init__(self, input_dim, geometry_dim, width=48, dropout=0.10):
+        super().__init__()
+        hidden = max(int(width), 32)
+        heads = 4 if hidden % 4 == 0 else 1
+        self.geometry_dim = int(geometry_dim)
+        self.candidate_encoder = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.side_embedding = nn.Parameter(torch.zeros(2, hidden))
+        self.cross_attention = nn.MultiheadAttention(
+            hidden,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden)
+        self.unary_score = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        pair_dim = max(hidden // 2, 16)
+        self.left_query = nn.Linear(hidden, pair_dim, bias=False)
+        self.right_key = nn.Linear(hidden, pair_dim, bias=False)
+        self.pair_scale = nn.Parameter(torch.tensor(0.0))
+        self.symmetry_scale = nn.Parameter(torch.tensor(-2.0))
+        self.symmetry_weights = nn.Parameter(torch.zeros(min(18, geometry_dim)))
+
+        # Start from the recall-preserving broad unary distribution. Pair context
+        # is introduced only after the dedicated clinical-ranking stage begins.
+        nn.init.zeros_(self.unary_score[-1].weight)
+        nn.init.zeros_(self.unary_score[-1].bias)
+
+    def forward(
+        self,
+        left_features,
+        right_features,
+        left_geometry,
+        right_geometry,
+        left_mask,
+        right_mask,
+    ):
+        left = self.candidate_encoder(torch.nan_to_num(left_features.float()))
+        right = self.candidate_encoder(torch.nan_to_num(right_features.float()))
+        left = left + self.side_embedding[0]
+        right = right + self.side_embedding[1]
+        left_context, _ = self.cross_attention(
+            left,
+            right,
+            right,
+            key_padding_mask=~right_mask,
+            need_weights=False,
+        )
+        right_context, _ = self.cross_attention(
+            right,
+            left,
+            left,
+            key_padding_mask=~left_mask,
+            need_weights=False,
+        )
+        left_context = self.cross_norm(left + left_context)
+        right_context = self.cross_norm(right + right_context)
+        left_correction = self.unary_score(
+            torch.cat([left, left_context, left - left_context], dim=-1)
+        ).squeeze(-1)
+        right_correction = self.unary_score(
+            torch.cat([right, right_context, right - right_context], dim=-1)
+        ).squeeze(-1)
+        left_correction = 3.0 * torch.tanh(left_correction / 3.0)
+        right_correction = 3.0 * torch.tanh(right_correction / 3.0)
+        left_correction = left_correction.masked_fill(~left_mask, 0.0)
+        right_correction = right_correction.masked_fill(~right_mask, 0.0)
+
+        query = F.normalize(self.left_query(left_context), dim=-1)
+        key = F.normalize(self.right_key(right_context), dim=-1)
+        compatibility = torch.einsum("bih,bjh->bij", query, key)
+        compatibility = torch.tanh(self.pair_scale) * compatibility
+
+        symmetry_dim = self.symmetry_weights.numel()
+        difference = torch.abs(
+            left_geometry[:, :, None, :symmetry_dim]
+            - right_geometry[:, None, :, :symmetry_dim]
+        )
+        symmetry_weights = torch.softmax(self.symmetry_weights, dim=0)
+        symmetry_distance = (difference * symmetry_weights).sum(dim=-1)
+        # Mirrored canonical coordinates provide a weak prior, not a hard
+        # symmetry constraint; the learned scale may suppress it for asymmetric
+        # faces.
+        symmetry_penalty = F.softplus(self.symmetry_scale) * symmetry_distance
+        pair_correction = compatibility - symmetry_penalty
+        pair_mask = left_mask[:, :, None] & right_mask[:, None, :]
+        return {
+            "left_correction": left_correction,
+            "right_correction": right_correction,
+            "pair_correction": pair_correction.masked_fill(~pair_mask, 0.0),
+        }
+
+
 class DualViewHard3Net(nn.Module):
     """Dual-view heatmaps plus a jointly decoded bilateral Gonion pair."""
 
@@ -229,7 +337,8 @@ class DualViewHard3Net(nn.Module):
         dropout=0.10,
         geometry_dim=18,
         proposal_topk=96,
-        pair_topk=32,
+        pair_topk=96,
+        enable_unary_reranker=False,
     ):
         super().__init__()
         self.proposal_topk = max(2, int(proposal_topk))
@@ -269,26 +378,23 @@ class DualViewHard3Net(nn.Module):
             dropout,
         )
         reranker_input_dim = self.geometry_dim + len(PROPOSAL_SOURCE_NAMES)
-        self.gonion_unary_reranker = SharpUnaryReranker(
-            reranker_input_dim,
-            proposal_width,
-            dropout,
+        self.gonion_unary_reranker = (
+            SharpUnaryReranker(
+                reranker_input_dim,
+                proposal_width,
+                dropout,
+            )
+            if enable_unary_reranker
+            else None
         )
 
-        pair_input_dim = 4 * self.geometry_dim + 4
         pair_width = max(width * 2, 48)
-        self.gonion_pair_ranker = nn.Sequential(
-            nn.Linear(pair_input_dim, pair_width),
-            nn.LayerNorm(pair_width),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(pair_width, pair_width // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(pair_width // 2, 1),
+        self.gonion_pair_ranker = ClinicalBilateralPairRanker(
+            self.geometry_dim + len(PROPOSAL_SOURCE_NAMES),
+            self.geometry_dim,
+            pair_width,
+            dropout,
         )
-        nn.init.zeros_(self.gonion_pair_ranker[-1].weight)
-        nn.init.zeros_(self.gonion_pair_ranker[-1].bias)
 
     @staticmethod
     def _heatmap_statistics(heatmaps):
@@ -457,6 +563,8 @@ class DualViewHard3Net(nn.Module):
         proposal_sources,
     ):
         """Preserve broad recall, then produce a sharper Gonion distribution."""
+        if self.gonion_unary_reranker is None:
+            raise RuntimeError("Unary reranker is disabled for this model")
         gonion_mask = candidate_mask[:, 1:3]
         broad = self._masked_standardize(candidate_logits[:, 1:3].float(), gonion_mask)
         proposal_count = min(self.proposal_topk, candidate_logits.shape[-1])
@@ -516,7 +624,11 @@ class DualViewHard3Net(nn.Module):
         right_logits = self._masked_standardize(
             candidate_logits[:, 2].float(), right_mask
         )
-        use_topk = min(self.pair_topk, candidate_logits.shape[-1])
+        use_topk = min(
+            self.pair_topk,
+            self.proposal_topk,
+            candidate_logits.shape[-1],
+        )
         # V5 consumes only the sharp reranker's shortlist. The broad top-96
         # proposal is retained one stage earlier and is never pruned directly to
         # the bilateral search space.
@@ -566,29 +678,32 @@ class DualViewHard3Net(nn.Module):
             ~right_valid, 0.0
         )
 
-        left = left_geometry[:, :, None, :].expand(-1, -1, use_topk, -1)
-        right = right_geometry[:, None, :, :].expand(-1, use_topk, -1, -1)
-        unary_features = torch.stack(
-            [
-                left_unary[:, :, None].expand(-1, -1, use_topk),
-                right_unary[:, None, :].expand(-1, use_topk, -1),
-                left_unary[:, :, None] + right_unary[:, None, :],
-                torch.abs(left_unary[:, :, None] - right_unary[:, None, :]),
-            ],
-            dim=-1,
+        if proposal_sources is None:
+            proposal_sources = canonical.new_zeros(
+                canonical.shape[0], 3, len(PROPOSAL_SOURCE_NAMES), canonical.shape[2]
+            )
+        source_values = proposal_sources[:, 1:3].permute(0, 1, 3, 2)
+        left_sources = self._gather(source_values[:, 0], left_indices)
+        right_sources = self._gather(source_values[:, 1], right_indices)
+        left_sources = torch.nan_to_num(left_sources).masked_fill(
+            ~left_valid[..., None], 0.0
         )
-        pair_features = torch.cat(
-            [
-                left,
-                right,
-                torch.abs(left - right),
-                0.5 * (left + right),
-                unary_features,
-            ],
-            dim=-1,
+        right_sources = torch.nan_to_num(right_sources).masked_fill(
+            ~right_valid[..., None], 0.0
         )
-        correction = self.gonion_pair_ranker(pair_features).squeeze(-1)
-        pair_logits = left_unary[:, :, None] + right_unary[:, None, :] + correction
+        ranked = self.gonion_pair_ranker(
+            torch.cat([left_geometry.float(), left_sources.float()], dim=-1),
+            torch.cat([right_geometry.float(), right_sources.float()], dim=-1),
+            left_geometry.float(),
+            right_geometry.float(),
+            left_valid,
+            right_valid,
+        )
+        left_unary = left_unary + ranked["left_correction"]
+        right_unary = right_unary + ranked["right_correction"]
+        pair_logits = (
+            left_unary[:, :, None] + right_unary[:, None, :] + ranked["pair_correction"]
+        )
         pair_mask = left_valid[:, :, None] & right_valid[:, None, :]
         pair_logits = pair_logits.masked_fill(~pair_mask, -torch.inf)
 
@@ -647,6 +762,7 @@ class DualViewHard3Net(nn.Module):
             "logits": pair_logits,
             "mask": pair_mask,
             "probability": probability,
+            "unary_logits": torch.stack([left_unary, right_unary], dim=1),
             "left_indices": left_indices,
             "right_indices": right_indices,
             "soft_coordinate": soft_coordinate,

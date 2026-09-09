@@ -16,6 +16,7 @@ from hard3_anatomical_context_refinement.patches import (
 )
 from hard3_anatomical_context_refinement.refiner import (
     Hard3DualViewConfig,
+    _clinical_full_pair_loss,
     _dual_blend_prediction,
     _loss,
     _median_best_epoch,
@@ -119,7 +120,9 @@ def test_pair_stage_freezes_everything_except_bilateral_ranker():
 
 
 def test_rerank_stage_freezes_everything_except_sharp_unary_ranker():
-    model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=2)
+    model = DualViewHard3Net(
+        20, width=8, dropout=0.0, pair_topk=2, enable_unary_reranker=True
+    )
     _set_training_stage(model, "rerank")
     assert all(
         parameter.requires_grad
@@ -141,6 +144,7 @@ def test_sharp_reranker_preserves_broad_topk_then_reorders_candidates():
         geometry_dim=18,
         proposal_topk=4,
         pair_topk=2,
+        enable_unary_reranker=True,
     )
     logits = torch.zeros(1, 3, 8)
     logits[:, 1:3] = torch.arange(8, dtype=torch.float32)
@@ -290,7 +294,7 @@ def test_dual_view_forward_candidate_logits_and_loss_are_finite():
     assert all(torch.isfinite(value) for value in components.values())
     loss.backward()
     assert model.gonion.output.weight.grad is not None
-    assert model.gonion_pair_ranker[-1].weight.grad is not None
+    assert model.gonion_pair_ranker.unary_score[-1].weight.grad is not None
     assert model.gonion_view_gate[-1].weight.grad is not None
 
 
@@ -304,6 +308,7 @@ def test_sharp_rerank_loss_is_finite_and_updates_only_reranker():
         geometry_dim=18,
         proposal_topk=8,
         pair_topk=4,
+        enable_unary_reranker=True,
     )
     _set_training_stage(model, "rerank")
     logits = torch.randn(batch_size, 3, candidates)
@@ -323,7 +328,7 @@ def test_sharp_rerank_loss_is_finite_and_updates_only_reranker():
     assert all(torch.isfinite(value) for value in components.values())
     loss.backward()
     assert model.gonion_unary_reranker.score[-1].weight.grad is not None
-    assert model.gonion_pair_ranker[-1].weight.grad is None
+    assert model.gonion_pair_ranker.unary_score[-1].weight.grad is None
 
 
 def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
@@ -380,7 +385,6 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
 def test_joint_pair_decoder_uses_both_gonion_candidate_sets():
     torch.manual_seed(23)
     model = DualViewHard3Net(20, width=8, dropout=0.0, pair_topk=4)
-    torch.nn.init.normal_(model.gonion_pair_ranker[-1].weight, std=0.1)
     logits = torch.randn(1, 3, 8)
     canonical = torch.randn(1, 3, 8, 18)
     points = torch.randn(1, 3, 8, 3)
@@ -393,6 +397,36 @@ def test_joint_pair_decoder_uses_both_gonion_candidate_sets():
     # Both coordinates are marginals of one normalized pair distribution.
     probability = torch.softmax(first["logits"].flatten(1) / 0.5, dim=-1)
     torch.testing.assert_close(probability.sum(dim=-1), torch.ones(1))
+
+
+def test_full_pair_decoder_preserves_all_broad_top96_candidates():
+    torch.manual_seed(25)
+    candidates = 128
+    model = DualViewHard3Net(
+        20,
+        width=8,
+        dropout=0.0,
+        geometry_dim=18,
+        proposal_topk=96,
+        pair_topk=96,
+    )
+    logits = torch.randn(1, 3, candidates)
+    canonical = torch.randn(1, 3, candidates, 18)
+    points = torch.randn(1, 3, candidates, 3)
+    mask = torch.ones(1, 3, candidates, dtype=torch.bool)
+    sources = torch.randn(1, 3, 4, candidates)
+    pair = model.gonion_pair(
+        logits,
+        canonical,
+        points,
+        mask,
+        proposal_sources=sources,
+    )
+    expected_left = set(torch.topk(logits[0, 1], 96).indices.tolist())
+    expected_right = set(torch.topk(logits[0, 2], 96).indices.tolist())
+    assert set(pair["left_indices"][0].tolist()) == expected_left
+    assert set(pair["right_indices"][0].tolist()) == expected_right
+    assert pair["logits"].shape == (1, 96, 96)
 
 
 def test_joint_pair_decoder_is_finite_when_topk_contains_padding():
@@ -411,6 +445,57 @@ def test_joint_pair_decoder_is_finite_when_topk_contains_padding():
     )
     objective.backward()
     assert torch.isfinite(logits.grad).all()
+
+
+def test_clinical_full_pair_loss_is_finite_and_updates_pair_decoder():
+    torch.manual_seed(41)
+    batch_size, candidates = 2, 12
+    model = DualViewHard3Net(
+        20,
+        width=8,
+        dropout=0.0,
+        geometry_dim=18,
+        proposal_topk=candidates,
+        pair_topk=candidates,
+    )
+    _set_training_stage(model, "pair")
+    logits = torch.randn(batch_size, 3, candidates)
+    canonical = torch.randn(batch_size, 3, candidates, 18)
+    points = torch.randn(batch_size, 3, candidates, 3)
+    expert = points[:, :, 0].clone()
+    distance = torch.linalg.norm(points - expert[:, :, None], dim=-1)
+    mask = torch.ones(batch_size, 3, candidates, dtype=torch.bool)
+    sources = torch.randn(batch_size, 3, 4, candidates)
+    pair = model.gonion_pair(
+        logits,
+        canonical,
+        points,
+        mask,
+        proposal_sources=sources,
+    )
+    loss, components = _clinical_full_pair_loss(
+        pair,
+        {"distance": distance, "mask": mask},
+        Hard3DualViewConfig(
+            width=8,
+            proposal_topk=candidates,
+            pair_topk=candidates,
+        ),
+    )
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(value) for value in components.values())
+    loss.backward()
+    trainable_gradients = [
+        parameter.grad
+        for parameter in model.gonion_pair_ranker.parameters()
+        if parameter.requires_grad
+    ]
+    assert any(gradient is not None for gradient in trainable_gradients)
+    assert all(
+        torch.isfinite(gradient).all()
+        for gradient in trainable_gradients
+        if gradient is not None
+    )
 
 
 def test_tiny_joint_pair_training_and_inference_complete():
@@ -465,9 +550,9 @@ def test_tiny_joint_pair_training_and_inference_complete():
         torch.device("cpu"),
         fold_number=1,
     )
-    assert best_epoch == {"proposal": 1, "rerank": 1, "pair": 1}
+    assert best_epoch == {"proposal": 1, "rerank": 0, "pair": 1}
     assert all(np.isfinite(value) for value in score.values())
-    assert len(history) == 3
+    assert len(history) == 2
     assert outputs["logits"].shape == (2, 3, candidates)
     assert outputs["pair_soft"].shape == (2, 2, 3)
 

@@ -55,8 +55,9 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
+    decoder_mode: str = "full_pair"
     proposal_topk: int = 96
-    pair_topk: int = 32
+    pair_topk: int = 96
     pair_temperature: float = 0.5
     proposal_neighbors: int = 12
     proposal_teacher_forcing_epochs: int = 0
@@ -76,8 +77,16 @@ class Hard3DualViewConfig:
     pair_stage_min_epochs: int = 10
     pair_stage_patience: int = 10
     pair_stage_lr: float = 5e-4
-    pair_target_sigma: float = 2.0
+    pair_target_sigma: float = 1.5
+    pair_listwise_weight: float = 0.75
+    pair_unary_listwise_weight: float = 0.50
+    pair_clinical_radius_mm: float = 2.0
+    pair_clinical_mass_weight: float = 1.0
     pair_expected_distance_weight: float = 0.5
+    pair_hard_negative_weight: float = 0.25
+    pair_hard_negative_radius_mm: float = 4.0
+    pair_hard_negative_count: int = 64
+    pair_validation_mode: str = "pair_argmax"
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -316,6 +325,12 @@ def _teacher_force_probability(epoch, warmup_epochs):
     return max(0.0, 1.0 - (max(int(epoch), 1) - 1) / max(warmup, 1))
 
 
+def _uses_unary_reranker(config):
+    if config.decoder_mode not in ("full_pair", "sharp_pruned"):
+        raise ValueError("decoder_mode must be full_pair or sharp_pruned")
+    return config.decoder_mode == "sharp_pruned"
+
+
 def _median_best_epoch(best_epochs, maximum_epochs):
     if not best_epochs:
         raise ValueError("best_epochs cannot be empty")
@@ -328,7 +343,7 @@ def _forward_model(
     config,
     training=False,
     teacher_force_probability=0.0,
-    compute_rerank=True,
+    compute_rerank=None,
     compute_pair=True,
 ):
     heatmaps, view_weights = model.forward_with_context(batch["images"])
@@ -343,6 +358,8 @@ def _forward_model(
         return_evidence=True,
     )
     proposal_logits = evidence["logits"]
+    if compute_rerank is None:
+        compute_rerank = _uses_unary_reranker(config)
     rerank = None
     candidate_logits = proposal_logits
     if compute_rerank:
@@ -566,6 +583,110 @@ def _sharp_rerank_loss(rerank_output, batch, config):
     }
 
 
+def _adaptive_clinical_positive(distance, mask, radius_mm):
+    fixed = mask & (distance <= float(radius_mm))
+    minimum = distance.masked_fill(~mask, torch.inf).amin(dim=-1, keepdim=True)
+    fallback = mask & (distance <= minimum + 0.5)
+    return torch.where(fixed.any(dim=-1, keepdim=True), fixed, fallback)
+
+
+def _clinical_full_pair_loss(pair_output, batch, config):
+    left_distance = torch.gather(
+        batch["distance"][:, 1], 1, pair_output["left_indices"]
+    ).float()
+    right_distance = torch.gather(
+        batch["distance"][:, 2], 1, pair_output["right_indices"]
+    ).float()
+    distance = torch.stack([left_distance, right_distance], dim=1)
+    unary_mask = torch.stack(
+        [
+            torch.gather(batch["mask"][:, 1], 1, pair_output["left_indices"]),
+            torch.gather(batch["mask"][:, 2], 1, pair_output["right_indices"]),
+        ],
+        dim=1,
+    )
+    unary_listwise, _, _ = _distance_distribution(
+        pair_output["unary_logits"],
+        distance,
+        unary_mask,
+        config.pair_target_sigma,
+        config.pair_temperature,
+    )
+
+    pair_mask = pair_output["mask"]
+    pair_distance = 0.5 * (left_distance[:, :, None] + right_distance[:, None, :])
+    target_energy = -(
+        left_distance[:, :, None].square() + right_distance[:, None, :].square()
+    ) / (2.0 * max(float(config.pair_target_sigma), 1e-4) ** 2)
+    target_energy = target_energy.masked_fill(~pair_mask, -torch.inf)
+    target = torch.softmax(target_energy.flatten(1), dim=-1).reshape_as(target_energy)
+    probability = pair_output["probability"]
+    pair_listwise = (
+        target
+        * (torch.log(target.clamp_min(1e-8)) - torch.log(probability.clamp_min(1e-8)))
+    ).masked_fill(~pair_mask, 0.0)
+    pair_listwise = pair_listwise.sum(dim=(1, 2)).mean()
+
+    left_positive = _adaptive_clinical_positive(
+        left_distance,
+        unary_mask[:, 0],
+        config.pair_clinical_radius_mm,
+    )
+    right_positive = _adaptive_clinical_positive(
+        right_distance,
+        unary_mask[:, 1],
+        config.pair_clinical_radius_mm,
+    )
+    positive_pair = left_positive[:, :, None] & right_positive[:, None, :]
+    positive_mass = (probability * positive_pair).sum(dim=(1, 2)).clamp_min(1e-8)
+    clinical_mass = -torch.log(positive_mass).mean()
+
+    expected_distance = (probability * pair_distance.masked_fill(~pair_mask, 0.0)).sum(
+        dim=(1, 2)
+    ).mean() / max(float(config.distance_normalizer_mm), 1e-4)
+
+    pair_logits = pair_output["logits"].float()
+    positive_logits = pair_logits.masked_fill(~positive_pair, -torch.inf)
+    positive_score = torch.logsumexp(positive_logits.flatten(1), dim=-1)
+    positive_count = positive_pair.flatten(1).sum(dim=-1).clamp_min(1).float()
+    positive_score = positive_score - torch.log(positive_count)
+    negative_mask = pair_mask & (
+        pair_distance > float(config.pair_hard_negative_radius_mm)
+    )
+    flattened_negative = pair_logits.masked_fill(~negative_mask, -torch.inf).flatten(1)
+    negative_count = min(
+        max(1, int(config.pair_hard_negative_count)), flattened_negative.shape[-1]
+    )
+    negative_values, negative_indices = torch.topk(
+        flattened_negative, negative_count, dim=-1
+    )
+    negative_valid = torch.gather(negative_mask.flatten(1), 1, negative_indices)
+    hard_negative = F.softplus(
+        negative_values - positive_score[:, None] + float(config.negative_margin)
+    )
+    hard_negative = torch.where(
+        negative_valid, hard_negative, torch.zeros_like(hard_negative)
+    )
+    hard_negative = (
+        hard_negative.sum(dim=-1) / negative_valid.sum(dim=-1).clamp_min(1)
+    ).mean()
+
+    total = (
+        config.pair_listwise_weight * pair_listwise
+        + config.pair_unary_listwise_weight * unary_listwise
+        + config.pair_clinical_mass_weight * clinical_mass
+        + config.pair_expected_distance_weight * expected_distance
+        + config.pair_hard_negative_weight * hard_negative
+    )
+    return total, {
+        "pair_listwise": pair_listwise,
+        "pair_unary_listwise": unary_listwise,
+        "pair_clinical_mass": clinical_mass,
+        "pair_expected_distance": expected_distance,
+        "pair_hard_negative": hard_negative,
+    }
+
+
 def _new_model(candidate_set, config):
     return DualViewHard3Net(
         candidate_set.images.shape[3],
@@ -574,6 +695,7 @@ def _new_model(candidate_set, config):
         geometry_dim=candidate_set.canonical.shape[-1],
         proposal_topk=config.proposal_topk,
         pair_topk=config.pair_topk,
+        enable_unary_reranker=_uses_unary_reranker(config),
     )
 
 
@@ -584,7 +706,6 @@ def _predict_outputs(model, candidate_set, indices, config, device):
         "logits": [],
         "proposal_logits": [],
         "proposal_sources": [],
-        "rerank_proposal_indices": [],
         "pair_soft": [],
         "pair_argmax": [],
         "pair_snapped": [],
@@ -603,10 +724,7 @@ def _predict_outputs(model, candidate_set, indices, config, device):
             evidence["proposal_logits"].float().cpu().numpy()
         )
         chunks["proposal_sources"].append(
-            pair["proposal_sources"].float().cpu().numpy()
-        )
-        chunks["rerank_proposal_indices"].append(
-            evidence["rerank"]["proposal_indices"].cpu().numpy()
+            evidence["proposal_sources"].float().cpu().numpy()
         )
         chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
         chunks["pair_argmax"].append(pair["argmax_coordinate"].float().cpu().numpy())
@@ -762,14 +880,18 @@ def _set_training_stage(model, stage):
     if stage == "proposal":
         for parameter in model.parameters():
             parameter.requires_grad_(True)
-        for parameter in model.gonion_unary_reranker.parameters():
-            parameter.requires_grad_(False)
+        if model.gonion_unary_reranker is not None:
+            for parameter in model.gonion_unary_reranker.parameters():
+                parameter.requires_grad_(False)
         for parameter in model.gonion_pair_ranker.parameters():
             parameter.requires_grad_(False)
         model.train()
-        model.gonion_unary_reranker.eval()
+        if model.gonion_unary_reranker is not None:
+            model.gonion_unary_reranker.eval()
         model.gonion_pair_ranker.eval()
     elif stage == "rerank":
+        if model.gonion_unary_reranker is None:
+            raise RuntimeError("Unary reranker stage requested while it is disabled")
         for parameter in model.gonion_unary_reranker.parameters():
             parameter.requires_grad_(True)
         model.eval()
@@ -796,12 +918,22 @@ def _validation_stage_metrics(model, candidate_set, val_indices, config, device,
     )
     prediction = unary.copy()
     if stage == "pair":
-        prediction[:, 1:3] = outputs["pair_soft"]
+        if config.pair_validation_mode not in (
+            "pair_soft",
+            "pair_argmax",
+            "pair_snapped",
+        ):
+            raise ValueError(
+                "pair_validation_mode must be pair_soft, pair_argmax, or pair_snapped"
+            )
+        prediction[:, 1:3] = outputs[config.pair_validation_mode]
     error = np.linalg.norm(prediction - candidate_set.expert[val_indices], axis=-1)
     return outputs, error
 
 
 def _pair_stage_loss(heatmaps, logits, batch, config, pair_output):
+    if config.decoder_mode == "full_pair":
+        return _clinical_full_pair_loss(pair_output, batch, config)
     _, components = _loss(heatmaps, logits, batch, config, pair_output)
     total = (
         config.coordinate_weight * components["coordinate"]
@@ -864,6 +996,10 @@ def _fit_stage(
                 "joint_pair_ranking",
                 "joint_pair_negative",
                 "pair_expected_distance",
+                "pair_listwise",
+                "pair_unary_listwise",
+                "pair_clinical_mass",
+                "pair_hard_negative",
                 "negative",
                 "rerank_listwise",
                 "rerank_expected_distance",
@@ -891,7 +1027,7 @@ def _fit_stage(
                 config,
                 training=False,
                 teacher_force_probability=0.0,
-                compute_rerank=stage != "proposal",
+                compute_rerank=(_uses_unary_reranker(config) and stage != "proposal"),
                 compute_pair=is_pair,
             )
             if is_pair:
@@ -916,12 +1052,14 @@ def _fit_stage(
         _, val_error = _validation_stage_metrics(
             model, candidate_set, val_indices, config, device, stage
         )
-        score = float(val_error.mean())
+        score = float(val_error[:, 1:3].mean()) if is_pair else float(val_error.mean())
+        hard3_score = float(val_error.mean())
         scheduler.step(score)
         row = {
             "stage": stage,
             "epoch": epoch,
-            "validation_hard3_ale": score,
+            "validation_selection_ale": score,
+            "validation_hard3_ale": hard3_score,
             "validation_lm0_ale": float(val_error[:, 0].mean()),
             "validation_gonion_ale": float(val_error[:, 1:3].mean()),
             "lr": float(optimizer.param_groups[0]["lr"]),
@@ -963,16 +1101,20 @@ def _train_model(
         "proposal",
     )
     model.load_state_dict(proposal_state)
-    rerank_epoch, rerank_score, rerank_history, rerank_state = _fit_stage(
-        model,
-        candidate_set,
-        train_indices,
-        val_indices,
-        config,
-        device,
-        fold_number,
-        "rerank",
-    )
+    if _uses_unary_reranker(config):
+        rerank_epoch, rerank_score, rerank_history, rerank_state = _fit_stage(
+            model,
+            candidate_set,
+            train_indices,
+            val_indices,
+            config,
+            device,
+            fold_number,
+            "rerank",
+        )
+    else:
+        rerank_epoch, rerank_score, rerank_history = 0, proposal_score, []
+        rerank_state = proposal_state
     model.load_state_dict(rerank_state)
     pair_epoch, pair_score, pair_history, pair_state = _fit_stage(
         model,
@@ -1019,11 +1161,11 @@ def _train_fixed_model(
     rng = np.random.default_rng(config.seed + 70_001 + member_number * 7919)
     indices = np.arange(len(candidate_set), dtype=np.int64)
     history = []
-    for stage, epochs, lr in (
-        ("proposal", int(proposal_epochs), config.lr),
-        ("rerank", int(rerank_epochs), config.rerank_stage_lr),
-        ("pair", int(pair_epochs), config.pair_stage_lr),
-    ):
+    stages = [("proposal", int(proposal_epochs), config.lr)]
+    if _uses_unary_reranker(config):
+        stages.append(("rerank", int(rerank_epochs), config.rerank_stage_lr))
+    stages.append(("pair", int(pair_epochs), config.pair_stage_lr))
+    for stage, epochs, lr in stages:
         _set_training_stage(model, stage)
         trainable = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -1053,7 +1195,9 @@ def _train_fixed_model(
                     model,
                     batch,
                     config,
-                    compute_rerank=stage != "proposal",
+                    compute_rerank=(
+                        _uses_unary_reranker(config) and stage != "proposal"
+                    ),
                     compute_pair=stage == "pair",
                 )
                 if stage == "pair":
@@ -1122,7 +1266,7 @@ def _cache_signature(dataset, config):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     payload = {
-        "version": 8,
+        "version": 11,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -1332,6 +1476,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                     geometry_dim=checkpoint["geometry_dim"],
                     proposal_topk=config.proposal_topk,
                     pair_topk=config.pair_topk,
+                    enable_unary_reranker=_uses_unary_reranker(config),
                 )
                 model.load_state_dict(state)
                 models.append(model)
@@ -1365,7 +1510,11 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         name: np.zeros((len(candidates), 2, 3), dtype=np.float32)
         for name in ("pair_soft", "pair_argmax", "pair_snapped")
     }
-    pair_count = min(config.pair_topk, candidates.points.shape[-2])
+    pair_count = min(
+        config.pair_topk,
+        config.proposal_topk,
+        candidates.points.shape[-2],
+    )
     oof_pair_indices = {
         name: np.full((len(candidates), pair_count), -1, dtype=np.int64)
         for name in ("pair_left_indices", "pair_right_indices")
@@ -1403,7 +1552,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                     candidates.sample_ids[i] for i in val_indices
                 ],
                 "best_epochs": stage_epochs,
-                "best_validation_hard3_ale": stage_scores["pair"],
+                "best_validation_pair_selection_ale": stage_scores["pair"],
                 "best_validation_proposal_ale": stage_scores["proposal"],
                 "best_validation_rerank_ale": stage_scores["rerank"],
                 "history": history,
@@ -1446,8 +1595,13 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     median_proposal_epoch = _median_best_epoch(
         [values["proposal"] for values in best_epochs], config.epochs
     )
-    median_rerank_epoch = _median_best_epoch(
-        [values["rerank"] for values in best_epochs], config.rerank_stage_epochs
+    median_rerank_epoch = (
+        _median_best_epoch(
+            [values["rerank"] for values in best_epochs],
+            config.rerank_stage_epochs,
+        )
+        if _uses_unary_reranker(config)
+        else 0
     )
     median_pair_epoch = _median_best_epoch(
         [values["pair"] for values in best_epochs], config.pair_stage_epochs
@@ -1512,8 +1666,9 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
     )
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
+    revision = "H3-DVAR-v6" if config.decoder_mode == "full_pair" else "H3-DVAR-v5"
     print(
-        f"H3-DVAR v5 broad proposal@{diagnostic_key}: "
+        f"{revision} broad proposal@{diagnostic_key}: "
         f"LM21={diagnostic_row['lm21_recall']:.3f} "
         f"LM22={diagnostic_row['lm22_recall']:.3f} "
         f"both={diagnostic_row['both_recall']:.3f} "
@@ -1545,22 +1700,30 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         ],
         axis=1,
     )
+    left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
+    right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     print(
-        f"H3-DVAR v5 reranked shortlist@{pair_count}: "
+        f"{revision} "
+        f"{'full-pair search' if config.decoder_mode == 'full_pair' else 'reranked shortlist'}"
+        f"@{pair_count}: "
         f"LM21={left_pair_hit.mean():.3f} "
         f"LM22={right_pair_hit.mean():.3f} "
         f"both={np.mean(left_pair_hit & right_pair_hit):.3f} "
         f"oracle={pair_shortlist_distance.mean():.3f} mm "
         f"p95={np.percentile(pair_shortlist_distance, 95):.3f} "
-        f"SDR2={(pair_shortlist_distance <= 2.0).mean():.3f}",
+        f"SDR2={(pair_shortlist_distance <= 2.0).mean():.3f} "
+        f"clinical_both={np.mean(left_clinical_hit & right_clinical_hit):.3f}",
         flush=True,
     )
     parameter_count = sum(parameter.numel() for parameter in models[0].parameters())
     report = {
         "signature": signature,
-        "version": "H3-DVAR-v5",
+        "version": revision,
         "method": (
-            "nested-OOF broad surface-context proposal, frozen sharp unary "
+            "nested-OOF broad surface-context proposal and recall-preserving "
+            "clinical full-pair Gonion decoding"
+            if config.decoder_mode == "full_pair"
+            else "nested-OOF broad surface-context proposal, frozen sharp unary "
             "reranking, and bilateral Gonion pair decoding"
         ),
         "uses_validation_labels_for_model_fit": False,
@@ -1574,6 +1737,7 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
         "final_training": {
             "selection": final_selection,
             "policy": config.final_model_policy,
+            "reranker_enabled": _uses_unary_reranker(config),
             "median_inner_fold_best_epochs": {
                 "proposal": median_proposal_epoch,
                 "rerank": median_rerank_epoch,
@@ -1601,6 +1765,10 @@ def fit_or_load_dual_view_refiner(dataset, output_dir, config, device):
                 "oracle_p95": float(np.percentile(pair_shortlist_distance, 95)),
                 "oracle_sdr_at_2mm": float((pair_shortlist_distance <= 2.0).mean()),
                 "oracle_sdr_at_3mm": float((pair_shortlist_distance <= 3.0).mean()),
+                "clinical_radius_mm": float(config.pair_clinical_radius_mm),
+                "clinical_both_coverage": float(
+                    np.mean(left_clinical_hit & right_clinical_hit)
+                ),
             },
             "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
             "std_dynamic_view_weights": oof_view_weights.std(axis=0).tolist(),
