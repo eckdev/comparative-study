@@ -185,6 +185,7 @@ def build_parser():
     parser.add_argument(
         "--hard3-dual-view-decoder-mode",
         choices=(
+            "crossfit_multiscale_contour",
             "crossfit_set_context",
             "crossfit_interaction",
             "crossfit_calibrated",
@@ -192,7 +193,7 @@ def build_parser():
             "full_pair",
             "sharp_pruned",
         ),
-        default="crossfit_set_context",
+        default="crossfit_multiscale_contour",
     )
     parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
@@ -352,6 +353,17 @@ def build_parser():
     )
     parser.add_argument(
         "--hard3-dual-view-set-negative-margin", type=float, default=0.5
+    )
+    parser.add_argument("--hard3-dual-view-multiscale-shortlist", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-multiscale-hops", default="1,2,3")
+    parser.add_argument(
+        "--hard3-dual-view-multiscale-feature-modes",
+        default="compact,geometry,contour",
+    )
+    parser.add_argument("--hard3-dual-view-multiscale-l2-grid", default="0.01,0.1,1,10")
+    parser.add_argument(
+        "--hard3-dual-view-multiscale-descriptor-weight-grid",
+        default="0,0.25,0.5,1",
     )
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
     parser.add_argument(
@@ -569,6 +581,29 @@ def hard3_dual_view_config_from_args(args):
         set_hard_negative_weight=args.hard3_dual_view_set_hard_negative_weight,
         set_negative_radius_mm=args.hard3_dual_view_set_negative_radius_mm,
         set_negative_margin=args.hard3_dual_view_set_negative_margin,
+        multiscale_shortlist=args.hard3_dual_view_multiscale_shortlist,
+        multiscale_hops=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_multiscale_hops.split(",")
+            if value.strip()
+        ),
+        multiscale_feature_modes=tuple(
+            value.strip()
+            for value in args.hard3_dual_view_multiscale_feature_modes.split(",")
+            if value.strip()
+        ),
+        multiscale_l2_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_multiscale_l2_grid.split(",")
+            if value.strip()
+        ),
+        multiscale_descriptor_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_multiscale_descriptor_weight_grid.split(
+                ","
+            )
+            if value.strip()
+        ),
         negative_weight=args.hard3_dual_view_negative_weight,
         gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
@@ -598,6 +633,8 @@ def hard3_dual_view_config_from_args(args):
 
 def hard3_dual_view_revision(args):
     mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "crossfit_multiscale_contour":
+        return "hard3_dual_view_v11", 12
     if mode == "crossfit_set_context":
         return "hard3_dual_view_v10", 11
     if mode == "crossfit_interaction":
@@ -644,6 +681,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
         gate_values = oof.get("gonion_pair_topk_recall", {})
         gate_scope = "outer_train_oof"
         if getattr(args, "hard3_dual_view_decoder_mode", "") in (
+            "crossfit_multiscale_contour",
             "crossfit_calibrated",
             "crossfit_interaction",
             "crossfit_set_context",
@@ -698,6 +736,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             "applied": True,
             "scope": gate_scope,
             "source": {
+                "crossfit_multiscale_contour": "OOF_multiscale_contour_search",
                 "crossfit_set_context": "OOF_relational_set_context_search",
                 "crossfit_interaction": "OOF_subjectwise_interaction_search",
                 "crossfit_calibrated": "OOF_calibrated_contour_search",
@@ -1019,6 +1058,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                     prior,
                 )
             elif hard3_config.decoder_mode in (
+                "crossfit_multiscale_contour",
                 "crossfit_calibrated",
                 "crossfit_interaction",
                 "crossfit_set_context",
@@ -1040,6 +1080,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                 datasets["val"], validation, "Hard3 validation dual-view patches"
             )
             if hard3_config.decoder_mode in (
+                "crossfit_multiscale_contour",
                 "crossfit_calibrated",
                 "crossfit_interaction",
                 "crossfit_set_context",

@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-RSCR v10)
+# Hard3 Anatomical Context Refinement (H3-MSCSR v11)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v10/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v11/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -199,6 +199,31 @@ V10, H3-RSCR (Hard3 Relational Set-Context Ranker), bu nedenle:
 - dış validation blend aşamasında LM21 ve LM22 için farklı tahmin varyantları
   seçilmesine izin verir; Core20 yine değiştirilemez.
 
+V10 Fold 1'de şimdiye kadarki en iyi ara sonucu üretmiştir: overall ALE
+`2.1618 mm`, Core20 `1.8330 mm` ve Hard3 `4.3536 mm`. Ancak OOF set-ranker ALE
+`5.5820 mm`, dış-validation selector ALE `5.3034 mm` iken aynı top-96 aday
+havuzunun oracle değeri `1.0196 mm`dir. Kazanç esas olarak LM21 için
+`fusion_w0.25_s8_argmax`, LM22 için `neural_policy` varyantlarının ayrı seçilmesinden
+gelmiştir. Bu sonuç daha yüksek ranker kapasitesinin değil, lokal konturun daha
+doğrudan temsil edilmesinin gerekli olduğunu gösterir.
+
+V11, H3-MSCSR (Hard3 Multi-Scale Contour Surface Ranker), bu darboğazı şu şekilde
+hedefler:
+
+- V8'in leakage denetimli OOF broad-proposal checkpointlerini değişmeden kullanır.
+- Her Gonion adayı çevresinde 12-komşulu yüzey grafını 1, 2 ve 3 hop yayarak üç
+  farklı ölçekte lokal yüzey momentleri hesaplar.
+- Kovaryans özdeğerleri, çizgisellik, düzlemsellik, saçılma, ana teğet yönü, normal
+  varyasyonu, eğrilik/yoğunluk istatistikleri ve frontal/profil kontur değişimleri
+  açık özellikler haline getirilir.
+- LM21 ve LM22 için ayrı, örnek-dengeli ridge rankerlar kullanılır. Böylece tarama
+  ve poz kaynaklı taraf asimetrisi ortak bir MLP'ye zorlanmaz.
+- Özellik ailesi ile L2 önce OOF üzerinde seçilir; proposal füzyon ağırlığı ve
+  decoder yalnız seçilen özellik çifti için ikinci adımda belirlenir. Bu sıralı
+  seçim küçük örneklemde çoklu-deneme overfit riskini sınırlar.
+- Dış validation/test landmarkları özellik çıkarımı, model fit'i veya politika
+  seçimine girmez; yalnız kilitli modelin değerlendirilmesinde kullanılır.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -208,13 +233,14 @@ V10, H3-RSCR (Hard3 Relational Set-Context Ranker), bu nedenle:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v10/` yeniden eğitilir; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v11/` oluşturulur; eski sürüm
 çıktıları değiştirilmez.
 
-V8 klasörü aynı fold altında bulunuyorsa V10, sample/coarse-center imzasını,
+V8 klasörü aynı fold altında bulunuyorsa V11, sample/coarse-center imzasını,
 proposal ayarlarını, OOF fold kapsamını ve `inner_fold_ensemble` politikasını
 doğrular. Tümü eşleşirse V8 broad-proposal checkpointleri yeniden kullanılır;
-yalnız ilişkisel set-ranker eğitilir ve pahalı proposal eğitimi tekrarlanmaz.
+yalnız çok ölçekli tanımlayıcılar ve ridge seçiciler fit edilir; pahalı proposal
+eğitimi tekrarlanmaz.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
@@ -231,12 +257,15 @@ oof.std_dynamic_view_weights
 oof.crossfit_selector.selected
 oof.crossfit_selector.state_l2_sweep
 oof.crossfit_selector.decoder_sweep
-oof.crossfit_selector.folds
+oof.crossfit_selector.side_policies
+oof.crossfit_selector.feature_sweep
+oof.crossfit_selector.decoder_sweep
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
-candidate_metrics.crossfit_set_context
-candidate_metrics.set_context_refit
-candidate_metrics.set_context_state_only
+candidate_metrics.crossfit_multiscale_contour
+candidate_metrics.multiscale_contour_refit
+candidate_metrics.multiscale_contour_argmax
+candidate_metrics.multiscale_contour_descriptor_only
 validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
 independent_variant_oracle
 selected.alpha_gonion_left/right
@@ -271,10 +300,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v10/hard3_dual_view_model.pth
-hard3_dual_view_v10/hard3_dual_view_training_report.json
-hard3_dual_view_v10/hard3_blend_selection.json
-hard3_dual_view_v10/metrics_val.json
+hard3_dual_view_v11/hard3_dual_view_model.pth
+hard3_dual_view_v11/hard3_dual_view_training_report.json
+hard3_dual_view_v11/hard3_blend_selection.json
+hard3_dual_view_v11/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```
