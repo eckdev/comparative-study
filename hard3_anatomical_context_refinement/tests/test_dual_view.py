@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3
@@ -41,6 +42,9 @@ from hard3_anatomical_context_refinement.multiscale_selector import (
     CrossFittedGlobalJawContourSelector,
     CrossFittedMultiscaleContourSelector,
     multiscale_surface_descriptors,
+)
+from hard3_anatomical_context_refinement.mixture_selector import (
+    CrossFittedMixtureStateSelector,
 )
 from hard3_anatomical_context_refinement.statistical_selector import (
     CrossFittedContourSelector,
@@ -975,6 +979,104 @@ def test_multiscale_contour_selector_is_cross_fitted_and_roundtrips_state():
         policy["feature_mode"].startswith("global_")
         for policy in global_selector.report["side_policies"]
     )
+
+
+def test_coordinate_mixture_selector_is_cross_fitted_and_roundtrips_state():
+    rng = np.random.default_rng(59)
+    samples, candidates = 12, 16
+    points = rng.normal(size=(samples, 3, candidates, 3)).astype(np.float32)
+    expert = points[:, :, 0].copy()
+    distance = np.linalg.norm(points - expert[:, :, None], axis=-1).astype(np.float32)
+    canonical = rng.normal(size=(samples, 3, candidates, 40)).astype(np.float32)
+    canonical[:, :, :, 3:6] = points
+    sources = rng.normal(size=(samples, 3, 4, candidates)).astype(np.float32)
+    sources[:, 1:3, :, 0] += 6.0
+    candidate_set = DualViewCandidateSet(
+        sample_ids=[f"sample_{index}" for index in range(samples)],
+        strata=["Class1|women", "Class1|men"] * 6,
+        images=np.zeros((samples, 3, 2, 20, 8, 8), dtype=np.float16),
+        targets=np.zeros((samples, 3, 2, 8, 8), dtype=np.float16),
+        grids=np.zeros((samples, 3, 2, candidates, 2), dtype=np.float32),
+        points=points,
+        canonical=canonical,
+        neighbor_index=np.zeros((samples, 3, candidates, 1), dtype=np.int64),
+        neighbor_mask=np.ones((samples, 3, candidates, 1), dtype=bool),
+        mask=np.ones((samples, 3, candidates), dtype=bool),
+        expert=expert,
+        expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
+        target_distance=distance,
+        target_view_mask=np.ones((samples, 3, 2), dtype=bool),
+        shape_context=rng.normal(size=(samples, 69)).astype(np.float32),
+        base_gonion=rng.normal(size=(samples, 2, 3)).astype(np.float32),
+        expert_gonion_context=points[:, 1:3, 0].copy(),
+    )
+    splits = [
+        (np.arange(6, 12), np.arange(0, 6)),
+        (np.arange(0, 6), np.arange(6, 12)),
+    ]
+    config = Hard3DualViewConfig(
+        decoder_mode="crossfit_mixture_state",
+        mixture_shortlist=8,
+        mixture_feature_modes=("coordinate", "evidence"),
+        mixture_l2_grid=(0.1, 1.0),
+        mixture_alpha_grid=(0.5, 1.0),
+    )
+    selector = CrossFittedMixtureStateSelector.fit(
+        candidate_set, sources, splits, config
+    )
+    restored = CrossFittedMixtureStateSelector.from_state_dict(selector.state_dict())
+    result = restored.predict(candidate_set, sources)
+    assert selector.oof_prediction.shape == (samples, 2, 3)
+    assert result["crossfit_mixture_state"].shape == (samples, 2, 3)
+    assert result["member_coordinate"].shape == (2, samples, 2, 3)
+    assert np.isfinite(result["crossfit_mixture_state"]).all()
+    assert selector.report["uses_outer_validation_labels"] is False
+    assert selector.report["uses_test_labels"] is False
+    assert selector.report["parameter_count"] < 5_000
+
+
+def test_coordinate_mixture_selector_rejects_non_oof_split():
+    rng = np.random.default_rng(61)
+    samples, candidates = 4, 8
+    points = rng.normal(size=(samples, 3, candidates, 3)).astype(np.float32)
+    canonical = rng.normal(size=(samples, 3, candidates, 40)).astype(np.float32)
+    canonical[..., 3:6] = points
+    expert = points[:, :, 0].copy()
+    candidate_set = DualViewCandidateSet(
+        sample_ids=[f"sample_{index}" for index in range(samples)],
+        strata=["Class1|women"] * samples,
+        images=np.zeros((samples, 3, 2, 20, 8, 8), dtype=np.float16),
+        targets=np.zeros((samples, 3, 2, 8, 8), dtype=np.float16),
+        grids=np.zeros((samples, 3, 2, candidates, 2), dtype=np.float32),
+        points=points,
+        canonical=canonical,
+        neighbor_index=np.zeros((samples, 3, candidates, 1), dtype=np.int64),
+        neighbor_mask=np.ones((samples, 3, candidates, 1), dtype=bool),
+        mask=np.ones((samples, 3, candidates), dtype=bool),
+        expert=expert,
+        expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
+        target_distance=np.linalg.norm(points - expert[:, :, None], axis=-1).astype(
+            np.float32
+        ),
+        target_view_mask=np.ones((samples, 3, 2), dtype=bool),
+        shape_context=rng.normal(size=(samples, 69)).astype(np.float32),
+        base_gonion=rng.normal(size=(samples, 2, 3)).astype(np.float32),
+        expert_gonion_context=points[:, 1:3, 0].copy(),
+    )
+    config = Hard3DualViewConfig(
+        decoder_mode="crossfit_mixture_state",
+        mixture_shortlist=4,
+        mixture_feature_modes=("coordinate",),
+        mixture_l2_grid=(1.0,),
+        mixture_alpha_grid=(1.0,),
+    )
+    with pytest.raises(ValueError, match="exactly one OOF"):
+        CrossFittedMixtureStateSelector.fit(
+            candidate_set,
+            rng.normal(size=(samples, 3, 4, candidates)).astype(np.float32),
+            [(np.asarray([2, 3]), np.asarray([0, 1]))],
+            config,
+        )
 
 
 def test_dual_blend_supports_independent_left_and_right_strengths():

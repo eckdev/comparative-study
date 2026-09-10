@@ -25,6 +25,7 @@ from all23_rgb_geodesic_cascade.metrics import bootstrap_delta, summarize
 
 from .atlas import TrainOnlyLocalHard3Atlas
 from .interaction_selector import CrossFittedInteractionSelector
+from .mixture_selector import CrossFittedMixtureStateSelector
 from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
 from .multiscale_selector import (
     CrossFittedGlobalJawContourSelector,
@@ -64,7 +65,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "crossfit_global_contour"
+    decoder_mode: str = "crossfit_mixture_state"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -154,6 +155,14 @@ class Hard3DualViewConfig:
     multiscale_feature_modes: tuple[str, ...] = ("compact", "geometry", "contour")
     multiscale_l2_grid: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0)
     multiscale_descriptor_weight_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0)
+    mixture_shortlist: int = 96
+    mixture_feature_modes: tuple[str, ...] = (
+        "coordinate",
+        "evidence",
+        "evidence_shape",
+    )
+    mixture_l2_grid: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0, 100.0)
+    mixture_alpha_grid: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -418,6 +427,7 @@ def _teacher_force_probability(epoch, warmup_epochs):
 
 def _uses_unary_reranker(config):
     if config.decoder_mode not in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_set_context",
@@ -428,7 +438,8 @@ def _uses_unary_reranker(config):
         "sharp_pruned",
     ):
         raise ValueError(
-            "decoder_mode must be crossfit_global_contour, "
+            "decoder_mode must be crossfit_mixture_state, "
+            "crossfit_global_contour, "
             "crossfit_multiscale_contour, "
             "crossfit_set_context, crossfit_interaction, crossfit_calibrated, "
             "contour_coordinate, full_pair or sharp_pruned"
@@ -438,6 +449,7 @@ def _uses_unary_reranker(config):
 
 def _uses_contour_features(config):
     return config.decoder_mode in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "contour_coordinate",
@@ -449,6 +461,7 @@ def _uses_contour_features(config):
 
 def _uses_neural_pair(config):
     return config.decoder_mode not in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_calibrated",
@@ -459,6 +472,7 @@ def _uses_neural_pair(config):
 
 def _uses_crossfit_selector(config):
     return config.decoder_mode in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_calibrated",
@@ -473,6 +487,8 @@ def _uses_global_contour_features(config):
 
 def _load_crossfit_selector(state):
     version = state.get("version")
+    if version == CrossFittedMixtureStateSelector.version:
+        return CrossFittedMixtureStateSelector.from_state_dict(state)
     if version == CrossFittedGlobalJawContourSelector.version:
         return CrossFittedGlobalJawContourSelector.from_state_dict(state)
     if version == CrossFittedMultiscaleContourSelector.version:
@@ -1533,6 +1549,7 @@ def _cache_signature(dataset, config, centers_by_id=None):
     multiscale_fields = {
         name for name in asdict(config) if name.startswith("multiscale_")
     }
+    mixture_fields = {name for name in asdict(config) if name.startswith("mixture_")}
     if config.decoder_mode != "crossfit_interaction":
         ignored.update(interaction_fields)
     if config.decoder_mode != "crossfit_set_context":
@@ -1542,7 +1559,10 @@ def _cache_signature(dataset, config, centers_by_id=None):
         "crossfit_multiscale_contour",
     ):
         ignored.update(multiscale_fields)
+    if config.decoder_mode != "crossfit_mixture_state":
+        ignored.update(mixture_fields)
     if config.decoder_mode in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_interaction",
@@ -1574,6 +1594,7 @@ def _cache_signature(dataset, config, centers_by_id=None):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     cache_version = {
+        "crossfit_mixture_state": 19,
         "crossfit_global_contour": 18,
         "crossfit_multiscale_contour": 17,
         "crossfit_set_context": 16,
@@ -1639,6 +1660,7 @@ def _torch_load(path, device):
 
 def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
     if config.decoder_mode not in (
+        "crossfit_mixture_state",
         "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_interaction",
@@ -1708,6 +1730,7 @@ def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
         if covered != set(candidates.sample_ids):
             return None
         target = {
+            "crossfit_mixture_state": "V13",
             "crossfit_global_contour": "V12",
             "crossfit_multiscale_contour": "V11",
             "crossfit_set_context": "V10",
@@ -2179,7 +2202,31 @@ def fit_or_load_dual_view_refiner(
     if not np.isfinite(oof_proposal_sources[expanded_mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF proposal sources are incomplete")
     statistical_selector = None
-    if config.decoder_mode == "crossfit_global_contour":
+    if config.decoder_mode == "crossfit_mixture_state":
+        print(
+            "Fitting joint bilateral coordinate-mixture estimator on OOF evidence...",
+            flush=True,
+        )
+        statistical_selector = CrossFittedMixtureStateSelector.fit(
+            candidates,
+            oof_proposal_sources,
+            selector_splits,
+            config,
+        )
+        selected_selector = statistical_selector.report["selected"]
+        print(
+            "H3-CMSE-v13 OOF selector: "
+            f"ALE={selected_selector['ale']:.4f} "
+            f"p95={selected_selector['p95']:.4f} "
+            f"SDR2={selected_selector['sdr_at_2mm']:.3f} "
+            f"mode={selected_selector['feature_mode']} "
+            f"l2={selected_selector['l2']:g} "
+            f"decoder={selected_selector['decoder']} "
+            f"alpha={selected_selector['alpha']:g} "
+            f"params={statistical_selector.report['parameter_count']}",
+            flush=True,
+        )
+    elif config.decoder_mode == "crossfit_global_contour":
         print(
             "Fitting side-specific global jaw-contour selector on OOF evidence...",
             flush=True,
@@ -2419,6 +2466,7 @@ def fit_or_load_dual_view_refiner(
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     revision = {
+        "crossfit_mixture_state": "H3-CMSE-v13",
         "crossfit_global_contour": "H3-GJCSR-v12",
         "crossfit_multiscale_contour": "H3-MSCSR-v11",
         "crossfit_set_context": "H3-RSCR-v10",
@@ -2477,6 +2525,7 @@ def fit_or_load_dual_view_refiner(
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     search_name = {
+        "crossfit_mixture_state": "coordinate-mixture state search",
         "crossfit_global_contour": "global jaw-contour search",
         "crossfit_multiscale_contour": "multi-scale contour search",
         "crossfit_set_context": "relational set-context search",
@@ -2504,6 +2553,10 @@ def fit_or_load_dual_view_refiner(
         "signature": signature,
         "version": revision,
         "method": {
+            "crossfit_mixture_state": (
+                "joint bilateral coordinate-mixture regression from nested-OOF "
+                "proposal distributions and Core20 context"
+            ),
             "crossfit_global_contour": (
                 "nested-OOF broad proposal plus side-specific regularized ranking "
                 "from full-mesh frontal, inferior and profile jaw silhouettes"

@@ -18,19 +18,17 @@ checkpoint'leri değiştirilmez.
 - Refiner dondurulduktan sonra ayrı confidence gate eğitimi.
 - Outer-train uzman şekillerinden fit edilen PCA + Core20-to-Hard3 conditional shape-prior.
   Shape-prior hiperparametreleri yalnız validation'da seçilir; test etiketi kullanılmaz.
-- Donmuş vNext + shape-prior çıktısı üzerinde H3-GJCSR v12:
+- Donmuş vNext + shape-prior çıktısı üzerinde H3-CMSE v13:
   - `LM0` için frontal/profil RGB-depth appearance U-Net,
   - `LM21/LM22` için RGB, normal, curvature ve landmark-anchor özellikli lokal
     surface-context proposal ranker,
   - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 96` broad proposal,
   - V7'nin yüksek recall üreten neural proposal'ını koruyan cross-fitted selector,
   - yalnız Core20 ile koşullanan bilateral state regression,
-  - top-96 Gonion adayı için tam mesh üzerinden frontal dış kontur, inferior çene
-    konturu ve profil derinliği,
-  - 3/6/12 mm ölçeklerinde robust kontur uzaklığı, teğet ve büküm özellikleri,
-  - LM21 ve LM22 için örnek-dengeli ayrı ridge rankerlar,
-  - LM21 ve LM22 için validation üzerinde kilitlenen bağımsız tahmin kaynağı,
-  - yalnız outer-train subject fold'larında OOF özellik/L2/decoder seçimi,
+  - geometry/fused/frontal/profile proposal dağılımlarından çok ölçekli koordinat,
+    yayılım, entropi ve peak-margin kanıtı,
+  - LM21 ve LM22'yi birlikte tahmin eden düşük kapasiteli bilateral ridge stacker,
+  - yalnız outer-train subject fold'larında OOF özellik/L2/alpha/decoder seçimi,
   - eğitimde in-sample Stage2 merkezi yerine leakage-free Stage1 OOF merkezi;
     çıkarımda donmuş Stage2 merkezi çevresinden dinamik geodezik ROI,
   - nested OOF best-checkpoint ensemble ve inference ile aynı teachersız pair eğitimi,
@@ -89,13 +87,13 @@ python -u agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py \
   --hard3-dual-view-patience 1 \
   --hard3-dual-view-image-size 32 \
   --hard3-dual-view-width 8 \
-  --hard3-dual-view-decoder-mode crossfit_global_contour \
+  --hard3-dual-view-decoder-mode crossfit_mixture_state \
   --hard3-dual-view-proposal-topk 16 \
   --hard3-dual-view-pair-topk 16 \
-  --hard3-dual-view-multiscale-shortlist 16 \
-  --hard3-dual-view-multiscale-hops 1,2 \
-  --hard3-dual-view-multiscale-feature-modes global_only \
-  --hard3-dual-view-multiscale-l2-grid 1 \
+  --hard3-dual-view-mixture-shortlist 16 \
+  --hard3-dual-view-mixture-feature-modes coordinate \
+  --hard3-dual-view-mixture-l2-grid 1 \
+  --hard3-dual-view-mixture-alpha-grid 0.5,1 \
   --hard3-dual-view-proposal-neighbors 4 \
   --hard3-dual-view-pair-stage-epochs 1 \
   --hard3-dual-view-pair-stage-min-epochs 1 \
@@ -132,12 +130,12 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
 checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız yeni
-`hard3_dual_view_v12/` modeli fit edilir. Önceki H3-DVAR/H3-CFCS/H3-QIR/H3-RSCR/
-H3-MSCSR çıktıları korunur; aynı komut tekrar çalıştırılırsa v12 model cache'den
+`hard3_dual_view_v13/` modeli fit edilir. Önceki H3-DVAR/H3-CFCS/H3-QIR/H3-RSCR/
+H3-MSCSR/H3-GJCSR çıktıları korunur; aynı komut tekrar çalıştırılırsa v13 model cache'den
 yüklenir.
 İmzası ve proposal hiperparametreleri eşleşen `hard3_dual_view_v8/` OOF ensemble'ı
-mevcutsa V12 bu beş broad-proposal ağını salt okunur donor olarak kullanır. Böylece
-yalnız tam mesh çene kontur özellikleri ve düşük kapasiteli seçiciler fit edilir;
+mevcutsa V13 bu beş broad-proposal ağını salt okunur donor olarak kullanır. Böylece
+yalnız düşük kapasiteli coordinate-mixture estimator fit edilir;
 uyuşmazlıkta donor reddedilir ve proposal aşaması otomatik olarak yeniden üretilir.
 
 Beş-fold preprocessing kontrolü:
@@ -210,6 +208,11 @@ Gonion adaylarını 45 mm lokal ROI'nin yapay sınırına göre değil, tam mesh
 robust kuantillerle çıkarılan dış-alt çene konturu ve profil derinliğine göre
 sıralar. Özellik ailesi, L2 ve füzyon politikası yalnız outer-train OOF tahminlerinde
 seçilir.
+V12 sonucu overall `2.1748 mm`, Core20 `1.8329 mm`, Hard3 `4.4544 mm` olmuş ve
+iki taraf için descriptor ağırlığı `0` seçilmiştir. V13 bu negatif sonucu temel
+alarak yeni bir kontur tanımlayıcısı eklemez; dört donmuş proposal uzmanının
+koordinat dağılımlarını bilateral OOF stacker ile birleştirir. Continuous, yüzeye
+projeksiyonlu ve hybrid çıktılar train OOF üzerinde kilitlenir.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
@@ -225,10 +228,10 @@ fold_*/group_metrics_*.csv
 fold_*/predictions_*.csv
 fold_*/shape_prior_selection.json
 fold_*/shape_prior_only/metrics_val.json
-fold_*/hard3_dual_view_v12/hard3_dual_view_model.pth
-fold_*/hard3_dual_view_v12/hard3_dual_view_training_report.json
-fold_*/hard3_dual_view_v12/hard3_blend_selection.json
-fold_*/hard3_dual_view_v12/metrics_val.json
+fold_*/hard3_dual_view_v13/hard3_dual_view_model.pth
+fold_*/hard3_dual_view_v13/hard3_blend_selection.json
+fold_*/hard3_dual_view_v13/hard3_dual_view_training_report.json
+fold_*/hard3_dual_view_v13/metrics_val.json
 fold_*/hard3_stage3_decision.json
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
@@ -237,7 +240,7 @@ summary_metrics.json
 
 `neural_only/` shape-prior öncesi AGH vNext sonucunu, `shape_prior_only/` mevcut
 `2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar.
-`hard3_dual_view_v12/` ve ana fold dosyaları validation'da kilitlenen H3-GJCSR v12
+`hard3_dual_view_v13/` ve ana fold dosyaları validation'da kilitlenen H3-CMSE v13
 dahil nihai sonucu içerir. `hard3_blend_selection.json` içindeki
 `validation_candidate_diagnostics` dış-validation shortlist oracle ve gerçek
 selector hatasını birbirinden ayırır.

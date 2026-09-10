@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-GJCSR v12)
+# Hard3 Anatomical Context Refinement (H3-CMSE v13)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v12/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v13/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -247,6 +247,32 @@ V12, H3-GJCSR (Hard3 Global Jaw-Contour Surface Ranker), bu temsil hatasını d�
 - Global özellikler ayrı `DualViewCandidateSet.global_contour` alanında tutulur;
   V8 donor proposal ağının 40-kanallı checkpoint sözleşmesi değişmez.
 
+V12 Fold 1 sonucu overall `2.1748 mm`, Core20 `1.8329 mm` ve Hard3 `4.4544 mm`
+olmuştur. OOF seçicide LM21 ve LM22 için descriptor füzyon ağırlığı `0` seçilmiş;
+global kontur tanımlayıcılarının tek başına ALE'si `7.5-7.8 mm` bandında kalmıştır.
+Dolayısıyla final kazanç yeni kontur sıralayıcıdan değil, mevcut tahmin
+varyantlarının validation blend'inden gelmiş ve V10 geçilememiştir. Bu deney,
+Gonion'un bu veri setinde tek bir yerel ya da global kontur ölçütüyle güvenilir
+biçimde tanımlanamadığını göstermiştir.
+
+V13, H3-CMSE (Hard3 Cross-Fitted Mixture State Estimator), vertex tanımlayıcı
+öğrenmek yerine donmuş uzman tahminlerini örnek bazında birleştirir:
+
+- V8'in leakage denetimli broad-proposal checkpointleri ve top-96 aday uzayı
+  değişmeden korunur.
+- Geometry, fused, frontal ve profile proposal dağılımlarından argmax, top-5,
+  top-20, beklenen koordinat, yayılım, entropi ve peak-margin özellikleri çıkarılır.
+- Sol ve sağ dağılımlar tek örnek temsiline alınır; model iki Gonion'u ortak
+  bilateral canonical state olarak tahmin eder.
+- Düşük kapasiteli ridge stacker; özellik ailesi, L2, düzeltme katsayısı ve
+  continuous/surface/soft-surface/hybrid decoder seçenekleriyle yalnız nested OOF
+  tahminlerinde seçilir.
+- Final çıkarım inner-fold modellerinin state ortalamasını kullanır. Outer
+  validation yalnız kilitli estimator'ın değerlendirilmesi ve mevcut güvenli blend
+  politikasının seçimi için kullanılır; test etiketi kapalı kalır.
+- Bu değişiklik, V12 validation tahmin varyantlarının `3.1649 mm` Hard3 oracle
+  potansiyelini model seçimi sızıntısı olmadan kullanmayı hedefler.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -256,14 +282,14 @@ V12, H3-GJCSR (Hard3 Global Jaw-Contour Surface Ranker), bu temsil hatasını d�
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v12/` oluşturulur; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v13/` oluşturulur; eski sürüm
 çıktıları değiştirilmez.
 
-V8 klasörü aynı fold altında bulunuyorsa V12, sample/coarse-center imzasını,
+V8 klasörü aynı fold altında bulunuyorsa V13, sample/coarse-center imzasını,
 proposal ayarlarını, OOF fold kapsamını ve `inner_fold_ensemble` politikasını
 doğrular. Tümü eşleşirse V8 broad-proposal checkpointleri yeniden kullanılır;
-yalnız tam mesh çene kontur tanımlayıcıları ve ridge seçiciler fit edilir; pahalı
-proposal eğitimi tekrarlanmaz.
+yalnız coordinate-mixture ridge estimator fit edilir; pahalı proposal eğitimi
+tekrarlanmaz.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
@@ -278,17 +304,15 @@ oof.selection_diagnostics.axis_mae_xyz
 oof.mean_dynamic_view_weights
 oof.std_dynamic_view_weights
 oof.crossfit_selector.selected
-oof.crossfit_selector.state_l2_sweep
-oof.crossfit_selector.decoder_sweep
-oof.crossfit_selector.side_policies
-oof.crossfit_selector.feature_sweep
-oof.crossfit_selector.decoder_sweep
+oof.crossfit_selector.policy_sweep
+oof.crossfit_selector.feature_dims
+oof.crossfit_selector.selected.feature_mode/l2/alpha/decoder
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
-candidate_metrics.crossfit_global_jaw_contour
-candidate_metrics.global_jaw_contour_refit
-candidate_metrics.global_jaw_contour_argmax
-candidate_metrics.global_jaw_contour_descriptor_only
+candidate_metrics.crossfit_mixture_state
+candidate_metrics.mixture_state_refit
+candidate_metrics.mixture_state_continuous
+candidate_metrics.mixture_state_surface
 validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
 independent_variant_oracle
 selected.alpha_gonion_left/right
@@ -323,10 +347,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v12/hard3_dual_view_model.pth
-hard3_dual_view_v12/hard3_dual_view_training_report.json
-hard3_dual_view_v12/hard3_blend_selection.json
-hard3_dual_view_v12/metrics_val.json
+hard3_dual_view_v13/hard3_dual_view_model.pth
+hard3_dual_view_v13/hard3_dual_view_training_report.json
+hard3_dual_view_v13/hard3_blend_selection.json
+hard3_dual_view_v13/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```
