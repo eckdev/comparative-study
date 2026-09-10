@@ -27,6 +27,7 @@ from .atlas import TrainOnlyLocalHard3Atlas
 from .interaction_selector import CrossFittedInteractionSelector
 from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
 from .patches import DualViewCandidateSet, extract_dual_view_set
+from .set_selector import CrossFittedRelationalSetSelector
 from .statistical_selector import (
     CrossFittedContourSelector,
 )
@@ -59,7 +60,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "crossfit_interaction"
+    decoder_mode: str = "crossfit_set_context"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -127,6 +128,23 @@ class Hard3DualViewConfig:
     interaction_hard_negative_weight: float = 0.25
     interaction_negative_radius_mm: float = 4.0
     interaction_negative_margin: float = 0.5
+    set_shortlist: int = 96
+    set_width: int = 24
+    set_dropout: float = 0.05
+    set_candidate_dropout: float = 0.10
+    set_epochs: int = 100
+    set_min_epochs: int = 30
+    set_patience: int = 15
+    set_lr: float = 1e-3
+    set_weight_decay: float = 1e-3
+    set_sigma: float = 2.5
+    set_expected_distance_weight: float = 0.25
+    set_coordinate_weight: float = 0.25
+    set_pair_weight: float = 0.10
+    set_clinical_mass_weight: float = 0.50
+    set_hard_negative_weight: float = 0.25
+    set_negative_radius_mm: float = 4.0
+    set_negative_margin: float = 0.5
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -391,6 +409,7 @@ def _teacher_force_probability(epoch, warmup_epochs):
 
 def _uses_unary_reranker(config):
     if config.decoder_mode not in (
+        "crossfit_set_context",
         "crossfit_interaction",
         "contour_coordinate",
         "crossfit_calibrated",
@@ -398,8 +417,8 @@ def _uses_unary_reranker(config):
         "sharp_pruned",
     ):
         raise ValueError(
-            "decoder_mode must be crossfit_interaction, crossfit_calibrated, "
-            "contour_coordinate, full_pair or sharp_pruned"
+            "decoder_mode must be crossfit_set_context, crossfit_interaction, "
+            "crossfit_calibrated, contour_coordinate, full_pair or sharp_pruned"
         )
     return config.decoder_mode == "sharp_pruned"
 
@@ -409,6 +428,7 @@ def _uses_contour_features(config):
         "contour_coordinate",
         "crossfit_calibrated",
         "crossfit_interaction",
+        "crossfit_set_context",
     )
 
 
@@ -416,6 +436,7 @@ def _uses_neural_pair(config):
     return config.decoder_mode not in (
         "crossfit_calibrated",
         "crossfit_interaction",
+        "crossfit_set_context",
     )
 
 
@@ -423,6 +444,7 @@ def _uses_crossfit_selector(config):
     return config.decoder_mode in (
         "crossfit_calibrated",
         "crossfit_interaction",
+        "crossfit_set_context",
     )
 
 
@@ -432,6 +454,8 @@ def _load_crossfit_selector(state):
         return CrossFittedContourSelector.from_state_dict(state)
     if version == CrossFittedInteractionSelector.version:
         return CrossFittedInteractionSelector.from_state_dict(state)
+    if version == CrossFittedRelationalSetSelector.version:
+        return CrossFittedRelationalSetSelector.from_state_dict(state)
     raise ValueError(f"Unsupported cross-fitted selector: {version}")
 
 
@@ -1478,9 +1502,12 @@ def _cache_signature(dataset, config, centers_by_id=None):
     interaction_fields = {
         name for name in asdict(config) if name.startswith("interaction_")
     }
+    set_fields = {name for name in asdict(config) if name.startswith("set_")}
     if config.decoder_mode != "crossfit_interaction":
         ignored.update(interaction_fields)
-    if config.decoder_mode == "crossfit_interaction":
+    if config.decoder_mode != "crossfit_set_context":
+        ignored.update(set_fields)
+    if config.decoder_mode in ("crossfit_interaction", "crossfit_set_context"):
         ignored.update(
             {
                 "statistical_shortlist_grid",
@@ -1507,6 +1534,7 @@ def _cache_signature(dataset, config, centers_by_id=None):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     cache_version = {
+        "crossfit_set_context": 16,
         "crossfit_interaction": 15,
         "crossfit_calibrated": 14,
         "contour_coordinate": 13,
@@ -1568,7 +1596,7 @@ def _torch_load(path, device):
 
 
 def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
-    if config.decoder_mode != "crossfit_interaction":
+    if config.decoder_mode not in ("crossfit_interaction", "crossfit_set_context"):
         return None
     donor_dir = Path(output_dir).parent / "hard3_dual_view_v8"
     checkpoint_path = donor_dir / "hard3_dual_view_model.pth"
@@ -1632,9 +1660,10 @@ def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
             )
         if covered != set(candidates.sample_ids):
             return None
+        target = "V10" if config.decoder_mode == "crossfit_set_context" else "V9"
         print(
             f"Reusing {len(records)} leakage-checked V8 OOF broad-proposal "
-            "checkpoints for V9.",
+            f"checkpoints for {target}.",
             flush=True,
         )
         return records
@@ -2140,6 +2169,28 @@ def fit_or_load_dual_view_refiner(
             f"params={statistical_selector.report['parameter_count']}",
             flush=True,
         )
+    elif config.decoder_mode == "crossfit_set_context":
+        print(
+            "Fitting bilateral relational set ranker on OOF evidence...",
+            flush=True,
+        )
+        statistical_selector = CrossFittedRelationalSetSelector.fit(
+            candidates,
+            oof_proposal_sources,
+            selector_splits,
+            config,
+            device,
+        )
+        selected_selector = statistical_selector.report["selected"]
+        print(
+            "H3-RSCR-v10 OOF selector: "
+            f"ALE={selected_selector['ale']:.4f} "
+            f"p95={selected_selector['p95']:.4f} "
+            f"SDR2={selected_selector['sdr_at_2mm']:.3f} "
+            f"shortlist={selected_selector['shortlist']} "
+            f"params={statistical_selector.report['parameter_count']}",
+            flush=True,
+        )
     if statistical_selector is not None:
         policy = _select_coordinate_policy(candidates, oof_logits)
         selector_metrics = statistical_selector.report["selected"]
@@ -2263,6 +2314,7 @@ def fit_or_load_dual_view_refiner(
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     revision = {
+        "crossfit_set_context": "H3-RSCR-v10",
         "crossfit_interaction": "H3-QIR-v9",
         "crossfit_calibrated": "H3-CFCS-v8",
         "contour_coordinate": "H3-DVAR-v7",
@@ -2318,6 +2370,7 @@ def fit_or_load_dual_view_refiner(
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     search_name = {
+        "crossfit_set_context": "relational set-context search",
         "crossfit_interaction": "subject-wise interaction search",
         "crossfit_calibrated": "OOF-calibrated contour search",
         "contour_coordinate": "shape-conditioned contour search",
@@ -2341,28 +2394,32 @@ def fit_or_load_dual_view_refiner(
     report = {
         "signature": signature,
         "version": revision,
-        "method": (
-            "nested-OOF broad proposal plus a compact query-normalized interaction "
-            "ranker conditioned on Core20 bilateral state"
-            if config.decoder_mode == "crossfit_interaction"
-            else (
+        "method": {
+            "crossfit_set_context": (
+                "nested-OOF broad proposal plus a permutation-equivariant bilateral "
+                "candidate-set ranker conditioned on Core20 facial context"
+            ),
+            "crossfit_interaction": (
+                "nested-OOF broad proposal plus a compact query-normalized interaction "
+                "ranker conditioned on Core20 bilateral state"
+            ),
+            "crossfit_calibrated": (
                 "nested-OOF broad proposal plus center-invariant ridge contour scoring "
                 "and Core20-conditioned bilateral state calibration"
-                if config.decoder_mode == "crossfit_calibrated"
-                else (
-                    "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
-                    "contour-state regression, and non-separable bilateral Gonion decoding"
-                    if config.decoder_mode == "contour_coordinate"
-                    else (
-                        "nested-OOF broad surface-context proposal and recall-preserving "
-                        "clinical full-pair Gonion decoding"
-                        if config.decoder_mode == "full_pair"
-                        else "nested-OOF broad surface-context proposal, frozen sharp "
-                        "unary reranking, and bilateral Gonion pair decoding"
-                    )
-                )
-            )
-        ),
+            ),
+            "contour_coordinate": (
+                "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
+                "contour-state regression, and non-separable bilateral Gonion decoding"
+            ),
+            "full_pair": (
+                "nested-OOF broad surface-context proposal and recall-preserving "
+                "clinical full-pair Gonion decoding"
+            ),
+            "sharp_pruned": (
+                "nested-OOF broad surface-context proposal, frozen sharp unary "
+                "reranking, and bilateral Gonion pair decoding"
+            ),
+        }[config.decoder_mode],
         "uses_validation_labels_for_model_fit": False,
         "uses_test_labels": False,
         "sample_count": len(candidates),
@@ -2505,17 +2562,32 @@ def _order_values(outputs, candidate_result, values):
     return np.stack([by_id[sample_id] for sample_id in outputs["sample_ids"]])
 
 
-def _candidate_for_variants(outputs, candidate_result, lm0_variant, gonion_variant):
+def _candidate_for_variants(
+    outputs,
+    candidate_result,
+    lm0_variant,
+    gonion_left_variant,
+    gonion_right_variant=None,
+):
+    if gonion_right_variant is None:
+        gonion_right_variant = gonion_left_variant
     lm0_values = _order_values(
         outputs, candidate_result, candidate_result["variant_predictions"][lm0_variant]
     )
-    gonion_values = _order_values(
+    left_values = _order_values(
         outputs,
         candidate_result,
-        candidate_result["variant_predictions"][gonion_variant],
+        candidate_result["variant_predictions"][gonion_left_variant],
     )
-    result = gonion_values.copy()
+    right_values = _order_values(
+        outputs,
+        candidate_result,
+        candidate_result["variant_predictions"][gonion_right_variant],
+    )
+    result = lm0_values.copy()
     result[:, 0] = lm0_values[:, 0]
+    result[:, 1] = left_values[:, 1]
+    result[:, 2] = right_values[:, 2]
     return result
 
 
@@ -2535,6 +2607,40 @@ def _dual_blend_prediction(base, candidate, reliability, row):
         candidate - base_hard3
     )
     return prediction, effective_alpha
+
+
+def _independent_variant_oracle(outputs, candidate_result, variants, gonion_variants):
+    expert = np.asarray(outputs["expert"], dtype=np.float32)[:, list(HARD3)]
+    available = (list(variants), list(gonion_variants), list(gonion_variants))
+    errors = []
+    best_fixed = {}
+    for local_index, names in enumerate(available):
+        rows = []
+        for name in names:
+            values = _order_values(
+                outputs,
+                candidate_result,
+                candidate_result["variant_predictions"][name],
+            )
+            rows.append(
+                np.linalg.norm(values[:, local_index] - expert[:, local_index], axis=-1)
+            )
+        matrix = np.stack(rows)
+        errors.append(matrix.min(axis=0))
+        best_index = int(np.argmin(matrix.mean(axis=1)))
+        best_fixed[str(HARD3[local_index])] = {
+            "variant": names[best_index],
+            "ale": float(matrix[best_index].mean()),
+        }
+    oracle = np.stack(errors, axis=1)
+    return {
+        "hard3": summarize(oracle),
+        "lm0": summarize(oracle[:, 0]),
+        "lm21": summarize(oracle[:, 1]),
+        "lm22": summarize(oracle[:, 2]),
+        "best_fixed_per_landmark": best_fixed,
+        "uses_validation_expert_for_diagnostic_only": True,
+    }
 
 
 def calibrate_dual_view_blend(outputs, candidate_result, config):
@@ -2568,58 +2674,104 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
     # as a weak logit regularizer, but are no longer eligible as direct Gonion
     # predictions.
     gonion_candidates = [name for name in variants if not name.startswith("atlas_")]
-    gonion_variants = sorted(
-        gonion_candidates, key=lambda name: individual[name]["gonion_ale"]
-    )[:8]
+    gonion_left_variants = sorted(
+        gonion_candidates, key=lambda name: individual[name]["lm21_ale"]
+    )[:6]
+    gonion_right_variants = sorted(
+        gonion_candidates, key=lambda name: individual[name]["lm22_ale"]
+    )[:6]
     for anchor in ("neural_policy", "atlas_direct"):
         if anchor not in lm0_variants:
             lm0_variants.append(anchor)
     for anchor in ("neural_policy", "joint_soft", "joint_argmax", "joint_snapped"):
-        if anchor in variants and anchor not in gonion_variants:
-            gonion_variants.append(anchor)
+        if anchor in variants and anchor not in gonion_left_variants:
+            gonion_left_variants.append(anchor)
+        if anchor in variants and anchor not in gonion_right_variants:
+            gonion_right_variants.append(anchor)
 
     limits = (
         config.maximum_step_lm0,
         config.maximum_step_gonion,
         config.maximum_step_gonion,
     )
-    rows = []
+    # A bounded pre-sweep lets LM21 and LM22 use different estimators without
+    # exploding the validation search or the persisted calibration report.
+    combinations = []
     for lm0_variant in lm0_variants:
-        for gonion_variant in gonion_variants:
-            raw = _candidate_for_variants(
-                outputs, candidate_result, lm0_variant, gonion_variant
-            )
-            limited, _, _ = _limited_hard3_candidate(base, raw, limits)
-            for confidence_mode in ("none", "ensemble"):
-                for alpha_lm0 in (0.0, 0.25, 0.5, 0.75, 1.0):
-                    for alpha_left in (0.0, 0.25, 0.5, 0.75, 1.0):
-                        for alpha_right in (0.0, 0.25, 0.5, 0.75, 1.0):
-                            alpha_gonion = 0.5 * (alpha_left + alpha_right)
-                            row = {
-                                "lm0_variant": lm0_variant,
-                                "gonion_variant": gonion_variant,
-                                "confidence_mode": confidence_mode,
-                                "alpha_lm0": alpha_lm0,
-                                "alpha_gonion": alpha_gonion,
-                                "alpha_gonion_left": alpha_left,
-                                "alpha_gonion_right": alpha_right,
+        for left_variant in gonion_left_variants:
+            for right_variant in gonion_right_variants:
+                raw = _candidate_for_variants(
+                    outputs,
+                    candidate_result,
+                    lm0_variant,
+                    left_variant,
+                    right_variant,
+                )
+                limited, _, _ = _limited_hard3_candidate(base, raw, limits)
+                full = base.copy()
+                full[:, list(HARD3)] = limited
+                error = np.linalg.norm(full - expert, axis=-1)
+                combinations.append(
+                    {
+                        "lm0_variant": lm0_variant,
+                        "gonion_left_variant": left_variant,
+                        "gonion_right_variant": right_variant,
+                        "hard3_ale": float(error[:, list(HARD3)].mean()),
+                        "overall_ale": float(error.mean()),
+                        "p95": float(np.percentile(error, 95)),
+                    }
+                )
+    combinations.sort(
+        key=lambda row: (row["hard3_ale"], row["overall_ale"], row["p95"])
+    )
+    shortlisted_combinations = combinations[:24]
+    rows = []
+    for combination in shortlisted_combinations:
+        raw = _candidate_for_variants(
+            outputs,
+            candidate_result,
+            combination["lm0_variant"],
+            combination["gonion_left_variant"],
+            combination["gonion_right_variant"],
+        )
+        limited, _, _ = _limited_hard3_candidate(base, raw, limits)
+        for confidence_mode in ("none", "ensemble"):
+            for alpha_lm0 in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for alpha_left in (0.0, 0.25, 0.5, 0.75, 1.0):
+                    for alpha_right in (0.0, 0.25, 0.5, 0.75, 1.0):
+                        left_variant = combination["gonion_left_variant"]
+                        right_variant = combination["gonion_right_variant"]
+                        row = {
+                            "lm0_variant": combination["lm0_variant"],
+                            "gonion_variant": (
+                                left_variant
+                                if left_variant == right_variant
+                                else "mixed"
+                            ),
+                            "gonion_left_variant": left_variant,
+                            "gonion_right_variant": right_variant,
+                            "confidence_mode": confidence_mode,
+                            "alpha_lm0": alpha_lm0,
+                            "alpha_gonion": 0.5 * (alpha_left + alpha_right),
+                            "alpha_gonion_left": alpha_left,
+                            "alpha_gonion_right": alpha_right,
+                        }
+                        prediction, _ = _dual_blend_prediction(
+                            base, limited, reliability, row
+                        )
+                        error = np.linalg.norm(prediction - expert, axis=-1)
+                        rows.append(
+                            {
+                                **row,
+                                "overall_ale": float(error.mean()),
+                                "hard3_ale": float(error[:, list(HARD3)].mean()),
+                                "lm0_ale": float(error[:, 0].mean()),
+                                "lm21_ale": float(error[:, 21].mean()),
+                                "lm22_ale": float(error[:, 22].mean()),
+                                "gonion_ale": float(error[:, 21:23].mean()),
+                                "p95": float(np.percentile(error, 95)),
                             }
-                            prediction, _ = _dual_blend_prediction(
-                                base, limited, reliability, row
-                            )
-                            error = np.linalg.norm(prediction - expert, axis=-1)
-                            rows.append(
-                                {
-                                    **row,
-                                    "overall_ale": float(error.mean()),
-                                    "hard3_ale": float(error[:, list(HARD3)].mean()),
-                                    "lm0_ale": float(error[:, 0].mean()),
-                                    "lm21_ale": float(error[:, 21].mean()),
-                                    "lm22_ale": float(error[:, 22].mean()),
-                                    "gonion_ale": float(error[:, 21:23].mean()),
-                                    "p95": float(np.percentile(error, 95)),
-                                }
-                            )
+                        )
     eligible = [
         row for row in rows if row["p95"] <= base_p95 + config.maximum_p95_regression_mm
     ]
@@ -2631,7 +2783,8 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         outputs,
         candidate_result,
         proposed["lm0_variant"],
-        proposed["gonion_variant"],
+        proposed["gonion_left_variant"],
+        proposed["gonion_right_variant"],
     )
     limited, raw_step, step_scale = _limited_hard3_candidate(base, raw, limits)
     proposed_prediction, _ = _dual_blend_prediction(
@@ -2658,6 +2811,8 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         else {
             "lm0_variant": "neural_policy",
             "gonion_variant": "neural_policy",
+            "gonion_left_variant": "neural_policy",
+            "gonion_right_variant": "neural_policy",
             "confidence_mode": "none",
             "alpha_lm0": 0.0,
             "alpha_gonion": 0.0,
@@ -2674,7 +2829,8 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         outputs,
         candidate_result,
         selected["lm0_variant"],
-        selected["gonion_variant"],
+        selected.get("gonion_left_variant", selected["gonion_variant"]),
+        selected.get("gonion_right_variant", selected["gonion_variant"]),
     )
     selected_limited, _, _ = _limited_hard3_candidate(base, selected_raw, limits)
     blended, effective_alpha = _dual_blend_prediction(
@@ -2704,6 +2860,10 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         ),
         "proposed_bootstrap_vs_base": proposed_bootstrap,
         "candidate_metrics": individual,
+        "independent_variant_oracle": _independent_variant_oracle(
+            outputs, candidate_result, variants, gonion_candidates
+        ),
+        "shortlisted_variant_combinations": shortlisted_combinations,
         "validation_candidate_diagnostics": candidate_result.get(
             "validation_diagnostics", {}
         ),
@@ -2734,7 +2894,8 @@ def apply_dual_view_blend(outputs, candidate_result, policy):
         outputs,
         candidate_result,
         selected["lm0_variant"],
-        selected["gonion_variant"],
+        selected.get("gonion_left_variant", selected["gonion_variant"]),
+        selected.get("gonion_right_variant", selected["gonion_variant"]),
     )
     reliability = np.clip(
         _order_values(outputs, candidate_result, candidate_result["reliability"]),

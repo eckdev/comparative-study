@@ -185,13 +185,14 @@ def build_parser():
     parser.add_argument(
         "--hard3-dual-view-decoder-mode",
         choices=(
+            "crossfit_set_context",
             "crossfit_interaction",
             "crossfit_calibrated",
             "contour_coordinate",
             "full_pair",
             "sharp_pruned",
         ),
-        default="crossfit_interaction",
+        default="crossfit_set_context",
     )
     parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
@@ -320,6 +321,37 @@ def build_parser():
     )
     parser.add_argument(
         "--hard3-dual-view-interaction-negative-margin", type=float, default=0.5
+    )
+    parser.add_argument("--hard3-dual-view-set-shortlist", type=int, default=96)
+    parser.add_argument("--hard3-dual-view-set-width", type=int, default=24)
+    parser.add_argument("--hard3-dual-view-set-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--hard3-dual-view-set-candidate-dropout", type=float, default=0.10
+    )
+    parser.add_argument("--hard3-dual-view-set-epochs", type=int, default=100)
+    parser.add_argument("--hard3-dual-view-set-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-dual-view-set-patience", type=int, default=15)
+    parser.add_argument("--hard3-dual-view-set-lr", type=float, default=1e-3)
+    parser.add_argument("--hard3-dual-view-set-weight-decay", type=float, default=1e-3)
+    parser.add_argument("--hard3-dual-view-set-sigma", type=float, default=2.5)
+    parser.add_argument(
+        "--hard3-dual-view-set-expected-distance-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-coordinate-weight", type=float, default=0.25
+    )
+    parser.add_argument("--hard3-dual-view-set-pair-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--hard3-dual-view-set-clinical-mass-weight", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-hard-negative-weight", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-negative-radius-mm", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--hard3-dual-view-set-negative-margin", type=float, default=0.5
     )
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
     parser.add_argument(
@@ -518,6 +550,25 @@ def hard3_dual_view_config_from_args(args):
             args.hard3_dual_view_interaction_negative_radius_mm
         ),
         interaction_negative_margin=(args.hard3_dual_view_interaction_negative_margin),
+        set_shortlist=args.hard3_dual_view_set_shortlist,
+        set_width=args.hard3_dual_view_set_width,
+        set_dropout=args.hard3_dual_view_set_dropout,
+        set_candidate_dropout=args.hard3_dual_view_set_candidate_dropout,
+        set_epochs=args.hard3_dual_view_set_epochs,
+        set_min_epochs=args.hard3_dual_view_set_min_epochs,
+        set_patience=args.hard3_dual_view_set_patience,
+        set_lr=args.hard3_dual_view_set_lr,
+        set_weight_decay=args.hard3_dual_view_set_weight_decay,
+        set_sigma=args.hard3_dual_view_set_sigma,
+        set_expected_distance_weight=(
+            args.hard3_dual_view_set_expected_distance_weight
+        ),
+        set_coordinate_weight=args.hard3_dual_view_set_coordinate_weight,
+        set_pair_weight=args.hard3_dual_view_set_pair_weight,
+        set_clinical_mass_weight=args.hard3_dual_view_set_clinical_mass_weight,
+        set_hard_negative_weight=args.hard3_dual_view_set_hard_negative_weight,
+        set_negative_radius_mm=args.hard3_dual_view_set_negative_radius_mm,
+        set_negative_margin=args.hard3_dual_view_set_negative_margin,
         negative_weight=args.hard3_dual_view_negative_weight,
         gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
@@ -547,6 +598,8 @@ def hard3_dual_view_config_from_args(args):
 
 def hard3_dual_view_revision(args):
     mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "crossfit_set_context":
+        return "hard3_dual_view_v10", 11
     if mode == "crossfit_interaction":
         return "hard3_dual_view_v9", 10
     if mode == "crossfit_calibrated":
@@ -593,6 +646,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
         if getattr(args, "hard3_dual_view_decoder_mode", "") in (
             "crossfit_calibrated",
             "crossfit_interaction",
+            "crossfit_set_context",
         ):
             validation_diagnostics = hard3_report.get(
                 "validation_candidate_diagnostics", {}
@@ -644,6 +698,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             "applied": True,
             "scope": gate_scope,
             "source": {
+                "crossfit_set_context": "OOF_relational_set_context_search",
                 "crossfit_interaction": "OOF_subjectwise_interaction_search",
                 "crossfit_calibrated": "OOF_calibrated_contour_search",
                 "contour_coordinate": "shape_conditioned_contour_search",
@@ -966,6 +1021,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             elif hard3_config.decoder_mode in (
                 "crossfit_calibrated",
                 "crossfit_interaction",
+                "crossfit_set_context",
             ):
                 print(
                     "Hard3 cross-fitted selector uses dataset-provided upstream coarse centers "
@@ -986,6 +1042,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             if hard3_config.decoder_mode in (
                 "crossfit_calibrated",
                 "crossfit_interaction",
+                "crossfit_set_context",
             ):
                 selector_diagnostics = hard3_validation["validation_diagnostics"][
                     "crossfit_selector"

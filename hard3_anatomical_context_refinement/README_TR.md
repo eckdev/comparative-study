@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-QIR v9)
+# Hard3 Anatomical Context Refinement (H3-RSCR v10)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v9/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v10/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -178,6 +178,27 @@ V9, H3-QIR (Hard3 Query Interaction Ranker), doğrudan bu selector regret'i hede
 - OOF en iyi epoch medyanı final refit süresini belirler; inner-fold ranker ensemble
   ve full-train refit dış validation'da ayrı adaylar olarak raporlanır.
 
+V9 Fold 1'de OOF selector ALE değerini `5.5407 mm`ye indirmiş, ancak nihai Hard3
+sonucu `4.5366 mm` ile V8'in `4.4917 mm` sonucunun gerisinde kalmıştır. Buna karşın
+aynı top-96 havuzunun dış-validation oracle değeri `1.0459 mm`dir. Ayrıca LM21 için
+interaction selector, LM22 için neural policy daha iyi sonuç vermiştir. Bu bulgu,
+aday-bazlı MLP kapasitesini artırmanın değil, aday kümesini ve iki tarafı ilişkisel
+olarak modellemenin gerekli olduğunu göstermiştir.
+
+V10, H3-RSCR (Hard3 Relational Set-Context Ranker), bu nedenle:
+
+- her Gonion tarafını bağımsız satırlar yerine permutation-equivariant bir aday
+  kümesi olarak işler,
+- her adayı kendi tarafının mean/max özeti, karşı tarafın mean/max özeti ve yalnız
+  Core20'den türetilen yüz bağlamıyla birlikte skorlar,
+- noisy upstream Gonion merkezine bağlı lokal XYZ'yi özelliklerden çıkarır,
+- soft-listwise, beklenen mesafe, koordinat, bilateral pair, klinik `<=2 mm` kütle
+  ve hard-negative kayıplarını birlikte kullanır,
+- eğitimde aday dropout uygular fakat expert-nearest adayı daima korur,
+- tüm seçici ayarlarını nested subject-level OOF üzerinde kilitler,
+- dış validation blend aşamasında LM21 ve LM22 için farklı tahmin varyantları
+  seçilmesine izin verir; Core20 yine değiştirilemez.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -187,13 +208,13 @@ V9, H3-QIR (Hard3 Query Interaction Ranker), doğrudan bu selector regret'i hede
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v9/` yeniden eğitilir; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v10/` yeniden eğitilir; eski sürüm
 çıktıları değiştirilmez.
 
-V8 klasörü aynı fold altında bulunuyorsa V9, sample/coarse-center imzasını,
+V8 klasörü aynı fold altında bulunuyorsa V10, sample/coarse-center imzasını,
 proposal ayarlarını, OOF fold kapsamını ve `inner_fold_ensemble` politikasını
 doğrular. Tümü eşleşirse V8 broad-proposal checkpointleri yeniden kullanılır;
-ranker dışındaki pahalı eğitim tekrarlanmaz.
+yalnız ilişkisel set-ranker eğitilir ve pahalı proposal eğitimi tekrarlanmaz.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
@@ -213,11 +234,13 @@ oof.crossfit_selector.decoder_sweep
 oof.crossfit_selector.folds
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
-candidate_metrics.crossfit_interaction
-candidate_metrics.interaction_refit
-candidate_metrics.interaction_state_only
+candidate_metrics.crossfit_set_context
+candidate_metrics.set_context_refit
+candidate_metrics.set_context_state_only
 validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
+independent_variant_oracle
 selected.alpha_gonion_left/right
+selected.gonion_left_variant/right_variant
 ```
 
 `proposal_diagnostics` broad aşamayı, `gonion_pair_topk_recall` ise V7'de doğrudan
@@ -248,10 +271,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v9/hard3_dual_view_model.pth
-hard3_dual_view_v9/hard3_dual_view_training_report.json
-hard3_dual_view_v9/hard3_blend_selection.json
-hard3_dual_view_v9/metrics_val.json
+hard3_dual_view_v10/hard3_dual_view_model.pth
+hard3_dual_view_v10/hard3_dual_view_training_report.json
+hard3_dual_view_v10/hard3_blend_selection.json
+hard3_dual_view_v10/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

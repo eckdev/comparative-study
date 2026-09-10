@@ -34,6 +34,9 @@ from hard3_anatomical_context_refinement.refiner import (
 from hard3_anatomical_context_refinement.interaction_selector import (
     CrossFittedInteractionSelector,
 )
+from hard3_anatomical_context_refinement.set_selector import (
+    CrossFittedRelationalSetSelector,
+)
 from hard3_anatomical_context_refinement.statistical_selector import (
     CrossFittedContourSelector,
 )
@@ -802,6 +805,64 @@ def test_query_interaction_selector_trains_oof_and_roundtrips_state():
     assert selector.report["parameter_count"] < 10_000
 
 
+def test_relational_set_selector_trains_oof_and_roundtrips_state():
+    rng = np.random.default_rng(47)
+    samples, candidates = 10, 12
+    points = rng.normal(size=(samples, 3, candidates, 3)).astype(np.float32)
+    expert = points[:, :, 0].copy()
+    distance = np.linalg.norm(points - expert[:, :, None], axis=-1).astype(np.float32)
+    canonical = rng.normal(size=(samples, 3, candidates, 40)).astype(np.float32)
+    canonical[:, :, :, 3:6] = points
+    sources = rng.normal(size=(samples, 3, 4, candidates)).astype(np.float32)
+    sources[:, 1:3, 0, 0] += 8.0
+    candidate_set = DualViewCandidateSet(
+        sample_ids=[f"sample_{index}" for index in range(samples)],
+        strata=["Class1|women", "Class1|men"] * 5,
+        images=np.zeros((samples, 3, 2, 20, 8, 8), dtype=np.float16),
+        targets=np.zeros((samples, 3, 2, 8, 8), dtype=np.float16),
+        grids=np.zeros((samples, 3, 2, candidates, 2), dtype=np.float32),
+        points=points,
+        canonical=canonical,
+        neighbor_index=np.zeros((samples, 3, candidates, 1), dtype=np.int64),
+        neighbor_mask=np.ones((samples, 3, candidates, 1), dtype=bool),
+        mask=np.ones((samples, 3, candidates), dtype=bool),
+        expert=expert,
+        expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
+        target_distance=distance,
+        target_view_mask=np.ones((samples, 3, 2), dtype=bool),
+        shape_context=rng.normal(size=(samples, 69)).astype(np.float32),
+        base_gonion=rng.normal(size=(samples, 2, 3)).astype(np.float32),
+        expert_gonion_context=points[:, 1:3, 0].copy(),
+    )
+    splits = [
+        (np.arange(5, 10), np.arange(0, 5)),
+        (np.arange(0, 5), np.arange(5, 10)),
+    ]
+    config = Hard3DualViewConfig(
+        decoder_mode="crossfit_set_context",
+        batch_size=4,
+        statistical_l2_grid=(0.01, 0.1),
+        set_shortlist=8,
+        set_width=8,
+        set_candidate_dropout=0.0,
+        set_epochs=2,
+        set_min_epochs=1,
+        set_patience=1,
+    )
+    selector = CrossFittedRelationalSetSelector.fit(
+        candidate_set, sources, splits, config, torch.device("cpu")
+    )
+    restored = CrossFittedRelationalSetSelector.from_state_dict(selector.state_dict())
+    result = restored.predict(candidate_set, sources)
+    assert selector.oof_prediction.shape == (samples, 2, 3)
+    assert result["crossfit_set_context"].shape == (samples, 2, 3)
+    assert result["member_coordinate"].shape == (2, samples, 2, 3)
+    assert np.isfinite(result["crossfit_set_context"]).all()
+    assert selector.report["uses_outer_validation_labels"] is False
+    assert selector.report["uses_test_labels"] is False
+    assert selector.report["parameter_count"] < 50_000
+
+
 def test_dual_blend_supports_independent_left_and_right_strengths():
     base = np.zeros((2, 23, 3), dtype=np.float32)
     candidate = np.ones((2, 3, 3), dtype=np.float32)
@@ -820,6 +881,53 @@ def test_dual_blend_supports_independent_left_and_right_strengths():
     )
     np.testing.assert_allclose(alpha[0], [0.25, 0.5, 1.0])
     np.testing.assert_allclose(prediction[0, list(HARD3), 0], [0.25, 0.5, 1.0])
+
+
+def test_dual_blend_calibration_can_select_different_gonion_variants():
+    samples = 16
+    expert = np.zeros((samples, 23, 3), dtype=np.float32)
+    base = expert.copy()
+    base[:, list(HARD3), 0] = 5.0
+    neural = base[:, list(HARD3)].copy()
+    left_specialist = neural.copy()
+    left_specialist[:, 0] = 0.0
+    left_specialist[:, 1] = 0.0
+    left_specialist[:, 2, 0] = 10.0
+    right_specialist = neural.copy()
+    right_specialist[:, 0] = 0.0
+    right_specialist[:, 1, 0] = 10.0
+    right_specialist[:, 2] = 0.0
+    outputs = {
+        "sample_ids": [f"sample_{index}" for index in range(samples)],
+        "prediction": base,
+        "expert": expert,
+    }
+    candidate_result = {
+        "sample_ids": list(outputs["sample_ids"]),
+        "variant_predictions": {
+            "neural_policy": neural,
+            "atlas_direct": neural,
+            "left_specialist": left_specialist,
+            "right_specialist": right_specialist,
+        },
+        "reliability": np.ones((samples, 3), dtype=np.float32),
+    }
+    policy = calibrate_dual_view_blend(
+        outputs,
+        candidate_result,
+        Hard3DualViewConfig(
+            bootstrap_iters=50,
+            minimum_overall_gain_mm=0.01,
+            minimum_hard3_gain_mm=0.1,
+        ),
+    )
+    selected = policy["selected"]
+    assert selected["gonion_left_variant"] == "left_specialist"
+    assert selected["gonion_right_variant"] == "right_specialist"
+    refined = apply_dual_view_blend(outputs, candidate_result, policy)
+    np.testing.assert_allclose(
+        refined["prediction"][:, list(HARD3)], expert[:, list(HARD3)]
+    )
 
 
 def test_train_only_atlas_excludes_matching_training_sample():
