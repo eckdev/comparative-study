@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-MSCSR v11)
+# Hard3 Anatomical Context Refinement (H3-GJCSR v12)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v11/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v12/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -224,6 +224,29 @@ hedefler:
 - Dış validation/test landmarkları özellik çıkarımı, model fit'i veya politika
   seçimine girmez; yalnız kilitli modelin değerlendirilmesinde kullanılır.
 
+V11 Fold 1 sonucu overall `2.1649 mm`, Core20 `1.8335 mm` ve Hard3 `4.3742 mm`
+olmuştur. V10'a göre overall `0.0031 mm`, Hard3 `0.0206 mm` kötüleşmiş; OOF
+selector da `5.7398 mm` ile gerilemiştir. V8-V11 outer selector sonuçlarının
+`5.26-5.30 mm` bandında kalması lokal ROI içindeki daha fazla özelliğin sorunu
+çözmediğini göstermiştir. Kod denetiminde signed silhouette kanallarının tam yüz
+sınırından değil, 45 mm geodezik ROI rasterının yapay sınırından üretildiği
+belirlenmiştir.
+
+V12, H3-GJCSR (Hard3 Global Jaw-Contour Surface Ranker), bu temsil hatasını düzeltir:
+
+- Tam PLY yüzeyi, yalnız tahmin edilen Core20 landmarklarından kurulan canonical
+  lateral/vertical/depth eksenlerine taşınır.
+- Her taraf için frontal dış yüz konturu, alt mandibular kontur ve profil derinliği
+  192 robust dilimde hesaplanır; tekil uç vertex yerine `%5/%10/%50/%95/%99`
+  kuantilleri kullanılır.
+- Her Gonion adayı için 3/6/12 mm ölçeklerinde kontura uzaklık, teğet eğimi,
+  ikinci-fark kontur bükümü ve profil derinlik farkları çıkarılır.
+- Bu 48 global kontur özelliği V11'in yüzey momentleriyle birleştirilir; LM21 ve
+  LM22 özellik ailesi/L2/füzyon politikaları yine yalnız subject-level OOF'ta
+  ayrı ayrı kilitlenir.
+- Global özellikler ayrı `DualViewCandidateSet.global_contour` alanında tutulur;
+  V8 donor proposal ağının 40-kanallı checkpoint sözleşmesi değişmez.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -233,14 +256,14 @@ hedefler:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v11/` oluşturulur; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v12/` oluşturulur; eski sürüm
 çıktıları değiştirilmez.
 
-V8 klasörü aynı fold altında bulunuyorsa V11, sample/coarse-center imzasını,
+V8 klasörü aynı fold altında bulunuyorsa V12, sample/coarse-center imzasını,
 proposal ayarlarını, OOF fold kapsamını ve `inner_fold_ensemble` politikasını
 doğrular. Tümü eşleşirse V8 broad-proposal checkpointleri yeniden kullanılır;
-yalnız çok ölçekli tanımlayıcılar ve ridge seçiciler fit edilir; pahalı proposal
-eğitimi tekrarlanmaz.
+yalnız tam mesh çene kontur tanımlayıcıları ve ridge seçiciler fit edilir; pahalı
+proposal eğitimi tekrarlanmaz.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
@@ -262,10 +285,10 @@ oof.crossfit_selector.feature_sweep
 oof.crossfit_selector.decoder_sweep
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
-candidate_metrics.crossfit_multiscale_contour
-candidate_metrics.multiscale_contour_refit
-candidate_metrics.multiscale_contour_argmax
-candidate_metrics.multiscale_contour_descriptor_only
+candidate_metrics.crossfit_global_jaw_contour
+candidate_metrics.global_jaw_contour_refit
+candidate_metrics.global_jaw_contour_argmax
+candidate_metrics.global_jaw_contour_descriptor_only
 validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
 independent_variant_oracle
 selected.alpha_gonion_left/right
@@ -300,10 +323,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v11/hard3_dual_view_model.pth
-hard3_dual_view_v11/hard3_dual_view_training_report.json
-hard3_dual_view_v11/hard3_blend_selection.json
-hard3_dual_view_v11/metrics_val.json
+hard3_dual_view_v12/hard3_dual_view_model.pth
+hard3_dual_view_v12/hard3_dual_view_training_report.json
+hard3_dual_view_v12/hard3_blend_selection.json
+hard3_dual_view_v12/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

@@ -232,6 +232,50 @@ def _feature_families(candidate_set, proposal_sources, hops):
             axis=-1,
         ),
     }
+    if candidate_set.global_contour is not None:
+        global_contour = np.nan_to_num(
+            np.asarray(candidate_set.global_contour[:, 1:3], dtype=np.float32),
+            nan=0.0,
+            posinf=8.0,
+            neginf=-8.0,
+        )
+        global_contour_relative = _query_standardize(global_contour, mask)
+        families.update(
+            {
+                "global_only": np.concatenate(
+                    [
+                        sources,
+                        global_xyz,
+                        anchor_distances,
+                        compact_surface,
+                        global_contour,
+                        global_contour_relative,
+                    ],
+                    axis=-1,
+                ),
+                "global_geometry": np.concatenate(
+                    [
+                        sources,
+                        invariant_geometry,
+                        descriptors,
+                        global_contour,
+                        global_contour_relative,
+                    ],
+                    axis=-1,
+                ),
+                "global_contour": np.concatenate(
+                    [
+                        sources,
+                        invariant_geometry,
+                        contour,
+                        descriptors,
+                        global_contour,
+                        global_contour_relative,
+                    ],
+                    axis=-1,
+                ),
+            }
+        )
     output = {}
     for name, values in families.items():
         values = np.nan_to_num(values, nan=0.0, posinf=8.0, neginf=-8.0).astype(
@@ -307,6 +351,13 @@ class CrossFittedMultiscaleContourSelector:
         "multiscale_contour_refit",
         "multiscale_contour_argmax",
         "multiscale_contour_descriptor_only",
+    )
+    refit_key = "multiscale_contour_refit"
+    argmax_key = "multiscale_contour_argmax"
+    descriptor_key = "multiscale_contour_descriptor_only"
+    method_description = (
+        "side-specific cross-fitted ridge ranking over multi-scale "
+        "surface moments and explicit contour evidence"
     )
 
     def __init__(self, final_models, member_models, policy, report):
@@ -489,10 +540,7 @@ class CrossFittedMultiscaleContourSelector:
         selected_metrics.update({"shortlist": int(data["points"].shape[2])})
         report = {
             "version": cls.version,
-            "method": (
-                "side-specific cross-fitted ridge ranking over multi-scale "
-                "surface moments and explicit contour evidence"
-            ),
+            "method": cls.method_description,
             "uses_outer_validation_labels": False,
             "uses_test_labels": False,
             "selected": selected_metrics,
@@ -567,13 +615,11 @@ class CrossFittedMultiscaleContourSelector:
         descriptor_only = np.where(data["mask"], descriptor_scores, -np.inf)
         return {
             self.primary_key: self._decode_policy(data, ensemble_scores),
-            "multiscale_contour_refit": self._decode_policy(data, refit_scores),
-            "multiscale_contour_argmax": self._decode_policy(
+            self.refit_key: self._decode_policy(data, refit_scores),
+            self.argmax_key: self._decode_policy(
                 data, ensemble_scores, force_argmax=True
             ),
-            "multiscale_contour_descriptor_only": self._decode_policy(
-                data, descriptor_only
-            ),
+            self.descriptor_key: self._decode_policy(data, descriptor_only),
             "member_coordinate": member_coordinate,
         }
 
@@ -611,3 +657,23 @@ class CrossFittedMultiscaleContourSelector:
             state["policy"],
             state["report"],
         )
+
+
+class CrossFittedGlobalJawContourSelector(CrossFittedMultiscaleContourSelector):
+    """V12 selector using true full-mesh jaw silhouettes as candidate evidence."""
+
+    version = "H3-GJCSR-v12"
+    primary_key = "crossfit_global_jaw_contour"
+    coordinate_keys = (
+        "crossfit_global_jaw_contour",
+        "global_jaw_contour_refit",
+        "global_jaw_contour_argmax",
+        "global_jaw_contour_descriptor_only",
+    )
+    refit_key = "global_jaw_contour_refit"
+    argmax_key = "global_jaw_contour_argmax"
+    descriptor_key = "global_jaw_contour_descriptor_only"
+    method_description = (
+        "side-specific cross-fitted ridge ranking over full-mesh frontal, "
+        "inferior and profile jaw-contour geometry"
+    )

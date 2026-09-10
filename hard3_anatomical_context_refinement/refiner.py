@@ -26,7 +26,10 @@ from all23_rgb_geodesic_cascade.metrics import bootstrap_delta, summarize
 from .atlas import TrainOnlyLocalHard3Atlas
 from .interaction_selector import CrossFittedInteractionSelector
 from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
-from .multiscale_selector import CrossFittedMultiscaleContourSelector
+from .multiscale_selector import (
+    CrossFittedGlobalJawContourSelector,
+    CrossFittedMultiscaleContourSelector,
+)
 from .patches import DualViewCandidateSet, extract_dual_view_set
 from .set_selector import CrossFittedRelationalSetSelector
 from .statistical_selector import (
@@ -61,7 +64,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "crossfit_multiscale_contour"
+    decoder_mode: str = "crossfit_global_contour"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -415,6 +418,7 @@ def _teacher_force_probability(epoch, warmup_epochs):
 
 def _uses_unary_reranker(config):
     if config.decoder_mode not in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_set_context",
         "crossfit_interaction",
@@ -424,7 +428,8 @@ def _uses_unary_reranker(config):
         "sharp_pruned",
     ):
         raise ValueError(
-            "decoder_mode must be crossfit_multiscale_contour, "
+            "decoder_mode must be crossfit_global_contour, "
+            "crossfit_multiscale_contour, "
             "crossfit_set_context, crossfit_interaction, crossfit_calibrated, "
             "contour_coordinate, full_pair or sharp_pruned"
         )
@@ -433,6 +438,7 @@ def _uses_unary_reranker(config):
 
 def _uses_contour_features(config):
     return config.decoder_mode in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "contour_coordinate",
         "crossfit_calibrated",
@@ -443,6 +449,7 @@ def _uses_contour_features(config):
 
 def _uses_neural_pair(config):
     return config.decoder_mode not in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_calibrated",
         "crossfit_interaction",
@@ -452,6 +459,7 @@ def _uses_neural_pair(config):
 
 def _uses_crossfit_selector(config):
     return config.decoder_mode in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_calibrated",
         "crossfit_interaction",
@@ -459,8 +467,14 @@ def _uses_crossfit_selector(config):
     )
 
 
+def _uses_global_contour_features(config):
+    return config.decoder_mode == "crossfit_global_contour"
+
+
 def _load_crossfit_selector(state):
     version = state.get("version")
+    if version == CrossFittedGlobalJawContourSelector.version:
+        return CrossFittedGlobalJawContourSelector.from_state_dict(state)
     if version == CrossFittedMultiscaleContourSelector.version:
         return CrossFittedMultiscaleContourSelector.from_state_dict(state)
     if version == CrossFittedContourSelector.version:
@@ -1523,9 +1537,13 @@ def _cache_signature(dataset, config, centers_by_id=None):
         ignored.update(interaction_fields)
     if config.decoder_mode != "crossfit_set_context":
         ignored.update(set_fields)
-    if config.decoder_mode != "crossfit_multiscale_contour":
+    if config.decoder_mode not in (
+        "crossfit_global_contour",
+        "crossfit_multiscale_contour",
+    ):
         ignored.update(multiscale_fields)
     if config.decoder_mode in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_interaction",
         "crossfit_set_context",
@@ -1556,6 +1574,7 @@ def _cache_signature(dataset, config, centers_by_id=None):
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
     cache_version = {
+        "crossfit_global_contour": 18,
         "crossfit_multiscale_contour": 17,
         "crossfit_set_context": 16,
         "crossfit_interaction": 15,
@@ -1620,6 +1639,7 @@ def _torch_load(path, device):
 
 def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
     if config.decoder_mode not in (
+        "crossfit_global_contour",
         "crossfit_multiscale_contour",
         "crossfit_interaction",
         "crossfit_set_context",
@@ -1688,6 +1708,7 @@ def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
         if covered != set(candidates.sample_ids):
             return None
         target = {
+            "crossfit_global_contour": "V12",
             "crossfit_multiscale_contour": "V11",
             "crossfit_set_context": "V10",
             "crossfit_interaction": "V9",
@@ -1809,6 +1830,7 @@ class FittedDualViewHard3Refiner:
             label,
             neighbor_count=self.config.proposal_neighbors,
             include_contour_features=_uses_contour_features(self.config),
+            include_global_contour_features=_uses_global_contour_features(self.config),
         )
         indices = list(range(len(candidate_set)))
         member_outputs = [
@@ -2033,6 +2055,7 @@ def fit_or_load_dual_view_refiner(
         label="Hard3 train patches",
         neighbor_count=config.proposal_neighbors,
         include_contour_features=_uses_contour_features(config),
+        include_global_contour_features=_uses_global_contour_features(config),
     )
     atlas = TrainOnlyLocalHard3Atlas(
         config.atlas_neighbors, config.atlas_temperature
@@ -2156,7 +2179,37 @@ def fit_or_load_dual_view_refiner(
     if not np.isfinite(oof_proposal_sources[expanded_mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF proposal sources are incomplete")
     statistical_selector = None
-    if config.decoder_mode == "crossfit_multiscale_contour":
+    if config.decoder_mode == "crossfit_global_contour":
+        print(
+            "Fitting side-specific global jaw-contour selector on OOF evidence...",
+            flush=True,
+        )
+        statistical_selector = CrossFittedGlobalJawContourSelector.fit(
+            candidates,
+            oof_proposal_sources,
+            selector_splits,
+            config,
+        )
+        selected_selector = statistical_selector.report["selected"]
+        print(
+            "H3-GJCSR-v12 OOF selector: "
+            f"ALE={selected_selector['ale']:.4f} "
+            f"p95={selected_selector['p95']:.4f} "
+            f"SDR2={selected_selector['sdr_at_2mm']:.3f} "
+            f"shortlist={selected_selector['shortlist']} "
+            f"params={statistical_selector.report['parameter_count']}",
+            flush=True,
+        )
+        side_policy = statistical_selector.report["side_policies"]
+        print(
+            "H3-GJCSR-v12 locked side policies: "
+            f"LM21=({side_policy[0]['feature_mode']},l2={side_policy[0]['l2']:g},"
+            f"w={side_policy[0]['descriptor_weight']:g}) "
+            f"LM22=({side_policy[1]['feature_mode']},l2={side_policy[1]['l2']:g},"
+            f"w={side_policy[1]['descriptor_weight']:g})",
+            flush=True,
+        )
+    elif config.decoder_mode == "crossfit_multiscale_contour":
         print(
             "Fitting side-specific multi-scale contour selector on OOF evidence...",
             flush=True,
@@ -2366,6 +2419,7 @@ def fit_or_load_dual_view_refiner(
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     revision = {
+        "crossfit_global_contour": "H3-GJCSR-v12",
         "crossfit_multiscale_contour": "H3-MSCSR-v11",
         "crossfit_set_context": "H3-RSCR-v10",
         "crossfit_interaction": "H3-QIR-v9",
@@ -2423,6 +2477,7 @@ def fit_or_load_dual_view_refiner(
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     search_name = {
+        "crossfit_global_contour": "global jaw-contour search",
         "crossfit_multiscale_contour": "multi-scale contour search",
         "crossfit_set_context": "relational set-context search",
         "crossfit_interaction": "subject-wise interaction search",
@@ -2449,6 +2504,10 @@ def fit_or_load_dual_view_refiner(
         "signature": signature,
         "version": revision,
         "method": {
+            "crossfit_global_contour": (
+                "nested-OOF broad proposal plus side-specific regularized ranking "
+                "from full-mesh frontal, inferior and profile jaw silhouettes"
+            ),
             "crossfit_multiscale_contour": (
                 "nested-OOF broad proposal plus side-specific regularized ranking "
                 "of multi-scale graph surface moments and contour evidence"

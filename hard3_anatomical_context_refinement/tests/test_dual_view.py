@@ -38,6 +38,7 @@ from hard3_anatomical_context_refinement.set_selector import (
     CrossFittedRelationalSetSelector,
 )
 from hard3_anatomical_context_refinement.multiscale_selector import (
+    CrossFittedGlobalJawContourSelector,
     CrossFittedMultiscaleContourSelector,
     multiscale_surface_descriptors,
 )
@@ -382,6 +383,7 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
         np.ones(14, dtype=np.float32),
         image_size=32,
         include_contour_features=True,
+        include_global_contour_features=True,
     )
     assert rendered[0].shape == (3, 2, 20, 32, 32)
     assert rendered[1].shape == (3, 2, 32, 32)
@@ -395,12 +397,27 @@ def test_sparse_mesh_patch_renderer_produces_finite_dual_views():
     assert rendered[13].shape == (69,)
     assert rendered[14].shape == (2, 3)
     assert rendered[15].shape == (2, 3)
+    assert rendered[16].shape == (3, roi_points, 48)
+    assert np.isfinite(rendered[16]).all()
     assert all(np.isfinite(values).all() for values in rendered[:5])
     # CoordConv and contour/depth-gradient channels are present immediately
     # before the final occupancy channel.
     assert rendered[0][..., -5, :, :].min() >= -1.0
     assert rendered[0][..., -5, :, :].max() <= 1.0
     assert rendered[0][..., -2, :, :].min() >= 0.0
+    perturbed_item = {
+        **item,
+        "expert": torch.from_numpy(expert + 25.0),
+    }
+    perturbed = render_item(
+        perturbed_item,
+        np.zeros(14, dtype=np.float32),
+        np.ones(14, dtype=np.float32),
+        image_size=32,
+        include_contour_features=True,
+        include_global_contour_features=True,
+    )
+    np.testing.assert_allclose(rendered[16], perturbed[16], atol=0.0, rtol=0.0)
     legacy = render_item(
         item,
         np.zeros(14, dtype=np.float32),
@@ -933,6 +950,31 @@ def test_multiscale_contour_selector_is_cross_fitted_and_roundtrips_state():
     assert selector.report["uses_outer_validation_labels"] is False
     assert selector.report["uses_test_labels"] is False
     assert len(selector.report["side_policies"]) == 2
+
+    candidate_set.global_contour = rng.normal(size=(samples, 3, candidates, 48)).astype(
+        np.float32
+    )
+    global_config = Hard3DualViewConfig(
+        decoder_mode="crossfit_global_contour",
+        multiscale_shortlist=8,
+        multiscale_hops=(1,),
+        multiscale_feature_modes=("global_only", "global_contour"),
+        multiscale_l2_grid=(1.0,),
+        multiscale_descriptor_weight_grid=(0.0, 0.5),
+    )
+    global_selector = CrossFittedGlobalJawContourSelector.fit(
+        candidate_set, sources, splits, global_config
+    )
+    global_restored = CrossFittedGlobalJawContourSelector.from_state_dict(
+        global_selector.state_dict()
+    )
+    global_result = global_restored.predict(candidate_set, sources)
+    assert global_result["crossfit_global_jaw_contour"].shape == (samples, 2, 3)
+    assert np.isfinite(global_result["crossfit_global_jaw_contour"]).all()
+    assert all(
+        policy["feature_mode"].startswith("global_")
+        for policy in global_selector.report["side_policies"]
+    )
 
 
 def test_dual_blend_supports_independent_left_and_right_strengths():

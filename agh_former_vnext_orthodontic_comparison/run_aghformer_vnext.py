@@ -185,6 +185,7 @@ def build_parser():
     parser.add_argument(
         "--hard3-dual-view-decoder-mode",
         choices=(
+            "crossfit_global_contour",
             "crossfit_multiscale_contour",
             "crossfit_set_context",
             "crossfit_interaction",
@@ -193,7 +194,7 @@ def build_parser():
             "full_pair",
             "sharp_pruned",
         ),
-        default="crossfit_multiscale_contour",
+        default="crossfit_global_contour",
     )
     parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
@@ -633,6 +634,8 @@ def hard3_dual_view_config_from_args(args):
 
 def hard3_dual_view_revision(args):
     mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "crossfit_global_contour":
+        return "hard3_dual_view_v12", 13
     if mode == "crossfit_multiscale_contour":
         return "hard3_dual_view_v11", 12
     if mode == "crossfit_set_context":
@@ -681,6 +684,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
         gate_values = oof.get("gonion_pair_topk_recall", {})
         gate_scope = "outer_train_oof"
         if getattr(args, "hard3_dual_view_decoder_mode", "") in (
+            "crossfit_global_contour",
             "crossfit_multiscale_contour",
             "crossfit_calibrated",
             "crossfit_interaction",
@@ -736,6 +740,7 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             "applied": True,
             "scope": gate_scope,
             "source": {
+                "crossfit_global_contour": "OOF_global_jaw_contour_search",
                 "crossfit_multiscale_contour": "OOF_multiscale_contour_search",
                 "crossfit_set_context": "OOF_relational_set_context_search",
                 "crossfit_interaction": "OOF_subjectwise_interaction_search",
@@ -1058,6 +1063,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                     prior,
                 )
             elif hard3_config.decoder_mode in (
+                "crossfit_global_contour",
                 "crossfit_multiscale_contour",
                 "crossfit_calibrated",
                 "crossfit_interaction",
@@ -1080,6 +1086,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                 datasets["val"], validation, "Hard3 validation dual-view patches"
             )
             if hard3_config.decoder_mode in (
+                "crossfit_global_contour",
                 "crossfit_multiscale_contour",
                 "crossfit_calibrated",
                 "crossfit_interaction",

@@ -6,7 +6,12 @@ import copy
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.ndimage import binary_fill_holes, distance_transform_edt, sobel
+from scipy.ndimage import (
+    binary_fill_holes,
+    distance_transform_edt,
+    gaussian_filter1d,
+    sobel,
+)
 
 from agh_former_vnext_orthodontic_comparison.hard3_structured import _canonical_frame
 from all23_rgb_geodesic_cascade.anatomy import HARD3, heatmap_sigma_mm, roi_radius_mm
@@ -32,6 +37,7 @@ class DualViewCandidateSet:
     shape_context: np.ndarray | None = None
     base_gonion: np.ndarray | None = None
     expert_gonion_context: np.ndarray | None = None
+    global_contour: np.ndarray | None = None
 
     def __len__(self):
         return len(self.sample_ids)
@@ -203,6 +209,167 @@ def _sample_contour_features(images, relative, radius):
     return np.concatenate(rows, axis=1).astype(np.float32)
 
 
+def _binned_quantile_profile(coordinate, values, quantile, bins=192):
+    """Construct a robust one-dimensional silhouette profile."""
+    coordinate = np.asarray(coordinate, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    valid = np.isfinite(coordinate) & np.isfinite(values)
+    coordinate, values = coordinate[valid], values[valid]
+    if len(coordinate) < 16:
+        return np.asarray([-1.0, 1.0], dtype=np.float32), np.zeros(2, dtype=np.float32)
+    low, high = np.percentile(coordinate, (0.5, 99.5))
+    if high - low < 1e-4:
+        high = low + 1e-4
+    edges = np.linspace(low, high, max(16, int(bins)) + 1, dtype=np.float32)
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    assignment = np.clip(
+        np.searchsorted(edges, coordinate, side="right") - 1, 0, len(centers) - 1
+    )
+    profile = np.full(len(centers), np.nan, dtype=np.float32)
+    for index in np.unique(assignment):
+        selected = values[assignment == index]
+        if len(selected):
+            profile[index] = np.quantile(selected, float(quantile))
+    support = np.isfinite(profile)
+    if not support.any():
+        profile.fill(0.0)
+    elif support.sum() == 1:
+        profile.fill(float(profile[support][0]))
+    else:
+        profile = np.interp(centers, centers[support], profile[support]).astype(
+            np.float32
+        )
+    return centers, gaussian_filter1d(profile, sigma=1.25, mode="nearest").astype(
+        np.float32
+    )
+
+
+def _build_jaw_contour_profile(points, centers, origin, frame, face_scale, landmark):
+    canonical = ((np.asarray(points, dtype=np.float32) - origin) @ frame) / max(
+        float(face_scale), 1e-4
+    )
+    center_canonical = ((np.asarray(centers, dtype=np.float32) - origin) @ frame) / max(
+        float(face_scale), 1e-4
+    )
+    side = _side_sign(landmark, centers, origin, frame)
+    canonical[:, 0] *= side
+    center_canonical[:, 0] *= side
+    finite = np.isfinite(canonical).all(axis=1)
+    # Keep the requested facial half and reject extreme scan-border fragments.
+    lateral = canonical[:, 0]
+    lateral_limit = np.percentile(lateral[finite], 99.75) if finite.any() else 1.0
+    side_mask = finite & (lateral >= -0.02) & (lateral <= lateral_limit)
+    side_points = canonical[side_mask]
+    if len(side_points) < 32:
+        side_points = canonical[finite]
+
+    vertical_coordinate = side_points[:, 1]
+    profiles = {}
+    for name, column, quantile in (
+        ("outer95", 0, 0.95),
+        ("outer99", 0, 0.99),
+        ("profile10", 2, 0.10),
+        ("profile50", 2, 0.50),
+        ("profile90", 2, 0.90),
+    ):
+        profiles[name] = _binned_quantile_profile(
+            vertical_coordinate, side_points[:, column], quantile
+        )
+
+    # Inferior jaw silhouette is estimated only below the mouth. This excludes
+    # the eye/nose width and retains the mandibular body-to-ramus transition.
+    mouth_y = float(center_canonical[7, 1])
+    lower_mask = side_points[:, 1] <= mouth_y + 0.08
+    lower = side_points[lower_mask]
+    if len(lower) < 32:
+        lower = side_points
+    lateral_coordinate = lower[:, 0]
+    for name, column, quantile in (
+        ("inferior05", 1, 0.05),
+        ("inferior10", 1, 0.10),
+        ("inferior_depth10", 2, 0.10),
+        ("inferior_depth50", 2, 0.50),
+    ):
+        profiles[name] = _binned_quantile_profile(
+            lateral_coordinate, lower[:, column], quantile
+        )
+    return profiles, side
+
+
+def _profile_triplet(profile, coordinate, offset):
+    axis, values = profile
+    center = float(np.interp(coordinate, axis, values))
+    lower = float(np.interp(coordinate - offset, axis, values))
+    upper = float(np.interp(coordinate + offset, axis, values))
+    slope = (upper - lower) / max(2.0 * offset, 1e-6)
+    bend = (upper - 2.0 * center + lower) / max(offset, 1e-6)
+    return center, slope, bend
+
+
+def _sample_global_jaw_contour(
+    selected,
+    profile,
+    side,
+    origin,
+    frame,
+    face_scale,
+    scales_mm=(3.0, 6.0, 12.0),
+):
+    candidate = ((np.asarray(selected, dtype=np.float32) - origin) @ frame) / max(
+        float(face_scale), 1e-4
+    )
+    candidate[:, 0] *= float(side)
+    rows = []
+    for point in candidate:
+        x, y, z = [float(value) for value in point]
+        features = []
+        for scale_mm in scales_mm:
+            offset = max(float(scale_mm) / max(float(face_scale), 1e-4), 1e-4)
+            outer95, outer_slope, outer_bend = _profile_triplet(
+                profile["outer95"], y, offset
+            )
+            outer99, _, _ = _profile_triplet(profile["outer99"], y, offset)
+            depth10, depth_slope, _ = _profile_triplet(profile["profile10"], y, offset)
+            depth50, _, _ = _profile_triplet(profile["profile50"], y, offset)
+            depth90, _, _ = _profile_triplet(profile["profile90"], y, offset)
+            inferior05, inferior_slope, inferior_bend = _profile_triplet(
+                profile["inferior05"], x, offset
+            )
+            inferior10, _, _ = _profile_triplet(profile["inferior10"], x, offset)
+            inferior_depth10, _, _ = _profile_triplet(
+                profile["inferior_depth10"], x, offset
+            )
+            inferior_depth50, _, _ = _profile_triplet(
+                profile["inferior_depth50"], x, offset
+            )
+            lateral_gap = outer95 - x
+            inferior_gap = y - inferior05
+            features.extend(
+                [
+                    lateral_gap,
+                    outer99 - x,
+                    outer_slope,
+                    outer_bend,
+                    depth10 - z,
+                    depth50 - z,
+                    depth90 - z,
+                    depth_slope,
+                    inferior_gap,
+                    y - inferior10,
+                    inferior_slope,
+                    inferior_bend,
+                    inferior_depth10 - z,
+                    inferior_depth50 - z,
+                    np.hypot(lateral_gap, inferior_gap),
+                    abs(outer_slope - inferior_slope),
+                ]
+            )
+        rows.append(features)
+    return np.nan_to_num(
+        np.asarray(rows, dtype=np.float32), nan=0.0, posinf=8.0, neginf=-8.0
+    )
+
+
 def render_item(
     item,
     normalizer_mean,
@@ -212,6 +379,7 @@ def render_item(
     centers=None,
     neighbor_count=12,
     include_contour_features=False,
+    include_global_contour_features=False,
 ):
     points = item["points"].numpy().astype(np.float32)
     normalized = item["features"].numpy().astype(np.float32)
@@ -235,8 +403,15 @@ def render_item(
         base_gonion[row, 0] *= _side_sign(landmark, centers, origin, frame)
         expert_gonion_context[row, 0] *= _side_sign(landmark, centers, origin, frame)
     images, targets, grids, canonical_rows, target_view_masks = [], [], [], [], []
+    global_contour_rows = []
     neighbor_indices, neighbor_masks = [], []
     candidate_points = points[roi_index]
+    jaw_profiles = {}
+    if include_global_contour_features:
+        for landmark in (21, 22):
+            jaw_profiles[landmark] = _build_jaw_contour_profile(
+                points, centers, origin, frame, face_scale, landmark
+            )
     for local_index, landmark in enumerate(HARD3):
         indices = roi_index[local_index]
         mask = roi_mask[local_index]
@@ -367,6 +542,20 @@ def render_item(
             candidate_features = np.concatenate(
                 [candidate_features, contour_features], axis=1
             )
+        if include_global_contour_features and landmark in jaw_profiles:
+            profile, profile_side = jaw_profiles[landmark]
+            global_contour_rows.append(
+                _sample_global_jaw_contour(
+                    selected,
+                    profile,
+                    profile_side,
+                    origin,
+                    frame,
+                    face_scale,
+                )
+            )
+        else:
+            global_contour_rows.append(np.zeros((len(selected), 48), dtype=np.float32))
         canonical_rows.append(candidate_features.astype(np.float32))
         images.append(landmark_images)
         targets.append(landmark_targets)
@@ -392,6 +581,7 @@ def render_item(
         center_context.reshape(-1).astype(np.float32),
         base_gonion.astype(np.float32),
         expert_gonion_context.astype(np.float32),
+        np.asarray(global_contour_rows, dtype=np.float32),
     )
 
 
@@ -403,6 +593,7 @@ def extract_dual_view_set(
     label="Hard3 patches",
     neighbor_count=12,
     include_contour_features=False,
+    include_global_contour_features=False,
 ):
     working_dataset = dataset
     if centers_by_id is not None and hasattr(dataset, "coarse_predictions"):
@@ -428,7 +619,7 @@ def extract_dual_view_set(
 
     previous_training = working_dataset.training
     working_dataset.training = False
-    rows = [[] for _ in range(16)]
+    rows = [[] for _ in range(17)]
     sample_ids, strata = [], []
     try:
         for index in range(len(working_dataset)):
@@ -445,6 +636,7 @@ def extract_dual_view_set(
                 centers=centers,
                 neighbor_count=neighbor_count,
                 include_contour_features=include_contour_features,
+                include_global_contour_features=include_global_contour_features,
             )
             for destination, value in zip(rows, rendered):
                 destination.append(value)
@@ -473,4 +665,7 @@ def extract_dual_view_set(
         shape_context=np.stack(rows[13]),
         base_gonion=np.stack(rows[14]),
         expert_gonion_context=np.stack(rows[15]),
+        global_contour=(
+            np.stack(rows[16]) if include_global_contour_features else None
+        ),
     )
