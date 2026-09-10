@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-DVAR v7)
+# Hard3 Anatomical Context Refinement (H3-CFCS v8)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v7/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v8/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -136,6 +136,27 @@ V7 bu seçim ve dağılım uyuşmazlığını hedefler:
   skor, V6'daki gibi iki bağımsız unary skora cebirsel olarak ayrılamaz.
 - OOF raporu selector regret ve `x/y/z` hata bileşenlerini ayrıca kaydeder.
 
+V7 Fold 1'de proposal@96 exact recall `LM21=%99.5`, `LM22=%99.5`, oracle ALE
+`0.753 mm` ve SDR@2 `%100` düzeyine ulaşmıştır. Buna rağmen Hard3 ALE
+`4.8370 mm` kalmış; OOF Gonion `3.3546 mm` iken dış-validation neural candidate
+Gonion `5.8404 mm` ölçülmüştür. Dolayısıyla aday havuzu çözülmüş, 665 bin
+parametreli seçicinin 192 örnekte genellenmesi yeni darboğaz olmuştur.
+
+V8, H3-CFCS (Hard3 Cross-Fitted Contour Selector), bu bulguya göre tasarlanmıştır:
+
+- Hard3 eğitimi in-sample Stage2 merkezi yerine Stage1 OOF merkezini kullanır.
+- Candidate ranker'da noisy Gonion merkezine göre lokal XYZ kaldırılır; global
+  canonical geometri, LM10-12 anchor'ları, normal, contour ve OOF proposal
+  kanıtları tutulur.
+- Nokta seçici, mesafeye duyarlı ağırlıklı ridge ile inner-fold OOF proposal
+  kanıtları üzerinde eğitilir.
+- İkinci ridge yalnız güvenilir Core20 konfigürasyonundan ortak bilateral Gonion
+  state'i tahmin eder; LM0/21/22 coarse koordinatlarını girdi olarak kullanmaz.
+- Ridge katsayısı, `top-32/48/96`, contour/state füzyon ağırlıkları ve top-k
+  coordinate decoder yalnız nested OOF sonuçlarında seçilir.
+- Dış validation için shortlist oracle ayrıca raporlanır. Böylece candidate recall
+  ile selector genellemesi ilk kez aynı dağılımda doğrudan ayrıştırılır.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -145,7 +166,7 @@ V7 bu seçim ve dağılım uyuşmazlığını hedefler:
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v7/` yeniden eğitilir; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v8/` yeniden eğitilir; eski sürüm
 çıktıları değiştirilmez.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
@@ -160,8 +181,13 @@ oof.selection_diagnostics.selector_regret_mm
 oof.selection_diagnostics.axis_mae_xyz
 oof.mean_dynamic_view_weights
 oof.std_dynamic_view_weights
+oof.crossfit_selector.selected
+oof.crossfit_selector.candidate_l2_sweep
+oof.crossfit_selector.state_l2_sweep
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
+candidate_metrics.crossfit_calibrated
+validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
 selected.alpha_gonion_left/right
 ```
 
@@ -193,10 +219,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v7/hard3_dual_view_model.pth
-hard3_dual_view_v7/hard3_dual_view_training_report.json
-hard3_dual_view_v7/hard3_blend_selection.json
-hard3_dual_view_v7/metrics_val.json
+hard3_dual_view_v8/hard3_dual_view_model.pth
+hard3_dual_view_v8/hard3_dual_view_training_report.json
+hard3_dual_view_v8/hard3_blend_selection.json
+hard3_dual_view_v8/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

@@ -546,6 +546,7 @@ class DualViewHard3Net(nn.Module):
         decoder_mode="full_pair",
         shape_context_dim=69,
         contour_residual_limit=0.20,
+        enable_pair_ranker=True,
     ):
         super().__init__()
         self.proposal_topk = max(2, int(proposal_topk))
@@ -598,7 +599,9 @@ class DualViewHard3Net(nn.Module):
 
         pair_width = max(width * 2, 48)
         pair_input_dim = self.geometry_dim + len(PROPOSAL_SOURCE_NAMES)
-        if self.decoder_mode == "contour_coordinate":
+        if not enable_pair_ranker:
+            self.gonion_pair_ranker = None
+        elif self.decoder_mode in ("contour_coordinate", "crossfit_calibrated"):
             self.gonion_pair_ranker = ShapeConditionedContourPairRanker(
                 pair_input_dim,
                 self.geometry_dim,
@@ -838,6 +841,8 @@ class DualViewHard3Net(nn.Module):
         base_gonion=None,
     ):
         """Rank LM21/22 jointly and return differentiable pair coordinates."""
+        if self.gonion_pair_ranker is None:
+            raise RuntimeError("The neural bilateral pair ranker is disabled")
         left_mask, right_mask = candidate_mask[:, 1], candidate_mask[:, 2]
         left_logits = self._masked_standardize(
             candidate_logits[:, 1].float(), left_mask
@@ -920,7 +925,7 @@ class DualViewHard3Net(nn.Module):
             left_valid,
             right_valid,
         )
-        if self.decoder_mode == "contour_coordinate":
+        if self.decoder_mode in ("contour_coordinate", "crossfit_calibrated"):
             if shape_context is None:
                 shape_context = canonical.new_zeros(
                     canonical.shape[0], self.gonion_pair_ranker.shape_context_dim

@@ -184,8 +184,13 @@ def build_parser():
     )
     parser.add_argument(
         "--hard3-dual-view-decoder-mode",
-        choices=("contour_coordinate", "full_pair", "sharp_pruned"),
-        default="contour_coordinate",
+        choices=(
+            "crossfit_calibrated",
+            "contour_coordinate",
+            "full_pair",
+            "sharp_pruned",
+        ),
+        default="crossfit_calibrated",
     )
     parser.add_argument("--hard3-dual-view-proposal-topk", type=int, default=96)
     parser.add_argument("--hard3-dual-view-pair-topk", type=int, default=96)
@@ -260,6 +265,21 @@ def build_parser():
     )
     parser.add_argument(
         "--hard3-dual-view-contour-residual-limit", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-l2-grid",
+        default="0.001,0.01,0.1,1,10",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-shortlist-grid", default="32,48,96"
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-contour-weight-grid",
+        default="0,0.25,0.5,1,2",
+    )
+    parser.add_argument(
+        "--hard3-dual-view-statistical-state-weight-grid",
+        default="0,0.25,0.5,1,2,4",
     )
     parser.add_argument("--hard3-dual-view-negative-weight", type=float, default=0.15)
     parser.add_argument(
@@ -415,6 +435,26 @@ def hard3_dual_view_config_from_args(args):
         contour_moment_weight=args.hard3_dual_view_contour_moment_weight,
         contour_state_scale=args.hard3_dual_view_contour_state_scale,
         contour_residual_limit=args.hard3_dual_view_contour_residual_limit,
+        statistical_l2_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_l2_grid.split(",")
+            if value.strip()
+        ),
+        statistical_shortlist_grid=tuple(
+            int(value.strip())
+            for value in args.hard3_dual_view_statistical_shortlist_grid.split(",")
+            if value.strip()
+        ),
+        statistical_contour_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_contour_weight_grid.split(",")
+            if value.strip()
+        ),
+        statistical_state_weight_grid=tuple(
+            float(value.strip())
+            for value in args.hard3_dual_view_statistical_state_weight_grid.split(",")
+            if value.strip()
+        ),
         negative_weight=args.hard3_dual_view_negative_weight,
         gonion_color_dropout=args.hard3_dual_view_gonion_color_dropout,
         atlas_neighbors=args.hard3_dual_view_atlas_neighbors,
@@ -444,6 +484,8 @@ def hard3_dual_view_config_from_args(args):
 
 def hard3_dual_view_revision(args):
     mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
+    if mode == "crossfit_calibrated":
+        return "hard3_dual_view_v8", 9
     if mode == "contour_coordinate":
         return "hard3_dual_view_v7", 8
     if mode == "full_pair":
@@ -482,6 +524,34 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
     if hard3_report.get("mode") == "dual_view":
         oof = hard3_report.get("training", {}).get("oof", {})
         gate_values = oof.get("gonion_pair_topk_recall", {})
+        gate_scope = "outer_train_oof"
+        if getattr(args, "hard3_dual_view_decoder_mode", "") == "crossfit_calibrated":
+            validation_diagnostics = hard3_report.get(
+                "validation_candidate_diagnostics", {}
+            )
+            selector_diagnostics = validation_diagnostics.get("crossfit_selector", {})
+            selector_policy = oof.get("crossfit_selector", {}).get("selected", {})
+            selector_topk = int(
+                selector_policy.get("shortlist", args.hard3_dual_view_pair_topk)
+            )
+            proposal_row = (
+                validation_diagnostics.get("proposal", {})
+                .get("at_k", {})
+                .get(str(selector_topk))
+            )
+            oracle_row = selector_diagnostics.get("shortlist_oracle")
+            if proposal_row is not None and oracle_row is not None:
+                gate_values = {
+                    "topk": selector_topk,
+                    "lm21": proposal_row["lm21_recall"],
+                    "lm22": proposal_row["lm22_recall"],
+                    "both": proposal_row["both_recall"],
+                    "oracle_ale": oracle_row["ale"],
+                    "oracle_p95": oracle_row["p95"],
+                    "oracle_sdr_at_2mm": oracle_row["sdr_at_2mm"],
+                    "clinical_both_coverage": oracle_row["both_within_2mm"],
+                }
+                gate_scope = "outer_validation_locked_shortlist"
         gate_topk = int(gate_values.get("topk", args.hard3_dual_view_pair_topk))
         lm21_recall = float(gate_values.get("lm21", 0.0))
         lm22_recall = float(gate_values.get("lm22", 0.0))
@@ -504,7 +574,9 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
         )
         proposal_gate = {
             "applied": True,
+            "scope": gate_scope,
             "source": {
+                "crossfit_calibrated": "OOF_calibrated_contour_search",
                 "contour_coordinate": "shape_conditioned_contour_search",
                 "full_pair": "recall_preserving_full_pair_search",
                 "sharp_pruned": "sharp_reranked_pair_shortlist",
@@ -822,6 +894,13 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                     refinement_calibration,
                     prior,
                 )
+            elif hard3_config.decoder_mode == "crossfit_calibrated":
+                print(
+                    "Hard3 v8 training uses dataset-provided upstream coarse centers "
+                    "(Stage 1 OOF in the publication preset); the statistical "
+                    "selector excludes local center coordinates.",
+                    flush=True,
+                )
             hard3_refiner = fit_or_load_dual_view_refiner(
                 datasets["train"],
                 hard3_output_dir,
@@ -832,6 +911,20 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             hard3_validation = hard3_refiner.predict(
                 datasets["val"], validation, "Hard3 validation dual-view patches"
             )
+            if hard3_config.decoder_mode == "crossfit_calibrated":
+                selector_diagnostics = hard3_validation["validation_diagnostics"][
+                    "crossfit_selector"
+                ]
+                oracle = selector_diagnostics["shortlist_oracle"]
+                selected = selector_diagnostics["selected"]
+                print(
+                    "H3-CFCS-v8 outer-validation selector: "
+                    f"ALE={selected['ale']:.4f} "
+                    f"shortlist_oracle={oracle['ale']:.4f} "
+                    f"p95={oracle['p95']:.4f} "
+                    f"SDR2={oracle['sdr_at_2mm']:.3f}",
+                    flush=True,
+                )
             hard3_policy = calibrate_dual_view_blend(
                 validation, hard3_validation, hard3_config
             )
@@ -874,6 +967,9 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             "training": hard3_refiner.report,
             "blend": hard3_policy,
             "validation": hard3_validation_metrics,
+            "validation_candidate_diagnostics": hard3_validation.get(
+                "validation_diagnostics", {}
+            ),
         }
         print(
             f"Hard3 {args.hard3_refiner_mode} refinement: "

@@ -18,19 +18,22 @@ checkpoint'leri değiştirilmez.
 - Refiner dondurulduktan sonra ayrı confidence gate eğitimi.
 - Outer-train uzman şekillerinden fit edilen PCA + Core20-to-Hard3 conditional shape-prior.
   Shape-prior hiperparametreleri yalnız validation'da seçilir; test etiketi kullanılmaz.
-- Donmuş vNext + shape-prior çıktısı üzerinde H3-DVAR v7:
+- Donmuş vNext + shape-prior çıktısı üzerinde H3-CFCS v8:
   - `LM0` için frontal/profil RGB-depth appearance U-Net,
   - `LM21/LM22` için RGB, normal, curvature ve landmark-anchor özellikli lokal
     surface-context proposal ranker,
   - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 96` broad proposal,
   - broad top-96 adayları kaybetmeden iki tarafı koşullandıran cross-attention,
-  - tüm `96 x 96` aday uzayını değerlendiren shape-conditioned contour-state
-    bilateral ranker,
+  - V7'nin yüksek recall üreten neural proposal'ını koruyan, fakat nihai Gonion
+    seçimini 665 bin parametreli pair ranker'a bırakmayan cross-fitted selector,
+  - merkezden bağımsız global/anchor/normal/contour özellikleri üzerinde ridge
+    candidate ranking ve yalnız Core20 ile koşullanan bilateral state regression,
+  - `top-32/48/96`, contour/state ağırlığı ve coordinate decoder seçimini yalnız
+    outer-train OOF tahminlerinde yapan kilitli politika,
   - `sigma=1.5 mm` listwise hedef, SDR@2 pozitif kütle, expected-distance ve
     pair hard-negative loss,
-  - eğitim ve çıkarımda aynı Stage 2 + shape-prior merkezlerinden yeniden kurulan
-    dinamik geodezik ROI,
-  - all-23 canonical shape context ve doğrudan mean/asymmetry state supervision,
+  - eğitimde in-sample Stage2 merkezi yerine leakage-free Stage1 OOF merkezi;
+    çıkarımda donmuş Stage2 merkezi çevresinden dinamik geodezik ROI,
   - nested OOF best-checkpoint ensemble ve inference ile aynı teachersız pair eğitimi,
   - görünür dış konturu koruyan z-buffer rasterizasyonu,
   - `LM0=12 mm`, Gonion=`15 mm` düzeltme sınırı ve validation-kilitli blend.
@@ -87,7 +90,7 @@ python -u agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py \
   --hard3-dual-view-patience 1 \
   --hard3-dual-view-image-size 32 \
   --hard3-dual-view-width 8 \
-  --hard3-dual-view-decoder-mode contour_coordinate \
+  --hard3-dual-view-decoder-mode crossfit_calibrated \
   --hard3-dual-view-proposal-topk 16 \
   --hard3-dual-view-pair-topk 16 \
   --hard3-dual-view-proposal-neighbors 4 \
@@ -126,8 +129,8 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
 checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız yeni
-`hard3_dual_view_v7/` modeli eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut
-tekrar çalıştırılırsa v7 model cache'den yüklenir.
+`hard3_dual_view_v8/` modeli eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut
+tekrar çalıştırılırsa v8 model cache'den yüklenir.
 
 Beş-fold preprocessing kontrolü:
 
@@ -178,7 +181,11 @@ pruning uygulamaz ve aynı `<4.00 mm` kabul eşiğini kullanır.
 V6'nın `4.6994 mm` sonucu ve `1.089 mm` broad oracle değeri, kalan problemin aday
 bulmak değil seçmek olduğunu doğrulamıştır. V7, gerçek bilateral mean/asymmetry
 state'i, all-23 shape context'i ve train/inference uyumlu cascade ROI'leriyle bu
-darboğazı hedefler.
+darboğazı hedeflemiştir. V7'de top-96 oracle `0.753 mm` ve SDR@2 `%100` olmasına
+rağmen dış-validation Hard3 `4.8370 mm` kalmıştır; OOF Gonion `3.3546 mm` iken dış
+validation candidate Gonion `5.84 mm` olması yüksek kapasiteli seçicinin
+genellenemediğini göstermiştir. V8 bu nedenle merkez shortcut'ını kaldırır ve
+low-capacity cross-fitted contour/state kalibrasyonu kullanır.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
@@ -194,10 +201,10 @@ fold_*/group_metrics_*.csv
 fold_*/predictions_*.csv
 fold_*/shape_prior_selection.json
 fold_*/shape_prior_only/metrics_val.json
-fold_*/hard3_dual_view_v7/hard3_dual_view_model.pth
-fold_*/hard3_dual_view_v7/hard3_dual_view_training_report.json
-fold_*/hard3_dual_view_v7/hard3_blend_selection.json
-fold_*/hard3_dual_view_v7/metrics_val.json
+fold_*/hard3_dual_view_v8/hard3_dual_view_model.pth
+fold_*/hard3_dual_view_v8/hard3_dual_view_training_report.json
+fold_*/hard3_dual_view_v8/hard3_blend_selection.json
+fold_*/hard3_dual_view_v8/metrics_val.json
 fold_*/hard3_stage3_decision.json
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
@@ -206,5 +213,7 @@ summary_metrics.json
 
 `neural_only/` shape-prior öncesi AGH vNext sonucunu, `shape_prior_only/` mevcut
 `2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar.
-`hard3_dual_view_v7/` ve ana fold dosyaları validation'da kilitlenen H3-DVAR v7
-dahil nihai sonucu içerir.
+`hard3_dual_view_v8/` ve ana fold dosyaları validation'da kilitlenen H3-CFCS v8
+dahil nihai sonucu içerir. `hard3_blend_selection.json` içindeki
+`validation_candidate_diagnostics` dış-validation shortlist oracle ve gerçek
+selector hatasını birbirinden ayırır.

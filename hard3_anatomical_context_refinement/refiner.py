@@ -26,6 +26,10 @@ from all23_rgb_geodesic_cascade.metrics import bootstrap_delta, summarize
 from .atlas import TrainOnlyLocalHard3Atlas
 from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
 from .patches import DualViewCandidateSet, extract_dual_view_set
+from .statistical_selector import (
+    CrossFittedContourSelector,
+    selector_validation_diagnostics,
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "contour_coordinate"
+    decoder_mode: str = "crossfit_calibrated"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -91,6 +95,23 @@ class Hard3DualViewConfig:
     contour_moment_weight: float = 0.5
     contour_state_scale: float = 0.03
     contour_residual_limit: float = 0.20
+    statistical_l2_grid: tuple[float, ...] = (0.001, 0.01, 0.1, 1.0, 10.0)
+    statistical_shortlist_grid: tuple[int, ...] = (32, 48, 96)
+    statistical_contour_weight_grid: tuple[float, ...] = (
+        0.0,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+    )
+    statistical_state_weight_grid: tuple[float, ...] = (
+        0.0,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+    )
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -356,13 +377,23 @@ def _teacher_force_probability(epoch, warmup_epochs):
 def _uses_unary_reranker(config):
     if config.decoder_mode not in (
         "contour_coordinate",
+        "crossfit_calibrated",
         "full_pair",
         "sharp_pruned",
     ):
         raise ValueError(
-            "decoder_mode must be contour_coordinate, full_pair or sharp_pruned"
+            "decoder_mode must be crossfit_calibrated, contour_coordinate, "
+            "full_pair or sharp_pruned"
         )
     return config.decoder_mode == "sharp_pruned"
+
+
+def _uses_contour_features(config):
+    return config.decoder_mode in ("contour_coordinate", "crossfit_calibrated")
+
+
+def _uses_neural_pair(config):
+    return config.decoder_mode != "crossfit_calibrated"
 
 
 def _median_best_epoch(best_epochs, maximum_epochs):
@@ -801,6 +832,7 @@ def _new_model(candidate_set, config):
             else 69
         ),
         contour_residual_limit=config.contour_residual_limit,
+        enable_pair_ranker=_uses_neural_pair(config),
     )
 
 
@@ -823,7 +855,12 @@ def _predict_outputs(model, candidate_set, indices, config, device):
             indices[start : start + config.batch_size], dtype=np.int64
         )
         batch = _tensor_batch(candidate_set, selected, device, config)
-        _, logits, pair, view_weights, evidence = _forward_model(model, batch, config)
+        _, logits, pair, view_weights, evidence = _forward_model(
+            model,
+            batch,
+            config,
+            compute_pair=_uses_neural_pair(config),
+        )
         chunks["logits"].append(logits.float().cpu().numpy())
         chunks["proposal_logits"].append(
             evidence["proposal_logits"].float().cpu().numpy()
@@ -831,11 +868,16 @@ def _predict_outputs(model, candidate_set, indices, config, device):
         chunks["proposal_sources"].append(
             evidence["proposal_sources"].float().cpu().numpy()
         )
-        chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
-        chunks["pair_argmax"].append(pair["argmax_coordinate"].float().cpu().numpy())
-        chunks["pair_snapped"].append(pair["snapped_coordinate"].float().cpu().numpy())
-        chunks["pair_left_indices"].append(pair["left_indices"].cpu().numpy())
-        chunks["pair_right_indices"].append(pair["right_indices"].cpu().numpy())
+        if pair is not None:
+            chunks["pair_soft"].append(pair["soft_coordinate"].float().cpu().numpy())
+            chunks["pair_argmax"].append(
+                pair["argmax_coordinate"].float().cpu().numpy()
+            )
+            chunks["pair_snapped"].append(
+                pair["snapped_coordinate"].float().cpu().numpy()
+            )
+            chunks["pair_left_indices"].append(pair["left_indices"].cpu().numpy())
+            chunks["pair_right_indices"].append(pair["right_indices"].cpu().numpy())
         chunks["view_weights"].append(view_weights.float().cpu().numpy())
         for name in (
             "predicted_mean",
@@ -843,7 +885,7 @@ def _predict_outputs(model, candidate_set, indices, config, device):
             "base_mean",
             "base_asymmetry",
         ):
-            if name in pair:
+            if pair is not None and name in pair:
                 chunks.setdefault(name, []).append(pair[name].float().cpu().numpy())
     return {
         name: np.concatenate(values, axis=0)
@@ -1000,12 +1042,14 @@ def _set_training_stage(model, stage):
         if model.gonion_unary_reranker is not None:
             for parameter in model.gonion_unary_reranker.parameters():
                 parameter.requires_grad_(False)
-        for parameter in model.gonion_pair_ranker.parameters():
-            parameter.requires_grad_(False)
+        if model.gonion_pair_ranker is not None:
+            for parameter in model.gonion_pair_ranker.parameters():
+                parameter.requires_grad_(False)
         model.train()
         if model.gonion_unary_reranker is not None:
             model.gonion_unary_reranker.eval()
-        model.gonion_pair_ranker.eval()
+        if model.gonion_pair_ranker is not None:
+            model.gonion_pair_ranker.eval()
     elif stage == "rerank":
         if model.gonion_unary_reranker is None:
             raise RuntimeError("Unary reranker stage requested while it is disabled")
@@ -1014,6 +1058,8 @@ def _set_training_stage(model, stage):
         model.eval()
         model.gonion_unary_reranker.train()
     elif stage == "pair":
+        if model.gonion_pair_ranker is None:
+            raise RuntimeError("Neural pair stage requested while it is disabled")
         for parameter in model.gonion_pair_ranker.parameters():
             parameter.requires_grad_(True)
         model.eval()
@@ -1049,7 +1095,7 @@ def _validation_stage_metrics(model, candidate_set, val_indices, config, device,
 
 
 def _pair_stage_loss(heatmaps, logits, batch, config, pair_output):
-    if config.decoder_mode == "contour_coordinate":
+    if _uses_contour_features(config):
         return _contour_coordinate_loss(pair_output, batch, config)
     if config.decoder_mode == "full_pair":
         return _clinical_full_pair_loss(pair_output, batch, config)
@@ -1235,16 +1281,24 @@ def _train_model(
         rerank_epoch, rerank_score, rerank_history = 0, proposal_score, []
         rerank_state = proposal_state
     model.load_state_dict(rerank_state)
-    pair_epoch, pair_score, pair_history, pair_state = _fit_stage(
-        model,
-        candidate_set,
-        train_indices,
-        val_indices,
-        config,
-        device,
-        fold_number,
-        "pair",
-    )
+    if _uses_neural_pair(config):
+        pair_epoch, pair_score, pair_history, pair_state = _fit_stage(
+            model,
+            candidate_set,
+            train_indices,
+            val_indices,
+            config,
+            device,
+            fold_number,
+            "pair",
+        )
+    else:
+        pair_epoch, pair_score, pair_history, pair_state = (
+            0,
+            proposal_score,
+            [],
+            rerank_state,
+        )
     model.load_state_dict(pair_state)
     outputs = _predict_outputs(model, candidate_set, list(val_indices), config, device)
     stage_epochs = {
@@ -1283,7 +1337,8 @@ def _train_fixed_model(
     stages = [("proposal", int(proposal_epochs), config.lr)]
     if _uses_unary_reranker(config):
         stages.append(("rerank", int(rerank_epochs), config.rerank_stage_lr))
-    stages.append(("pair", int(pair_epochs), config.pair_stage_lr))
+    if _uses_neural_pair(config):
+        stages.append(("pair", int(pair_epochs), config.pair_stage_lr))
     for stage, epochs, lr in stages:
         _set_training_stage(model, stage)
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -1371,7 +1426,7 @@ def _cache_signature(dataset, config, centers_by_id=None):
         "minimum_proposal_sdr2",
         "maximum_proposal_oracle_p95",
     }
-    is_contour = config.decoder_mode == "contour_coordinate"
+    is_contour = _uses_contour_features(config)
     if not is_contour:
         ignored.update(
             {
@@ -1399,8 +1454,13 @@ def _cache_signature(dataset, config, centers_by_id=None):
         records.append(
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
+    cache_version = (
+        14
+        if config.decoder_mode == "crossfit_calibrated"
+        else (13 if is_contour else 11)
+    )
     payload = {
-        "version": 13 if is_contour else 11,
+        "version": cache_version,
         "records": records,
         "coarse_digest": digest.hexdigest(),
         "normalizer_mean": np.asarray(dataset.mean, dtype=np.float32).tolist(),
@@ -1492,13 +1552,23 @@ def _variant_predictions(
 
 
 class FittedDualViewHard3Refiner:
-    def __init__(self, models, policy, atlas, report, config, device):
+    def __init__(
+        self,
+        models,
+        policy,
+        atlas,
+        report,
+        config,
+        device,
+        statistical_selector=None,
+    ):
         self.models = [model.to(device).eval() for model in models]
         self.policy = policy
         self.atlas = atlas
         self.report = report
         self.config = config
         self.device = device
+        self.statistical_selector = statistical_selector
 
     def predict(self, dataset, baseline_outputs, label="Hard3 dual-view inference"):
         centers = {
@@ -1514,7 +1584,7 @@ class FittedDualViewHard3Refiner:
             centers,
             label,
             neighbor_count=self.config.proposal_neighbors,
-            include_contour_features=(self.config.decoder_mode == "contour_coordinate"),
+            include_contour_features=_uses_contour_features(self.config),
         )
         indices = list(range(len(candidate_set)))
         member_outputs = [
@@ -1523,10 +1593,16 @@ class FittedDualViewHard3Refiner:
         ]
         member_logits = [values["logits"] for values in member_outputs]
         logits = np.mean(np.stack(member_logits), axis=0)
-        joint_predictions = {
-            name: np.mean(np.stack([values[name] for values in member_outputs]), axis=0)
-            for name in ("pair_soft", "pair_argmax", "pair_snapped")
-        }
+        joint_predictions = (
+            {
+                name: np.mean(
+                    np.stack([values[name] for values in member_outputs]), axis=0
+                )
+                for name in ("pair_soft", "pair_argmax", "pair_snapped")
+            }
+            if _uses_neural_pair(self.config)
+            else None
+        )
         baseline = _ordered_baseline(candidate_set, baseline_outputs)
         atlas_result = self.atlas.predict(baseline, candidate_set.sample_ids)
         variants = _variant_predictions(
@@ -1536,15 +1612,50 @@ class FittedDualViewHard3Refiner:
             atlas_result["prediction"],
             joint_predictions,
         )
-        member_coordinates = np.stack(
-            [
-                _decode_dual_policy(
-                    candidate_set, values["logits"], values, self.policy
-                )
-                for values in member_outputs
-            ]
+        proposal_sources = np.mean(
+            np.stack([values["proposal_sources"] for values in member_outputs]),
+            axis=0,
         )
-        neural_coordinate = variants["neural_policy"]
+        selector_result = None
+        if self.statistical_selector is not None:
+            selector_result = self.statistical_selector.predict(
+                candidate_set, proposal_sources
+            )
+            for name in (
+                "crossfit_calibrated",
+                "crossfit_contour_only",
+                "crossfit_state_only",
+            ):
+                coordinate = variants["unary_policy"].copy()
+                coordinate[:, 1:3] = selector_result[name]
+                variants[name] = coordinate
+        if self.statistical_selector is not None:
+            calibrated_members = []
+            for values in member_outputs:
+                coordinate = _decode_policy(
+                    candidate_set, values["logits"], self.policy
+                )
+                coordinate[:, 1:3] = self.statistical_selector.predict(
+                    candidate_set, values["proposal_sources"]
+                )["crossfit_calibrated"]
+                calibrated_members.append(coordinate)
+            member_coordinates = np.stack(calibrated_members)
+        else:
+            member_coordinates = np.stack(
+                [
+                    _decode_dual_policy(
+                        candidate_set, values["logits"], values, self.policy
+                    )
+                    for values in member_outputs
+                ]
+            )
+        neural_coordinate = variants[
+            (
+                "crossfit_calibrated"
+                if self.statistical_selector is not None
+                else "neural_policy"
+            )
+        ]
         spread = np.linalg.norm(
             member_coordinates - neural_coordinate[None], axis=-1
         ).mean(axis=0)
@@ -1570,6 +1681,23 @@ class FittedDualViewHard3Refiner:
         reliability *= 1.0 / (
             1.0 + (atlas_result["dispersion"] / np.maximum(scale * 2.0, 1.0)) ** 2
         )
+        validation_diagnostics = {
+            "proposal": _proposal_diagnostics(
+                candidate_set,
+                proposal_sources,
+                tuple(self.config.diagnostic_topk)
+                + (self.config.proposal_topk, self.config.pair_topk),
+            )
+        }
+        if selector_result is not None:
+            validation_diagnostics["crossfit_selector"] = (
+                selector_validation_diagnostics(
+                    candidate_set,
+                    selector_result["crossfit_calibrated"],
+                    proposal_sources,
+                    self.statistical_selector.policy["shortlist"],
+                )
+            )
         return {
             "sample_ids": candidate_set.sample_ids,
             "prediction": neural_coordinate,
@@ -1585,6 +1713,7 @@ class FittedDualViewHard3Refiner:
                 np.stack([values["view_weights"] for values in member_outputs]),
                 axis=0,
             ).astype(np.float32),
+            "validation_diagnostics": validation_diagnostics,
         }
 
 
@@ -1639,14 +1768,28 @@ def fit_or_load_dual_view_refiner(
                     decoder_mode=config.decoder_mode,
                     shape_context_dim=checkpoint.get("shape_context_dim", 69),
                     contour_residual_limit=config.contour_residual_limit,
+                    enable_pair_ranker=_uses_neural_pair(config),
                 )
                 model.load_state_dict(state)
                 models.append(model)
             atlas = TrainOnlyLocalHard3Atlas.from_state_dict(checkpoint["atlas"])
+            statistical_selector = (
+                CrossFittedContourSelector.from_state_dict(
+                    checkpoint["statistical_selector"]
+                )
+                if checkpoint.get("statistical_selector") is not None
+                else None
+            )
             report = json.loads(report_path.read_text(encoding="utf-8"))
             print("Hard3 dual-view refiner cached", flush=True)
             return FittedDualViewHard3Refiner(
-                models, checkpoint["coordinate_policy"], atlas, report, config, device
+                models,
+                checkpoint["coordinate_policy"],
+                atlas,
+                report,
+                config,
+                device,
+                statistical_selector,
             )
 
     candidates = extract_dual_view_set(
@@ -1656,7 +1799,7 @@ def fit_or_load_dual_view_refiner(
         centers_by_id=training_centers,
         label="Hard3 train patches",
         neighbor_count=config.proposal_neighbors,
-        include_contour_features=(config.decoder_mode == "contour_coordinate"),
+        include_contour_features=_uses_contour_features(config),
     )
     atlas = TrainOnlyLocalHard3Atlas(
         config.atlas_neighbors, config.atlas_temperature
@@ -1670,24 +1813,39 @@ def fit_or_load_dual_view_refiner(
         -np.inf,
         dtype=np.float32,
     )
-    oof_pair = {
-        name: np.zeros((len(candidates), 2, 3), dtype=np.float32)
-        for name in ("pair_soft", "pair_argmax", "pair_snapped")
-    }
+    oof_pair = (
+        {
+            name: np.zeros((len(candidates), 2, 3), dtype=np.float32)
+            for name in ("pair_soft", "pair_argmax", "pair_snapped")
+        }
+        if _uses_neural_pair(config)
+        else {}
+    )
     pair_count = min(
         config.pair_topk,
         config.proposal_topk,
         candidates.points.shape[-2],
     )
-    oof_pair_indices = {
-        name: np.full((len(candidates), pair_count), -1, dtype=np.int64)
-        for name in ("pair_left_indices", "pair_right_indices")
-    }
+    oof_pair_indices = (
+        {
+            name: np.full((len(candidates), pair_count), -1, dtype=np.int64)
+            for name in ("pair_left_indices", "pair_right_indices")
+        }
+        if _uses_neural_pair(config)
+        else {}
+    )
     oof_view_weights = np.zeros((len(candidates), 3, 2), dtype=np.float32)
     fold_reports, oof_models, oof_states, best_epochs = [], [], [], []
+    selector_splits = []
     for fold_number, (train_indices, val_indices) in enumerate(
         _splitter(candidates.strata, config.folds, config.seed), start=1
     ):
+        selector_splits.append(
+            (
+                np.asarray(train_indices, dtype=np.int64),
+                np.asarray(val_indices, dtype=np.int64),
+            )
+        )
         fold_outputs, stage_epochs, stage_scores, history, state = _train_model(
             candidates,
             np.asarray(train_indices),
@@ -1729,29 +1887,66 @@ def fit_or_load_dual_view_refiner(
     )
     if not np.isfinite(oof_proposal_sources[expanded_mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF proposal sources are incomplete")
-    policy = _select_dual_coordinate_policy(candidates, oof_logits, oof_pair)
-    oof_prediction = _decode_dual_policy(candidates, oof_logits, oof_pair, policy)
+    statistical_selector = None
+    if config.decoder_mode == "crossfit_calibrated":
+        print(
+            "Fitting cross-fitted low-capacity Gonion selector on OOF evidence...",
+            flush=True,
+        )
+        statistical_selector = CrossFittedContourSelector.fit(
+            candidates,
+            oof_proposal_sources,
+            selector_splits,
+            config,
+        )
+        selected_selector = statistical_selector.report["selected"]
+        print(
+            "H3-CFCS-v8 OOF selector: "
+            f"ALE={selected_selector['ale']:.4f} "
+            f"p95={selected_selector['p95']:.4f} "
+            f"SDR2={selected_selector['sdr_at_2mm']:.3f} "
+            f"shortlist={selected_selector['shortlist']} "
+            f"weights=({selected_selector['contour_weight']:.2f},"
+            f"{selected_selector['state_weight']:.2f})",
+            flush=True,
+        )
+    if statistical_selector is not None:
+        policy = _select_coordinate_policy(candidates, oof_logits)
+        selector_metrics = statistical_selector.report["selected"]
+        policy["gonion_pair"] = {
+            "mode": "crossfit_calibrated",
+            "gonion_ale": selector_metrics["ale"],
+            "lm21_ale": selector_metrics["lm21_ale"],
+            "lm22_ale": selector_metrics["lm22_ale"],
+            "sweep": statistical_selector.report["policy_sweep"],
+        }
+        oof_prediction = _decode_policy(candidates, oof_logits, policy)
+        oof_prediction[:, 1:3] = statistical_selector.oof_prediction
+    else:
+        policy = _select_dual_coordinate_policy(candidates, oof_logits, oof_pair)
+        oof_prediction = _decode_dual_policy(candidates, oof_logits, oof_pair, policy)
     oof_error = np.linalg.norm(oof_prediction - candidates.expert, axis=-1)
     oof_axis_error = np.abs(oof_prediction - candidates.expert).mean(axis=0)
-    member_predictions = np.stack(
-        [
-            _decode_dual_policy(
-                candidates,
-                (
-                    member_output := _predict_outputs(
-                        model.to(device),
-                        candidates,
-                        list(range(len(candidates))),
-                        config,
-                        device,
-                    )
-                )["logits"],
-                member_output,
-                policy,
+    decoded_members = []
+    for model in oof_models:
+        member_output = _predict_outputs(
+            model.to(device),
+            candidates,
+            list(range(len(candidates))),
+            config,
+            device,
+        )
+        if statistical_selector is not None:
+            coordinate = _decode_policy(candidates, member_output["logits"], policy)
+            coordinate[:, 1:3] = statistical_selector.predict(
+                candidates, member_output["proposal_sources"]
+            )["crossfit_calibrated"]
+        else:
+            coordinate = _decode_dual_policy(
+                candidates, member_output["logits"], member_output, policy
             )
-            for model in oof_models
-        ]
-    )
+        decoded_members.append(coordinate)
+    member_predictions = np.stack(decoded_members)
     ensemble_prediction = member_predictions.mean(axis=0)
     spread = np.linalg.norm(
         member_predictions - ensemble_prediction[None], axis=-1
@@ -1768,8 +1963,12 @@ def fit_or_load_dual_view_refiner(
         if _uses_unary_reranker(config)
         else 0
     )
-    median_pair_epoch = _median_best_epoch(
-        [values["pair"] for values in best_epochs], config.pair_stage_epochs
+    median_pair_epoch = (
+        _median_best_epoch(
+            [values["pair"] for values in best_epochs], config.pair_stage_epochs
+        )
+        if _uses_neural_pair(config)
+        else 0
     )
     if config.final_model_policy == "inner_fold_ensemble":
         models = oof_models
@@ -1832,6 +2031,7 @@ def fit_or_load_dual_view_refiner(
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     revision = {
+        "crossfit_calibrated": "H3-CFCS-v8",
         "contour_coordinate": "H3-DVAR-v7",
         "full_pair": "H3-DVAR-v6",
         "sharp_pruned": "H3-DVAR-v5",
@@ -1848,6 +2048,19 @@ def fit_or_load_dual_view_refiner(
     )
     nearest_left = np.argmin(candidates.target_distance[:, 1], axis=-1)
     nearest_right = np.argmin(candidates.target_distance[:, 2], axis=-1)
+    if statistical_selector is not None:
+        pair_count = min(
+            int(statistical_selector.policy["shortlist"]),
+            candidates.points.shape[-2],
+        )
+        oof_pair_indices = {
+            "pair_left_indices": _learned_proposal_indices(
+                oof_proposal_sources[:, 1], candidates.mask[:, 1], pair_count
+            ),
+            "pair_right_indices": _learned_proposal_indices(
+                oof_proposal_sources[:, 2], candidates.mask[:, 2], pair_count
+            ),
+        }
     left_pair_hit = np.any(
         oof_pair_indices["pair_left_indices"] == nearest_left[:, None], axis=1
     )
@@ -1872,6 +2085,7 @@ def fit_or_load_dual_view_refiner(
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     search_name = {
+        "crossfit_calibrated": "OOF-calibrated contour search",
         "contour_coordinate": "shape-conditioned contour search",
         "full_pair": "full-pair search",
         "sharp_pruned": "reranked shortlist",
@@ -1894,15 +2108,20 @@ def fit_or_load_dual_view_refiner(
         "signature": signature,
         "version": revision,
         "method": (
-            "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
-            "contour-state regression, and non-separable bilateral Gonion decoding"
-            if config.decoder_mode == "contour_coordinate"
+            "nested-OOF broad proposal plus center-invariant ridge contour scoring "
+            "and Core20-conditioned bilateral state calibration"
+            if config.decoder_mode == "crossfit_calibrated"
             else (
-                "nested-OOF broad surface-context proposal and recall-preserving "
-                "clinical full-pair Gonion decoding"
-                if config.decoder_mode == "full_pair"
-                else "nested-OOF broad surface-context proposal, frozen sharp unary "
-                "reranking, and bilateral Gonion pair decoding"
+                "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
+                "contour-state regression, and non-separable bilateral Gonion decoding"
+                if config.decoder_mode == "contour_coordinate"
+                else (
+                    "nested-OOF broad surface-context proposal and recall-preserving "
+                    "clinical full-pair Gonion decoding"
+                    if config.decoder_mode == "full_pair"
+                    else "nested-OOF broad surface-context proposal, frozen sharp unary "
+                    "reranking, and bilateral Gonion pair decoding"
+                )
             )
         ),
         "uses_validation_labels_for_model_fit": False,
@@ -1968,6 +2187,11 @@ def fit_or_load_dual_view_refiner(
             },
             "mean_dynamic_view_weights": oof_view_weights.mean(axis=0).tolist(),
             "std_dynamic_view_weights": oof_view_weights.std(axis=0).tolist(),
+            "crossfit_selector": (
+                statistical_selector.report
+                if statistical_selector is not None
+                else None
+            ),
         },
         "atlas": {
             "fit_sample_ids": candidates.sample_ids,
@@ -1986,7 +2210,7 @@ def fit_or_load_dual_view_refiner(
         "training_center_source": (
             "stage2_shape_prior_prediction"
             if training_centers is not None
-            else "dataset_stage1_coarse"
+            else "dataset_upstream_coarse_prediction"
         ),
         "training_center_metrics": {
             "hard3_ale": float(
@@ -2014,11 +2238,24 @@ def fit_or_load_dual_view_refiner(
             "coordinate_policy": policy,
             "model_states": states,
             "atlas": atlas.state_dict(),
+            "statistical_selector": (
+                statistical_selector.state_dict()
+                if statistical_selector is not None
+                else None
+            ),
         },
         checkpoint_path,
     )
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return FittedDualViewHard3Refiner(models, policy, atlas, report, config, device)
+    return FittedDualViewHard3Refiner(
+        models,
+        policy,
+        atlas,
+        report,
+        config,
+        device,
+        statistical_selector,
+    )
 
 
 def _order_values(outputs, candidate_result, values):
@@ -2228,6 +2465,9 @@ def calibrate_dual_view_blend(outputs, candidate_result, config):
         ),
         "proposed_bootstrap_vs_base": proposed_bootstrap,
         "candidate_metrics": individual,
+        "validation_candidate_diagnostics": candidate_result.get(
+            "validation_diagnostics", {}
+        ),
         "mean_reliability": reliability.mean(axis=0).tolist(),
         "mean_effective_alpha": effective_alpha.mean(axis=0).tolist(),
         "step_limit_fraction": np.mean(step_scale < 1.0, axis=0).tolist(),

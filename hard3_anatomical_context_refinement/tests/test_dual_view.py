@@ -31,6 +31,9 @@ from hard3_anatomical_context_refinement.refiner import (
     apply_dual_view_blend,
     calibrate_dual_view_blend,
 )
+from hard3_anatomical_context_refinement.statistical_selector import (
+    CrossFittedContourSelector,
+)
 
 
 def test_diverse_topk_keeps_the_best_candidate_from_each_proposal_source():
@@ -664,6 +667,7 @@ def test_tiny_joint_pair_training_and_inference_complete():
         np.arange(4),
         np.arange(4, 6),
         Hard3DualViewConfig(
+            decoder_mode="contour_coordinate",
             epochs=1,
             min_epochs=1,
             patience=1,
@@ -689,6 +693,55 @@ def test_tiny_joint_pair_training_and_inference_complete():
     assert len(history) == 2
     assert outputs["logits"].shape == (2, 3, candidates)
     assert outputs["pair_soft"].shape == (2, 2, 3)
+
+
+def test_crossfit_selector_fits_oof_policy_and_roundtrips_state():
+    rng = np.random.default_rng(41)
+    samples, candidates = 10, 12
+    points = rng.normal(size=(samples, 3, candidates, 3)).astype(np.float32)
+    expert = points[:, :, 0].copy()
+    distance = np.linalg.norm(points - expert[:, :, None], axis=-1).astype(np.float32)
+    canonical = rng.normal(size=(samples, 3, candidates, 40)).astype(np.float32)
+    canonical[:, :, :, 3:6] = points
+    sources = rng.normal(size=(samples, 3, 4, candidates)).astype(np.float32)
+    sources[:, 1:3, 0, 0] += 8.0
+    candidate_set = DualViewCandidateSet(
+        sample_ids=[f"sample_{index}" for index in range(samples)],
+        strata=["Class1|women", "Class1|men"] * 5,
+        images=np.zeros((samples, 3, 2, 20, 8, 8), dtype=np.float16),
+        targets=np.zeros((samples, 3, 2, 8, 8), dtype=np.float16),
+        grids=np.zeros((samples, 3, 2, candidates, 2), dtype=np.float32),
+        points=points,
+        canonical=canonical,
+        neighbor_index=np.zeros((samples, 3, candidates, 1), dtype=np.int64),
+        neighbor_mask=np.ones((samples, 3, candidates, 1), dtype=bool),
+        mask=np.ones((samples, 3, candidates), dtype=bool),
+        expert=expert,
+        expert_full=rng.normal(size=(samples, 23, 3)).astype(np.float32),
+        target_distance=distance,
+        target_view_mask=np.ones((samples, 3, 2), dtype=bool),
+        shape_context=rng.normal(size=(samples, 69)).astype(np.float32),
+        base_gonion=rng.normal(size=(samples, 2, 3)).astype(np.float32),
+        expert_gonion_context=points[:, 1:3, 0].copy(),
+    )
+    splits = [
+        (np.arange(5, 10), np.arange(0, 5)),
+        (np.arange(0, 5), np.arange(5, 10)),
+    ]
+    config = Hard3DualViewConfig(
+        decoder_mode="crossfit_calibrated",
+        statistical_l2_grid=(0.01, 0.1),
+        statistical_shortlist_grid=(4, 8),
+        statistical_contour_weight_grid=(0.0, 1.0),
+        statistical_state_weight_grid=(0.0, 1.0),
+    )
+    selector = CrossFittedContourSelector.fit(candidate_set, sources, splits, config)
+    restored = CrossFittedContourSelector.from_state_dict(selector.state_dict())
+    result = restored.predict(candidate_set, sources)
+    assert result["crossfit_calibrated"].shape == (samples, 2, 3)
+    assert np.isfinite(result["crossfit_calibrated"]).all()
+    assert selector.report["uses_outer_validation_labels"] is False
+    assert selector.report["selected"]["shortlist"] in (4, 8)
 
 
 def test_dual_blend_supports_independent_left_and_right_strengths():
