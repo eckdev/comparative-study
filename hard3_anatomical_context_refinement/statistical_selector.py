@@ -268,6 +268,12 @@ class CrossFittedContourSelector:
     """Regularized OOF stacker for the high-recall Gonion surface proposal."""
 
     version = "H3-CFCS-v8"
+    primary_key = "crossfit_calibrated"
+    coordinate_keys = (
+        "crossfit_calibrated",
+        "crossfit_contour_only",
+        "crossfit_state_only",
+    )
 
     def __init__(self, candidate_model, state_model, policy, categories, report):
         self.candidate_model = candidate_model
@@ -485,6 +491,14 @@ class CrossFittedContourSelector:
             ),
             "predicted_state": state_prediction.astype(np.float32),
         }
+
+    def validation_diagnostics(self, candidate_set, prediction, proposal_sources):
+        return selector_validation_diagnostics(
+            candidate_set,
+            prediction,
+            proposal_sources,
+            self.policy["shortlist"],
+        )
 
     def state_dict(self):
         return {

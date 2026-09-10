@@ -601,7 +601,11 @@ class DualViewHard3Net(nn.Module):
         pair_input_dim = self.geometry_dim + len(PROPOSAL_SOURCE_NAMES)
         if not enable_pair_ranker:
             self.gonion_pair_ranker = None
-        elif self.decoder_mode in ("contour_coordinate", "crossfit_calibrated"):
+        elif self.decoder_mode in (
+            "contour_coordinate",
+            "crossfit_calibrated",
+            "crossfit_interaction",
+        ):
             self.gonion_pair_ranker = ShapeConditionedContourPairRanker(
                 pair_input_dim,
                 self.geometry_dim,
@@ -925,7 +929,11 @@ class DualViewHard3Net(nn.Module):
             left_valid,
             right_valid,
         )
-        if self.decoder_mode in ("contour_coordinate", "crossfit_calibrated"):
+        if self.decoder_mode in (
+            "contour_coordinate",
+            "crossfit_calibrated",
+            "crossfit_interaction",
+        ):
             if shape_context is None:
                 shape_context = canonical.new_zeros(
                     canonical.shape[0], self.gonion_pair_ranker.shape_context_dim

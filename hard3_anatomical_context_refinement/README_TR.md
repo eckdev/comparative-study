@@ -1,9 +1,9 @@
-# Hard3 Anatomical Context Refinement (H3-CFCS v8)
+# Hard3 Anatomical Context Refinement (H3-QIR v9)
 
 Bu deney, AGH-Former vNext'in güçlü Core20 tahminlerini değiştirmeden yalnız
 `LM0=Trichion`, `LM21=Gonion left` ve `LM22=Gonion right` noktalarını yeniden
 lokalize eder. Eski pointwise Hard3 ranker ile aynı çıktı klasörünü kullanmaz;
-sonuçlar her fold altında `hard3_dual_view_v8/` dizinine yazılır.
+sonuçlar her fold altında `hard3_dual_view_v9/` dizinine yazılır.
 
 ## Neden farklı bir model?
 
@@ -157,6 +157,27 @@ V8, H3-CFCS (Hard3 Cross-Fitted Contour Selector), bu bulguya göre tasarlanmı�
 - Dış validation için shortlist oracle ayrıca raporlanır. Böylece candidate recall
   ile selector genellemesi ilk kez aynı dağılımda doğrudan ayrıştırılır.
 
+V8 Fold 1'de Hard3 ALE'yi `5.2457 -> 4.4917 mm`, overall ALE'yi `2.2795 ->
+2.1795 mm` düşürmüştür. Buna karşın OOF selector `5.5680 mm`, dış-validation
+selector `5.2627 mm` ve dış-validation shortlist oracle `1.0203 mm` olmuştur.
+Seçilen contour ağırlığının `0.00` olması, additif lineer contour skorunun iyi
+adayı ayırt edemediğini; Core20 state priorının ise tek başına yetersiz kaldığını
+göstermiştir.
+
+V9, H3-QIR (Hard3 Query Interaction Ranker), doğrudan bu selector regret'i hedefler:
+
+- Her yüz ve taraf bağımsız bir ranking query'sidir; top-96 aday query içinde
+  median/IQR ile normalize edilir.
+- Aday girdisi, noisy lokal Gonion merkezi yerine global canonical geometri,
+  LM10-12 anchor'ları, normal/curvature/contour, dört proposal skoru ve Core20
+  state tahminine göre üç eksenli farkları içerir.
+- State farkı, normal yönü ve yüzey özellikleri arasındaki çarpımsal terimler açıkça
+  modellenir. LM21/LM22 taraf kodu asimetrik sistematik hatayı öğrenebilir.
+- Yaklaşık birkaç bin parametreli shared MLP, subject-level inner fold'larda soft
+  listwise, expected-distance ve hard-negative loss ile eğitilir.
+- OOF en iyi epoch medyanı final refit süresini belirler; inner-fold ranker ensemble
+  ve full-train refit dış validation'da ayrı adaylar olarak raporlanır.
+
 ## Colab Fold 1 geliştirme koşusu
 
 ```python
@@ -166,8 +187,13 @@ V8, H3-CFCS (Hard3 Cross-Fitted Contour Selector), bu bulguya göre tasarlanmı�
 
 Bu preset varsayılan olarak `--hard3-refiner-mode dual_view` kullanır. Daha önce
 tamamlanan vNext Stage 1/Stage 2 checkpointleri aynı run klasöründe ise yeniden
-eğitilmez. Yalnız `fold_1/hard3_dual_view_v8/` yeniden eğitilir; eski sürüm
+eğitilmez. Yalnız `fold_1/hard3_dual_view_v9/` yeniden eğitilir; eski sürüm
 çıktıları değiştirilmez.
+
+V8 klasörü aynı fold altında bulunuyorsa V9, sample/coarse-center imzasını,
+proposal ayarlarını, OOF fold kapsamını ve `inner_fold_ensemble` politikasını
+doğrular. Tümü eşleşirse V8 broad-proposal checkpointleri yeniden kullanılır;
+ranker dışındaki pahalı eğitim tekrarlanmaz.
 
 Yeni eğitim raporunda aşağıdaki tanılar ayrıca bulunur:
 
@@ -182,11 +208,14 @@ oof.selection_diagnostics.axis_mae_xyz
 oof.mean_dynamic_view_weights
 oof.std_dynamic_view_weights
 oof.crossfit_selector.selected
-oof.crossfit_selector.candidate_l2_sweep
 oof.crossfit_selector.state_l2_sweep
+oof.crossfit_selector.decoder_sweep
+oof.crossfit_selector.folds
 coordinate_policy.gonion_pair
 candidate_metrics.joint_soft/joint_argmax/joint_snapped
-candidate_metrics.crossfit_calibrated
+candidate_metrics.crossfit_interaction
+candidate_metrics.interaction_refit
+candidate_metrics.interaction_state_only
 validation_candidate_diagnostics.crossfit_selector.shortlist_oracle
 selected.alpha_gonion_left/right
 ```
@@ -219,10 +248,10 @@ OOF full-pair search Gonion oracle SDR@2mm >= %75
 Ana dosyalar:
 
 ```text
-hard3_dual_view_v8/hard3_dual_view_model.pth
-hard3_dual_view_v8/hard3_dual_view_training_report.json
-hard3_dual_view_v8/hard3_blend_selection.json
-hard3_dual_view_v8/metrics_val.json
+hard3_dual_view_v9/hard3_dual_view_model.pth
+hard3_dual_view_v9/hard3_dual_view_training_report.json
+hard3_dual_view_v9/hard3_blend_selection.json
+hard3_dual_view_v9/metrics_val.json
 hard3_stage3_decision.json
 validation_only_summary.json
 ```

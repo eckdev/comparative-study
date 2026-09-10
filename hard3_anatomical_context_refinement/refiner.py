@@ -24,11 +24,11 @@ from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3, NUM_LANDMARKS
 from all23_rgb_geodesic_cascade.metrics import bootstrap_delta, summarize
 
 from .atlas import TrainOnlyLocalHard3Atlas
+from .interaction_selector import CrossFittedInteractionSelector
 from .model import PROPOSAL_SOURCE_NAMES, DualViewHard3Net, diverse_topk_indices
 from .patches import DualViewCandidateSet, extract_dual_view_set
 from .statistical_selector import (
     CrossFittedContourSelector,
-    selector_validation_diagnostics,
 )
 
 
@@ -59,7 +59,7 @@ class Hard3DualViewConfig:
     pair_weight: float = 0.10
     joint_pair_weight: float = 0.75
     joint_pair_negative_weight: float = 0.20
-    decoder_mode: str = "crossfit_calibrated"
+    decoder_mode: str = "crossfit_interaction"
     proposal_topk: int = 96
     pair_topk: int = 96
     pair_temperature: float = 0.5
@@ -112,6 +112,21 @@ class Hard3DualViewConfig:
         2.0,
         4.0,
     )
+    interaction_shortlist: int = 96
+    interaction_width: int = 24
+    interaction_dropout: float = 0.10
+    interaction_epochs: int = 100
+    interaction_min_epochs: int = 30
+    interaction_patience: int = 15
+    interaction_lr: float = 1e-3
+    interaction_weight_decay: float = 1e-3
+    interaction_sigma: float = 2.5
+    interaction_expected_distance_weight: float = 0.25
+    interaction_coordinate_weight: float = 0.25
+    interaction_pair_weight: float = 0.10
+    interaction_hard_negative_weight: float = 0.25
+    interaction_negative_radius_mm: float = 4.0
+    interaction_negative_margin: float = 0.5
     distance_normalizer_mm: float = 10.0
     negative_weight: float = 0.15
     negative_margin: float = 0.5
@@ -376,24 +391,48 @@ def _teacher_force_probability(epoch, warmup_epochs):
 
 def _uses_unary_reranker(config):
     if config.decoder_mode not in (
+        "crossfit_interaction",
         "contour_coordinate",
         "crossfit_calibrated",
         "full_pair",
         "sharp_pruned",
     ):
         raise ValueError(
-            "decoder_mode must be crossfit_calibrated, contour_coordinate, "
-            "full_pair or sharp_pruned"
+            "decoder_mode must be crossfit_interaction, crossfit_calibrated, "
+            "contour_coordinate, full_pair or sharp_pruned"
         )
     return config.decoder_mode == "sharp_pruned"
 
 
 def _uses_contour_features(config):
-    return config.decoder_mode in ("contour_coordinate", "crossfit_calibrated")
+    return config.decoder_mode in (
+        "contour_coordinate",
+        "crossfit_calibrated",
+        "crossfit_interaction",
+    )
 
 
 def _uses_neural_pair(config):
-    return config.decoder_mode != "crossfit_calibrated"
+    return config.decoder_mode not in (
+        "crossfit_calibrated",
+        "crossfit_interaction",
+    )
+
+
+def _uses_crossfit_selector(config):
+    return config.decoder_mode in (
+        "crossfit_calibrated",
+        "crossfit_interaction",
+    )
+
+
+def _load_crossfit_selector(state):
+    version = state.get("version")
+    if version == CrossFittedContourSelector.version:
+        return CrossFittedContourSelector.from_state_dict(state)
+    if version == CrossFittedInteractionSelector.version:
+        return CrossFittedInteractionSelector.from_state_dict(state)
+    raise ValueError(f"Unsupported cross-fitted selector: {version}")
 
 
 def _median_best_epoch(best_epochs, maximum_epochs):
@@ -1436,6 +1475,19 @@ def _cache_signature(dataset, config, centers_by_id=None):
                 "contour_residual_limit",
             }
         )
+    interaction_fields = {
+        name for name in asdict(config) if name.startswith("interaction_")
+    }
+    if config.decoder_mode != "crossfit_interaction":
+        ignored.update(interaction_fields)
+    if config.decoder_mode == "crossfit_interaction":
+        ignored.update(
+            {
+                "statistical_shortlist_grid",
+                "statistical_contour_weight_grid",
+                "statistical_state_weight_grid",
+            }
+        )
     model_config = {
         key: value for key, value in asdict(config).items() if key not in ignored
     }
@@ -1454,11 +1506,11 @@ def _cache_signature(dataset, config, centers_by_id=None):
         records.append(
             (sample.sample_id, path.name, int(stat.st_size), int(stat.st_mtime_ns))
         )
-    cache_version = (
-        14
-        if config.decoder_mode == "crossfit_calibrated"
-        else (13 if is_contour else 11)
-    )
+    cache_version = {
+        "crossfit_interaction": 15,
+        "crossfit_calibrated": 14,
+        "contour_coordinate": 13,
+    }.get(config.decoder_mode, 11)
     payload = {
         "version": cache_version,
         "records": records,
@@ -1477,6 +1529,118 @@ def _cache_signature(dataset, config, centers_by_id=None):
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+_PROPOSAL_REUSE_FIELDS = (
+    "folds",
+    "epochs",
+    "min_epochs",
+    "patience",
+    "batch_size",
+    "image_size",
+    "width",
+    "dropout",
+    "radius_scale",
+    "translation_pixels",
+    "color_noise",
+    "lr",
+    "weight_decay",
+    "grad_clip",
+    "sigma_lm0",
+    "sigma_gonion",
+    "heatmap_weight",
+    "poss_weight",
+    "poss_exponent",
+    "poss_temperature",
+    "ranking_weight",
+    "coordinate_weight",
+    "proposal_neighbors",
+    "gonion_color_dropout",
+    "seed",
+)
+
+
+def _torch_load(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def _reusable_v8_proposal(dataset, candidates, output_dir, config, device):
+    if config.decoder_mode != "crossfit_interaction":
+        return None
+    donor_dir = Path(output_dir).parent / "hard3_dual_view_v8"
+    checkpoint_path = donor_dir / "hard3_dual_view_model.pth"
+    report_path = donor_dir / "hard3_dual_view_training_report.json"
+    if not checkpoint_path.exists() or not report_path.exists():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        donor_config = Hard3DualViewConfig(**dict(report["config"]))
+        if report.get("version") != "H3-CFCS-v8":
+            return None
+        if report.get("final_training", {}).get("policy") != "inner_fold_ensemble":
+            return None
+        expected_signature = _cache_signature(dataset, donor_config)
+        if expected_signature != report.get("signature"):
+            print(
+                "V8 proposal cache ignored: dataset/coarse-center signature changed.",
+                flush=True,
+            )
+            return None
+        for name in _PROPOSAL_REUSE_FIELDS:
+            if getattr(donor_config, name) != getattr(config, name):
+                print(f"V8 proposal cache ignored: {name} differs.", flush=True)
+                return None
+        checkpoint = _torch_load(checkpoint_path, device)
+        states = checkpoint["model_states"]
+        folds = report["folds"]
+        best_epochs = report["oof_best_epochs"]
+        if not (len(states) == len(folds) == len(best_epochs) == int(config.folds)):
+            return None
+        lookup = {
+            sample_id: index for index, sample_id in enumerate(candidates.sample_ids)
+        }
+        records = []
+        covered = set()
+        for fold, state, epochs in zip(folds, states, best_epochs):
+            train_ids = fold["train_sample_ids"]
+            validation_ids = fold["validation_sample_ids"]
+            if any(name not in lookup for name in train_ids + validation_ids):
+                return None
+            train_indices = np.asarray(
+                [lookup[name] for name in train_ids], dtype=np.int64
+            )
+            validation_indices = np.asarray(
+                [lookup[name] for name in validation_ids], dtype=np.int64
+            )
+            if covered.intersection(validation_ids):
+                return None
+            covered.update(validation_ids)
+            model = _new_model(candidates, config)
+            model.load_state_dict(state)
+            records.append(
+                {
+                    "train_indices": train_indices,
+                    "validation_indices": validation_indices,
+                    "model": model,
+                    "state": state,
+                    "best_epochs": epochs,
+                    "source_fold": int(fold["fold"]),
+                }
+            )
+        if covered != set(candidates.sample_ids):
+            return None
+        print(
+            f"Reusing {len(records)} leakage-checked V8 OOF broad-proposal "
+            "checkpoints for V9.",
+            flush=True,
+        )
+        return records
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        print(f"V8 proposal cache ignored: {error}", flush=True)
+        return None
 
 
 def _ordered_baseline(candidate_set, outputs):
@@ -1621,25 +1785,37 @@ class FittedDualViewHard3Refiner:
             selector_result = self.statistical_selector.predict(
                 candidate_set, proposal_sources
             )
-            for name in (
-                "crossfit_calibrated",
-                "crossfit_contour_only",
-                "crossfit_state_only",
-            ):
+            for name in self.statistical_selector.coordinate_keys:
                 coordinate = variants["unary_policy"].copy()
                 coordinate[:, 1:3] = selector_result[name]
                 variants[name] = coordinate
         if self.statistical_selector is not None:
-            calibrated_members = []
-            for values in member_outputs:
-                coordinate = _decode_policy(
-                    candidate_set, values["logits"], self.policy
+            if "member_coordinate" in selector_result:
+                selector_members = selector_result["member_coordinate"]
+                unary_members = np.stack(
+                    [
+                        _decode_policy(candidate_set, values["logits"], self.policy)
+                        for values in member_outputs
+                    ]
                 )
-                coordinate[:, 1:3] = self.statistical_selector.predict(
-                    candidate_set, values["proposal_sources"]
-                )["crossfit_calibrated"]
-                calibrated_members.append(coordinate)
-            member_coordinates = np.stack(calibrated_members)
+                member_coordinates = np.stack(
+                    [
+                        unary_members[index % len(unary_members)].copy()
+                        for index in range(len(selector_members))
+                    ]
+                )
+                member_coordinates[:, :, 1:3] = selector_members
+            else:
+                calibrated_members = []
+                for values in member_outputs:
+                    coordinate = _decode_policy(
+                        candidate_set, values["logits"], self.policy
+                    )
+                    coordinate[:, 1:3] = self.statistical_selector.predict(
+                        candidate_set, values["proposal_sources"]
+                    )[self.statistical_selector.primary_key]
+                    calibrated_members.append(coordinate)
+                member_coordinates = np.stack(calibrated_members)
         else:
             member_coordinates = np.stack(
                 [
@@ -1651,7 +1827,7 @@ class FittedDualViewHard3Refiner:
             )
         neural_coordinate = variants[
             (
-                "crossfit_calibrated"
+                self.statistical_selector.primary_key
                 if self.statistical_selector is not None
                 else "neural_policy"
             )
@@ -1691,11 +1867,10 @@ class FittedDualViewHard3Refiner:
         }
         if selector_result is not None:
             validation_diagnostics["crossfit_selector"] = (
-                selector_validation_diagnostics(
+                self.statistical_selector.validation_diagnostics(
                     candidate_set,
-                    selector_result["crossfit_calibrated"],
+                    selector_result[self.statistical_selector.primary_key],
                     proposal_sources,
-                    self.statistical_selector.policy["shortlist"],
                 )
             )
         return {
@@ -1774,9 +1949,7 @@ def fit_or_load_dual_view_refiner(
                 models.append(model)
             atlas = TrainOnlyLocalHard3Atlas.from_state_dict(checkpoint["atlas"])
             statistical_selector = (
-                CrossFittedContourSelector.from_state_dict(
-                    checkpoint["statistical_selector"]
-                )
+                _load_crossfit_selector(checkpoint["statistical_selector"])
                 if checkpoint.get("statistical_selector") is not None
                 else None
             )
@@ -1837,49 +2010,84 @@ def fit_or_load_dual_view_refiner(
     oof_view_weights = np.zeros((len(candidates), 3, 2), dtype=np.float32)
     fold_reports, oof_models, oof_states, best_epochs = [], [], [], []
     selector_splits = []
-    for fold_number, (train_indices, val_indices) in enumerate(
-        _splitter(candidates.strata, config.folds, config.seed), start=1
-    ):
-        selector_splits.append(
-            (
-                np.asarray(train_indices, dtype=np.int64),
-                np.asarray(val_indices, dtype=np.int64),
+    reused_proposal = _reusable_v8_proposal(
+        dataset, candidates, output_dir, config, device
+    )
+    if reused_proposal is not None:
+        for record in reused_proposal:
+            train_indices = record["train_indices"]
+            val_indices = record["validation_indices"]
+            model = record["model"]
+            fold_outputs = _predict_outputs(
+                model.to(device), candidates, list(val_indices), config, device
             )
-        )
-        fold_outputs, stage_epochs, stage_scores, history, state = _train_model(
-            candidates,
-            np.asarray(train_indices),
-            np.asarray(val_indices),
-            config,
-            device,
-            fold_number,
-        )
-        oof_logits[val_indices] = fold_outputs["logits"]
-        oof_proposal_sources[val_indices] = fold_outputs["proposal_sources"]
-        for name in oof_pair:
-            oof_pair[name][val_indices] = fold_outputs[name]
-        for name in oof_pair_indices:
-            oof_pair_indices[name][val_indices] = fold_outputs[name]
-        oof_view_weights[val_indices] = fold_outputs["view_weights"]
-        best_epochs.append(stage_epochs)
-        model = _new_model(candidates, config)
-        model.load_state_dict(state)
-        oof_models.append(model)
-        oof_states.append(state)
-        fold_reports.append(
-            {
-                "fold": fold_number,
-                "train_sample_ids": [candidates.sample_ids[i] for i in train_indices],
-                "validation_sample_ids": [
-                    candidates.sample_ids[i] for i in val_indices
-                ],
-                "best_epochs": stage_epochs,
-                "best_validation_pair_selection_ale": stage_scores["pair"],
-                "best_validation_proposal_ale": stage_scores["proposal"],
-                "best_validation_rerank_ale": stage_scores["rerank"],
-                "history": history,
-            }
-        )
+            oof_logits[val_indices] = fold_outputs["logits"]
+            oof_proposal_sources[val_indices] = fold_outputs["proposal_sources"]
+            oof_view_weights[val_indices] = fold_outputs["view_weights"]
+            selector_splits.append((train_indices, val_indices))
+            best_epochs.append(record["best_epochs"])
+            oof_models.append(model)
+            oof_states.append(record["state"])
+            fold_reports.append(
+                {
+                    "fold": record["source_fold"],
+                    "train_sample_ids": [
+                        candidates.sample_ids[index] for index in train_indices
+                    ],
+                    "validation_sample_ids": [
+                        candidates.sample_ids[index] for index in val_indices
+                    ],
+                    "best_epochs": record["best_epochs"],
+                    "source": "reused_leakage_checked_h3_cfcs_v8_proposal",
+                    "history": [],
+                }
+            )
+    else:
+        for fold_number, (train_indices, val_indices) in enumerate(
+            _splitter(candidates.strata, config.folds, config.seed), start=1
+        ):
+            selector_splits.append(
+                (
+                    np.asarray(train_indices, dtype=np.int64),
+                    np.asarray(val_indices, dtype=np.int64),
+                )
+            )
+            fold_outputs, stage_epochs, stage_scores, history, state = _train_model(
+                candidates,
+                np.asarray(train_indices),
+                np.asarray(val_indices),
+                config,
+                device,
+                fold_number,
+            )
+            oof_logits[val_indices] = fold_outputs["logits"]
+            oof_proposal_sources[val_indices] = fold_outputs["proposal_sources"]
+            for name in oof_pair:
+                oof_pair[name][val_indices] = fold_outputs[name]
+            for name in oof_pair_indices:
+                oof_pair_indices[name][val_indices] = fold_outputs[name]
+            oof_view_weights[val_indices] = fold_outputs["view_weights"]
+            best_epochs.append(stage_epochs)
+            model = _new_model(candidates, config)
+            model.load_state_dict(state)
+            oof_models.append(model)
+            oof_states.append(state)
+            fold_reports.append(
+                {
+                    "fold": fold_number,
+                    "train_sample_ids": [
+                        candidates.sample_ids[i] for i in train_indices
+                    ],
+                    "validation_sample_ids": [
+                        candidates.sample_ids[i] for i in val_indices
+                    ],
+                    "best_epochs": stage_epochs,
+                    "best_validation_pair_selection_ale": stage_scores["pair"],
+                    "best_validation_proposal_ale": stage_scores["proposal"],
+                    "best_validation_rerank_ale": stage_scores["rerank"],
+                    "history": history,
+                }
+            )
     if not np.isfinite(oof_logits[candidates.mask]).all():
         raise RuntimeError("Dual-view Hard3 OOF logits are incomplete")
     expanded_mask = np.broadcast_to(
@@ -1910,15 +2118,39 @@ def fit_or_load_dual_view_refiner(
             f"{selected_selector['state_weight']:.2f})",
             flush=True,
         )
+    elif config.decoder_mode == "crossfit_interaction":
+        print(
+            "Fitting subject-wise query interaction ranker on OOF evidence...",
+            flush=True,
+        )
+        statistical_selector = CrossFittedInteractionSelector.fit(
+            candidates,
+            oof_proposal_sources,
+            selector_splits,
+            config,
+            device,
+        )
+        selected_selector = statistical_selector.report["selected"]
+        print(
+            "H3-QIR-v9 OOF selector: "
+            f"ALE={selected_selector['ale']:.4f} "
+            f"p95={selected_selector['p95']:.4f} "
+            f"SDR2={selected_selector['sdr_at_2mm']:.3f} "
+            f"shortlist={selected_selector['shortlist']} "
+            f"params={statistical_selector.report['parameter_count']}",
+            flush=True,
+        )
     if statistical_selector is not None:
         policy = _select_coordinate_policy(candidates, oof_logits)
         selector_metrics = statistical_selector.report["selected"]
         policy["gonion_pair"] = {
-            "mode": "crossfit_calibrated",
+            "mode": config.decoder_mode,
             "gonion_ale": selector_metrics["ale"],
             "lm21_ale": selector_metrics["lm21_ale"],
             "lm22_ale": selector_metrics["lm22_ale"],
-            "sweep": statistical_selector.report["policy_sweep"],
+            "sweep": statistical_selector.report.get(
+                "policy_sweep", statistical_selector.report.get("decoder_sweep", [])
+            ),
         }
         oof_prediction = _decode_policy(candidates, oof_logits, policy)
         oof_prediction[:, 1:3] = statistical_selector.oof_prediction
@@ -1940,7 +2172,7 @@ def fit_or_load_dual_view_refiner(
             coordinate = _decode_policy(candidates, member_output["logits"], policy)
             coordinate[:, 1:3] = statistical_selector.predict(
                 candidates, member_output["proposal_sources"]
-            )["crossfit_calibrated"]
+            )[statistical_selector.primary_key]
         else:
             coordinate = _decode_dual_policy(
                 candidates, member_output["logits"], member_output, policy
@@ -2031,6 +2263,7 @@ def fit_or_load_dual_view_refiner(
     diagnostic_key = str(min(config.proposal_topk, candidates.points.shape[-2]))
     diagnostic_row = diagnostics["at_k"][diagnostic_key]
     revision = {
+        "crossfit_interaction": "H3-QIR-v9",
         "crossfit_calibrated": "H3-CFCS-v8",
         "contour_coordinate": "H3-DVAR-v7",
         "full_pair": "H3-DVAR-v6",
@@ -2085,6 +2318,7 @@ def fit_or_load_dual_view_refiner(
     left_clinical_hit = pair_shortlist_distance[:, 0] <= config.pair_clinical_radius_mm
     right_clinical_hit = pair_shortlist_distance[:, 1] <= config.pair_clinical_radius_mm
     search_name = {
+        "crossfit_interaction": "subject-wise interaction search",
         "crossfit_calibrated": "OOF-calibrated contour search",
         "contour_coordinate": "shape-conditioned contour search",
         "full_pair": "full-pair search",
@@ -2108,19 +2342,24 @@ def fit_or_load_dual_view_refiner(
         "signature": signature,
         "version": revision,
         "method": (
-            "nested-OOF broad proposal plus center-invariant ridge contour scoring "
-            "and Core20-conditioned bilateral state calibration"
-            if config.decoder_mode == "crossfit_calibrated"
+            "nested-OOF broad proposal plus a compact query-normalized interaction "
+            "ranker conditioned on Core20 bilateral state"
+            if config.decoder_mode == "crossfit_interaction"
             else (
-                "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
-                "contour-state regression, and non-separable bilateral Gonion decoding"
-                if config.decoder_mode == "contour_coordinate"
+                "nested-OOF broad proposal plus center-invariant ridge contour scoring "
+                "and Core20-conditioned bilateral state calibration"
+                if config.decoder_mode == "crossfit_calibrated"
                 else (
-                    "nested-OOF broad surface-context proposal and recall-preserving "
-                    "clinical full-pair Gonion decoding"
-                    if config.decoder_mode == "full_pair"
-                    else "nested-OOF broad surface-context proposal, frozen sharp unary "
-                    "reranking, and bilateral Gonion pair decoding"
+                    "nested-OOF broad surface-context proposal, all-23 shape-conditioned "
+                    "contour-state regression, and non-separable bilateral Gonion decoding"
+                    if config.decoder_mode == "contour_coordinate"
+                    else (
+                        "nested-OOF broad surface-context proposal and recall-preserving "
+                        "clinical full-pair Gonion decoding"
+                        if config.decoder_mode == "full_pair"
+                        else "nested-OOF broad surface-context proposal, frozen sharp "
+                        "unary reranking, and bilateral Gonion pair decoding"
+                    )
                 )
             )
         ),

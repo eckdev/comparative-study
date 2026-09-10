@@ -18,20 +18,19 @@ checkpoint'leri değiştirilmez.
 - Refiner dondurulduktan sonra ayrı confidence gate eğitimi.
 - Outer-train uzman şekillerinden fit edilen PCA + Core20-to-Hard3 conditional shape-prior.
   Shape-prior hiperparametreleri yalnız validation'da seçilir; test etiketi kullanılmaz.
-- Donmuş vNext + shape-prior çıktısı üzerinde H3-CFCS v8:
+- Donmuş vNext + shape-prior çıktısı üzerinde H3-QIR v9:
   - `LM0` için frontal/profil RGB-depth appearance U-Net,
   - `LM21/LM22` için RGB, normal, curvature ve landmark-anchor özellikli lokal
     surface-context proposal ranker,
   - geodezik ROI içindeki 12-komşulu aday grafından `1024 -> 96` broad proposal,
-  - broad top-96 adayları kaybetmeden iki tarafı koşullandıran cross-attention,
   - V7'nin yüksek recall üreten neural proposal'ını koruyan, fakat nihai Gonion
     seçimini 665 bin parametreli pair ranker'a bırakmayan cross-fitted selector,
-  - merkezden bağımsız global/anchor/normal/contour özellikleri üzerinde ridge
-    candidate ranking ve yalnız Core20 ile koşullanan bilateral state regression,
-  - `top-32/48/96`, contour/state ağırlığı ve coordinate decoder seçimini yalnız
-    outer-train OOF tahminlerinde yapan kilitli politika,
-  - `sigma=1.5 mm` listwise hedef, SDR@2 pozitif kütle, expected-distance ve
-    pair hard-negative loss,
+  - yalnız Core20 ile koşullanan bilateral state regression,
+  - her yüz/taraf için top-96 adayı birlikte normalize eden, state farkı ile
+    global/anchor/normal/contour etkileşimlerini kullanan kompakt listwise MLP,
+  - yalnız outer-train subject fold'larında early stopping ve OOF decoder seçimi,
+  - `sigma=2.5 mm` listwise hedef, 2 mm klinik pozitif kütle, expected-distance
+    ve query içi hard-negative loss,
   - eğitimde in-sample Stage2 merkezi yerine leakage-free Stage1 OOF merkezi;
     çıkarımda donmuş Stage2 merkezi çevresinden dinamik geodezik ROI,
   - nested OOF best-checkpoint ensemble ve inference ile aynı teachersız pair eğitimi,
@@ -90,9 +89,14 @@ python -u agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py \
   --hard3-dual-view-patience 1 \
   --hard3-dual-view-image-size 32 \
   --hard3-dual-view-width 8 \
-  --hard3-dual-view-decoder-mode crossfit_calibrated \
+  --hard3-dual-view-decoder-mode crossfit_interaction \
   --hard3-dual-view-proposal-topk 16 \
   --hard3-dual-view-pair-topk 16 \
+  --hard3-dual-view-interaction-shortlist 16 \
+  --hard3-dual-view-interaction-width 8 \
+  --hard3-dual-view-interaction-epochs 2 \
+  --hard3-dual-view-interaction-min-epochs 1 \
+  --hard3-dual-view-interaction-patience 1 \
   --hard3-dual-view-proposal-neighbors 4 \
   --hard3-dual-view-pair-stage-epochs 1 \
   --hard3-dual-view-pair-stage-min-epochs 1 \
@@ -129,8 +133,12 @@ Tamamlanmış Fold 1 checkpoint'ini değiştirmeden yalnız yeni Hard3 aşaması
 
 Bu komut aynı `publication_cv_seed42/fold_1` klasörünü kullanır. Stage 2 ve ayrı gate
 checkpoint imzaları eşleşiyorsa yeniden eğitilmez; yalnız yeni
-`hard3_dual_view_v8/` modeli eğitilir. Önceki H3-DVAR çıktıları korunur; aynı komut
-tekrar çalıştırılırsa v8 model cache'den yüklenir.
+`hard3_dual_view_v9/` modeli eğitilir. Önceki H3-DVAR/H3-CFCS çıktıları korunur;
+aynı komut tekrar çalıştırılırsa v9 model cache'den yüklenir.
+İmzası ve proposal hiperparametreleri eşleşen `hard3_dual_view_v8/` OOF ensemble'ı
+mevcutsa V9 bu beş broad-proposal ağını da salt okunur donor olarak kullanır. Böylece
+yalnız H3-QIR ranker eğitilir; uyuşmazlıkta donor reddedilir ve proposal aşaması
+otomatik olarak yeniden üretilir.
 
 Beş-fold preprocessing kontrolü:
 
@@ -159,7 +167,7 @@ Stage 1 cache imzaları uyuşuyorsa tamamlanan epochlar yeniden eğitilmez. Beli
 ## Kabul kapısı
 
 Pahalı beş-fold koşudan önce Fold 1 validation sonucu aynı fold baseline'ına göre tek
-bir H3-DVAR kapısından geçmelidir:
+bir Hard3 kapısından geçmelidir:
 
 - Hard3 ALE `<4.00 mm` ve overall ALE `<=2.25 mm` olmalı,
 - Core20 koordinatları tam olarak değişmeden kalmalı,
@@ -185,7 +193,12 @@ darboğazı hedeflemiştir. V7'de top-96 oracle `0.753 mm` ve SDR@2 `%100` olmas
 rağmen dış-validation Hard3 `4.8370 mm` kalmıştır; OOF Gonion `3.3546 mm` iken dış
 validation candidate Gonion `5.84 mm` olması yüksek kapasiteli seçicinin
 genellenemediğini göstermiştir. V8 bu nedenle merkez shortcut'ını kaldırır ve
-low-capacity cross-fitted contour/state kalibrasyonu kullanır.
+low-capacity cross-fitted contour/state kalibrasyonu kullanır. V8 outer-validation
+sonucu overall `2.1795 mm`, Core20 `1.8327 mm`, Hard3 `4.4917 mm`dir. Top-96
+shortlist oracle `1.0203 mm` iken selector `5.2627 mm` kaldığı ve OOF contour
+ağırlığı sıfır seçildiği için V9 adayı tek tek lineer puanlamak yerine subject-wise
+query interaction ranking uygular. MLP birkaç bin parametrede tutulur ve LM21/LM22
+taraf kodu ile aynı model içinde öğrenilir.
 `hard3_stage3_decision.json` bu kapıları, mevcut Core20 sabitken 2 mm overall hedefi için
 gereken Hard3 ALE bütçesini ve `run_full_cv` kararını otomatik hesaplar.
 
@@ -201,10 +214,10 @@ fold_*/group_metrics_*.csv
 fold_*/predictions_*.csv
 fold_*/shape_prior_selection.json
 fold_*/shape_prior_only/metrics_val.json
-fold_*/hard3_dual_view_v8/hard3_dual_view_model.pth
-fold_*/hard3_dual_view_v8/hard3_dual_view_training_report.json
-fold_*/hard3_dual_view_v8/hard3_blend_selection.json
-fold_*/hard3_dual_view_v8/metrics_val.json
+fold_*/hard3_dual_view_v9/hard3_dual_view_model.pth
+fold_*/hard3_dual_view_v9/hard3_dual_view_training_report.json
+fold_*/hard3_dual_view_v9/hard3_blend_selection.json
+fold_*/hard3_dual_view_v9/metrics_val.json
 fold_*/hard3_stage3_decision.json
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
@@ -213,7 +226,7 @@ summary_metrics.json
 
 `neural_only/` shape-prior öncesi AGH vNext sonucunu, `shape_prior_only/` mevcut
 `2.2818 mm` hattına karşılık gelen Stage 3 öncesi sonucu saklar.
-`hard3_dual_view_v8/` ve ana fold dosyaları validation'da kilitlenen H3-CFCS v8
+`hard3_dual_view_v9/` ve ana fold dosyaları validation'da kilitlenen H3-QIR v9
 dahil nihai sonucu içerir. `hard3_blend_selection.json` içindeki
 `validation_candidate_diagnostics` dış-validation shortlist oracle ve gerçek
 selector hatasını birbirinden ayırır.
