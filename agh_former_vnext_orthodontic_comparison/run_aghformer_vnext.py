@@ -27,6 +27,10 @@ from hard3_anatomical_context_refinement import (
     calibrate_dual_view_blend,
     fit_or_load_dual_view_refiner,
 )
+from curve_supervised_hard3_refinement import (
+    CurveHard3Config,
+    fit_or_load_curve_hard3_refiner,
+)
 from all23_rgb_geodesic_cascade.anatomy import (
     ANATOMICAL_EDGES,
     CORE20,
@@ -116,9 +120,12 @@ def build_parser():
     parser.set_defaults(hard3_structured=True)
     parser.add_argument(
         "--hard3-refiner-mode",
-        choices=("dual_view", "structured"),
+        choices=("dual_view", "curve_supervised", "structured"),
         default="dual_view",
-        help="dual_view uses anatomy-specific RGB-depth patches; structured keeps the legacy point ranker",
+        help=(
+            "curve_supervised first learns the anatomical support curve; dual_view "
+            "uses RGB-depth patches; structured keeps the legacy point ranker"
+        ),
     )
     parser.add_argument("--hard3-structured-folds", type=int, default=5)
     parser.add_argument("--hard3-structured-epochs", type=int, default=70)
@@ -402,6 +409,45 @@ def build_parser():
         "--hard3-dual-view-max-proposal-oracle-p95", type=float, default=3.50
     )
     parser.add_argument("--hard3-dual-view-target-ale", type=float, default=4.0)
+    parser.add_argument("--hard3-curve-annotation-manifest")
+    parser.add_argument("--hard3-curve-min-annotated-samples", type=int, default=0)
+    parser.add_argument(
+        "--hard3-curve-allow-pseudo",
+        dest="hard3_curve_allow_pseudo",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-hard3-curve-pseudo",
+        dest="hard3_curve_allow_pseudo",
+        action="store_false",
+    )
+    parser.set_defaults(hard3_curve_allow_pseudo=True)
+    parser.add_argument("--hard3-curve-folds", type=int, default=5)
+    parser.add_argument("--hard3-curve-epochs", type=int, default=100)
+    parser.add_argument("--hard3-curve-min-epochs", type=int, default=30)
+    parser.add_argument("--hard3-curve-patience", type=int, default=15)
+    parser.add_argument("--hard3-curve-batch-size", type=int, default=8)
+    parser.add_argument("--hard3-curve-image-size", type=int, default=64)
+    parser.add_argument("--hard3-curve-width", type=int, default=48)
+    parser.add_argument("--hard3-curve-blocks", type=int, default=2)
+    parser.add_argument("--hard3-curve-dropout", type=float, default=0.10)
+    parser.add_argument("--hard3-curve-radius-scale", type=float, default=1.25)
+    parser.add_argument("--hard3-curve-neighbors", type=int, default=12)
+    parser.add_argument("--hard3-curve-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-curve-weight-decay", type=float, default=1e-3)
+    parser.add_argument("--hard3-curve-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-curve-sigma-mm", type=float, default=2.0)
+    parser.add_argument("--hard3-curve-point-sigma-lm0", type=float, default=2.5)
+    parser.add_argument("--hard3-curve-point-sigma-gonion", type=float, default=3.0)
+    parser.add_argument("--hard3-curve-pseudo-weight", type=float, default=0.20)
+    parser.add_argument("--hard3-curve-bce-weight", type=float, default=0.75)
+    parser.add_argument("--hard3-curve-dice-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-listwise-weight", type=float, default=1.0)
+    parser.add_argument("--hard3-curve-coordinate-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-clinical-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-bilateral-weight", type=float, default=0.10)
+    parser.add_argument("--hard3-curve-confidence-weight", type=float, default=0.05)
+    parser.add_argument("--hard3-curve-temperature", type=float, default=0.75)
     parser.add_argument("--no-tta", dest="tta", action="store_false")
     parser.add_argument(
         "--no-tta-validation", dest="tta_validation", action="store_false"
@@ -660,6 +706,51 @@ def hard3_dual_view_config_from_args(args):
     )
 
 
+def hard3_curve_config_from_args(args):
+    return CurveHard3Config(
+        folds=args.hard3_curve_folds,
+        epochs=args.hard3_curve_epochs,
+        min_epochs=args.hard3_curve_min_epochs,
+        patience=args.hard3_curve_patience,
+        batch_size=args.hard3_curve_batch_size,
+        image_size=args.hard3_curve_image_size,
+        width=args.hard3_curve_width,
+        blocks=args.hard3_curve_blocks,
+        dropout=args.hard3_curve_dropout,
+        radius_scale=args.hard3_curve_radius_scale,
+        neighbor_count=args.hard3_curve_neighbors,
+        lr=args.hard3_curve_lr,
+        weight_decay=args.hard3_curve_weight_decay,
+        grad_clip=args.hard3_curve_grad_clip,
+        curve_sigma_mm=args.hard3_curve_sigma_mm,
+        point_sigma_lm0_mm=args.hard3_curve_point_sigma_lm0,
+        point_sigma_gonion_mm=args.hard3_curve_point_sigma_gonion,
+        pseudo_curve_weight=args.hard3_curve_pseudo_weight,
+        curve_bce_weight=args.hard3_curve_bce_weight,
+        curve_dice_weight=args.hard3_curve_dice_weight,
+        listwise_weight=args.hard3_curve_listwise_weight,
+        coordinate_weight=args.hard3_curve_coordinate_weight,
+        clinical_weight=args.hard3_curve_clinical_weight,
+        bilateral_weight=args.hard3_curve_bilateral_weight,
+        confidence_weight=args.hard3_curve_confidence_weight,
+        temperature=args.hard3_curve_temperature,
+        annotation_manifest=args.hard3_curve_annotation_manifest,
+        minimum_annotated_samples=args.hard3_curve_min_annotated_samples,
+        allow_pseudo_curves=args.hard3_curve_allow_pseudo,
+        maximum_step_lm0=args.hard3_structured_max_step_lm0,
+        maximum_step_gonion=args.hard3_structured_max_step_gonion,
+        bootstrap_iters=args.bootstrap_iters,
+        minimum_overall_gain_mm=args.hard3_structured_min_overall_gain_mm,
+        minimum_hard3_gain_mm=args.hard3_structured_min_hard3_gain_mm,
+        minimum_improvement_probability=(
+            args.hard3_structured_min_improvement_probability
+        ),
+        maximum_p95_regression_mm=args.hard3_structured_max_p95_regression_mm,
+        target_hard3_ale=args.hard3_dual_view_target_ale,
+        seed=args.seed,
+    )
+
+
 def hard3_dual_view_revision(args):
     mode = getattr(args, "hard3_dual_view_decoder_mode", "sharp_pruned")
     if mode == "crossfit_mixture_state":
@@ -679,6 +770,16 @@ def hard3_dual_view_revision(args):
     if mode == "full_pair":
         return "hard3_dual_view_v6", 7
     return "hard3_dual_view_v5", 6
+
+
+def hard3_artifact_contract(args):
+    mode = getattr(args, "hard3_refiner_mode", "structured")
+    if mode == "dual_view":
+        name, version = hard3_dual_view_revision(args)
+        return name, version, "hard3_dual_view_model.pth"
+    if mode == "curve_supervised":
+        return "curve_supervised_hard3_v1", 15, "curve_hard3_model.pth"
+    return "hard3_structured", 2, "hard3_structured_model.pth"
 
 
 def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
@@ -795,6 +896,47 @@ def build_stage3_decision(args, baseline_metrics, final_metrics, hard3_report):
             "informational_exact_recall_reference": (
                 args.hard3_dual_view_min_proposal_recall
             ),
+            "maximum_oracle_ale": args.hard3_dual_view_max_proposal_oracle_ale,
+            "maximum_oracle_p95": args.hard3_dual_view_max_proposal_oracle_p95,
+            "minimum_oracle_sdr_at_2mm": args.hard3_dual_view_min_proposal_sdr2,
+        }
+    elif hard3_report.get("mode") == "curve_supervised":
+        candidate_oracle = hard3_report.get("validation_candidate_diagnostics", {}).get(
+            "candidate_oracle", {}
+        )
+        proposal_oracle = float(candidate_oracle.get("hard3_ale", float("inf")))
+        proposal_p95 = float(candidate_oracle.get("hard3_p95", float("inf")))
+        proposal_sdr2 = float(candidate_oracle.get("hard3_sdr_at_2mm", 0.0))
+        publication_ready = bool(
+            hard3_report.get("training", {}).get("publication_ready", False)
+        )
+        checks.update(
+            {
+                "curve_annotations_publication_ready": publication_ready,
+                "proposal_oracle_at_or_below_gate": bool(
+                    proposal_oracle <= args.hard3_dual_view_max_proposal_oracle_ale
+                ),
+                "proposal_oracle_p95_at_or_below_gate": bool(
+                    proposal_p95 <= args.hard3_dual_view_max_proposal_oracle_p95
+                ),
+                "proposal_oracle_sdr2_at_or_above_gate": bool(
+                    proposal_sdr2 >= args.hard3_dual_view_min_proposal_sdr2
+                ),
+            }
+        )
+        proposal_gate = {
+            "applied": True,
+            "scope": "outer_validation_curve_candidate_set",
+            "source": "curve_support_candidate_search",
+            "topk": None,
+            "lm21_recall": None,
+            "lm22_recall": None,
+            "both_recall": None,
+            "gonion_oracle_ale": proposal_oracle,
+            "gonion_oracle_p95": proposal_p95,
+            "gonion_oracle_sdr_at_2mm": proposal_sdr2,
+            "clinical_both_coverage": None,
+            "publication_ready": publication_ready,
             "maximum_oracle_ale": args.hard3_dual_view_max_proposal_oracle_ale,
             "maximum_oracle_p95": args.hard3_dual_view_max_proposal_oracle_p95,
             "minimum_oracle_sdr_at_2mm": args.hard3_dual_view_min_proposal_sdr2,
@@ -1143,6 +1285,26 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                 validation, hard3_validation, hard3_config
             )
             hard3_apply = apply_dual_view_blend
+        elif args.hard3_refiner_mode == "curve_supervised":
+            hard3_name, _, _ = hard3_artifact_contract(args)
+            hard3_output_dir = fold_dir / hard3_name
+            hard3_config = hard3_curve_config_from_args(args)
+            if hard3_config.minimum_annotated_samples <= 0:
+                print(
+                    "Curve-H3 is running in pseudo-curve development mode; "
+                    "this result is not publication-ready.",
+                    flush=True,
+                )
+            hard3_refiner = fit_or_load_curve_hard3_refiner(
+                datasets["train"], hard3_output_dir, hard3_config, device
+            )
+            hard3_validation = hard3_refiner.predict(
+                datasets["val"], validation, "Curve-H3 validation patches"
+            )
+            hard3_policy = calibrate_dual_view_blend(
+                validation, hard3_validation, hard3_config
+            )
+            hard3_apply = apply_dual_view_blend
         else:
             hard3_output_dir = fold_dir / "hard3_structured"
             hard3_config = hard3_config_from_args(args)
@@ -1229,25 +1391,31 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     if stage3_decision["proposal_gate"]["applied"]:
         proposal = stage3_decision["proposal_gate"]
-        print(
-            f"Hard3 bilateral search gate@{proposal['topk']}: "
-            f"LM21={proposal['lm21_recall']:.3f} "
-            f"LM22={proposal['lm22_recall']:.3f} "
-            f"both={proposal['both_recall']:.3f} "
-            f"oracle={proposal['gonion_oracle_ale']:.3f} mm "
-            f"p95={proposal['gonion_oracle_p95']:.3f} "
-            f"SDR2={proposal['gonion_oracle_sdr_at_2mm']:.3f} "
-            f"clinical_both={proposal['clinical_both_coverage']:.3f}",
-            flush=True,
-        )
+        if args.hard3_refiner_mode == "curve_supervised":
+            print(
+                "Curve-H3 candidate gate: "
+                f"oracle={proposal['gonion_oracle_ale']:.3f} mm "
+                f"p95={proposal['gonion_oracle_p95']:.3f} "
+                f"SDR2={proposal['gonion_oracle_sdr_at_2mm']:.3f} "
+                f"publication_ready={proposal['publication_ready']}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Hard3 bilateral search gate@{proposal['topk']}: "
+                f"LM21={proposal['lm21_recall']:.3f} "
+                f"LM22={proposal['lm22_recall']:.3f} "
+                f"both={proposal['both_recall']:.3f} "
+                f"oracle={proposal['gonion_oracle_ale']:.3f} mm "
+                f"p95={proposal['gonion_oracle_p95']:.3f} "
+                f"SDR2={proposal['gonion_oracle_sdr_at_2mm']:.3f} "
+                f"clinical_both={proposal['clinical_both_coverage']:.3f}",
+                flush=True,
+            )
     if args.validation_only:
-        _, dual_view_postprocess_version = hard3_dual_view_revision(args)
+        _, postprocess_version, _ = hard3_artifact_contract(args)
         result = {
-            "postprocess_version": (
-                dual_view_postprocess_version
-                if args.hard3_refiner_mode == "dual_view"
-                else 2
-            ),
+            "postprocess_version": postprocess_version,
             "stage2_signature": args.stage2_signature,
             "parameter_count": parameter_count,
             "total_inference_parameter_count": parameter_count + hard3_parameter_count,
@@ -1318,9 +1486,9 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     )
     hard3_test_metrics = None
     if hard3_refiner is not None:
-        if args.hard3_refiner_mode == "dual_view":
+        if args.hard3_refiner_mode in ("dual_view", "curve_supervised"):
             hard3_test = hard3_refiner.predict(
-                datasets["test"], test, "Hard3 test dual-view patches"
+                datasets["test"], test, "Hard3 test image-surface patches"
             )
         else:
             hard3_test = hard3_refiner.predict(
@@ -1343,13 +1511,9 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         args.bootstrap_iters,
         args.seed,
     )
-    _, dual_view_postprocess_version = hard3_dual_view_revision(args)
+    _, postprocess_version, _ = hard3_artifact_contract(args)
     result = {
-        "postprocess_version": (
-            dual_view_postprocess_version
-            if args.hard3_refiner_mode == "dual_view"
-            else 2
-        ),
+        "postprocess_version": postprocess_version,
         "stage2_signature": args.stage2_signature,
         "parameter_count": parameter_count,
         "total_inference_parameter_count": parameter_count + hard3_parameter_count,
@@ -1446,22 +1610,20 @@ def load_completed_fold(fold_dir, args, splits):
         return None
     if args.hard3_structured:
         hard3_mode = getattr(args, "hard3_refiner_mode", "structured")
-        if hard3_mode == "dual_view":
-            hard3_name, expected_postprocess_version = hard3_dual_view_revision(args)
-            hard3_root = fold_dir / hard3_name
-            checkpoint = hard3_root / "hard3_dual_view_model.pth"
-        else:
-            hard3_root = fold_dir / "hard3_structured"
-            checkpoint = hard3_root / "hard3_structured_model.pth"
+        hard3_name, expected_postprocess_version, checkpoint_name = (
+            hard3_artifact_contract(args)
+        )
+        hard3_root = fold_dir / hard3_name
+        checkpoint = hard3_root / checkpoint_name
         hard3_required = (
             checkpoint,
             hard3_root / "metrics_val.json",
             hard3_root / "metrics_test.json",
         )
         valid_postprocess_version = (
-            result.get("postprocess_version") == expected_postprocess_version
-            if hard3_mode == "dual_view"
-            else result.get("postprocess_version") in (1, 2)
+            result.get("postprocess_version") in (1, 2)
+            if hard3_mode == "structured"
+            else result.get("postprocess_version") == expected_postprocess_version
         )
         stored_mode = result.get("hard3_structured", {}).get("mode", "structured")
         if (
