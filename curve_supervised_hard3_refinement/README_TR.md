@@ -17,10 +17,22 @@ iken seçilen adayların hatası `4.3-5.7 mm` bandında kaldı. Bu, aday erişim
 
 birlikte öğrenir.
 
-Model; iki RGB-depth görünüm, gerçek mesh komşulukları, normal/eğrilik/yoğunluk
-özellikleri, yüz şekli bağlamı ve bilateral Gonion bağlamını kullanır. Kayıp;
-curve BCE + Dice, soft-listwise landmark ranking, Smooth L1 koordinat,
-bilateral geometri, klinik mesafe ve confidence-aware NLL bileşenlerinden oluşur.
+V1 pseudo deneyi `overall=2.2086 mm`, `Core20=1.8338 mm` ve
+`Hard3=4.7077 mm` üretmiştir. ROI oracle `0.78 mm` olduğu halde OOF Hard3
+`5.27 mm` kalmıştır. V2 bu nedenle iki RGB-depth görünüm ve gerçek mesh
+komşuluklarını iki aşamada işler:
+
+1. Curve pretraining yalnız destek eğrisini öğrenir.
+2. Curve-conditioned ikinci surface-graph geçişi landmarkı destek üzerinde seçer.
+
+Gerçek eğri bulunan örnekler source-balanced batchlerle oversample edilir ve
+inner foldlara dengeli dağıtılır. Kayıp; curve BCE + Dice + beklenen curve
+mesafesi, soft-listwise landmark ranking, Smooth L1 koordinat, bilateral
+geometri, klinik mesafe ve confidence-aware NLL bileşenlerinden oluşur.
+İç-fold checkpoint seçimi Hard3 ALE yanında yalnız gerçek validation eğrilerinde
+ölçülen beklenen destek-eğrisi mesafesini düşük ağırlıkla kullanır. Böylece
+curve-only ön eğitim joint aşamada tamamen unutulmaz; pseudo eğriler checkpoint
+seçimine ek sinyal olarak girmez.
 
 ## Leakage Protokolü
 
@@ -31,19 +43,26 @@ bilateral geometri, klinik mesafe ve confidence-aware NLL bileşenlerinden oluş
 - Validation eğrileri model eğitiminde kullanılmaz; yalnız uzman noktaları
   blend seçimi ve metrik için kullanılır.
 - Test eğrileri ve test noktaları konfigürasyon seçimine girmez.
-- Curve checkpoint'i `postprocess_version=15` ile eski Hard3 sürümlerinden
+- Curve checkpoint'i `postprocess_version=16` ile eski Hard3 sürümlerinden
   ayrılır.
+- Manifest cache hash'i yalnız outer-train anotasyonlarından hesaplanır.
 
 ## Anotasyon Şeması
 
-Boş manifest üretimi:
+Fold-1 train içinden sınıf/cinsiyet dengeli 24 örneklik pilot manifest üretimi:
 
 ```python
 %cd /content/comparative-study
 !python -u curve_supervised_hard3_refinement/prepare_annotations.py \
   --data-root /content/drive/MyDrive/orthodontic/data/dataset \
-  --output /content/drive/MyDrive/orthodontic/annotations/hard3_curves_v1.json
+  --split-report /content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/publication_cv_stage1_v4_seed42/fold_1/split_and_leakage_report.json \
+  --split-name train --sample-count 24 --seed 42 \
+  --output /content/drive/MyDrive/orthodontic/annotations/hard3_curves_pilot_v2.json
 ```
+
+Komut ayrıca anotasyon sırasını ve PLY yollarını içeren
+`hard3_curves_pilot_v2_tasks.csv` dosyasını üretir. Var olan manifest varsayılan
+olarak ezilmez.
 
 Her polylineda ham PLY koordinat sisteminde sıralı XYZ noktaları bulunur:
 
@@ -73,6 +92,20 @@ yaklaşık `2-3 mm` olması önerilir. Tekrarlı landmark işaretleri isteğe ba
 varsa target tek bir yapay ortalama yerine en yakın tekrar anotasyonuna göre
 hesaplanır.
 
+Anotasyon QA'sını eğitimden bağımsız çalıştırmak için:
+
+```python
+!python -u curve_supervised_hard3_refinement/validate_annotations.py \
+  --data-root /content/drive/MyDrive/orthodontic/data/dataset \
+  --manifest /content/drive/MyDrive/orthodontic/annotations/hard3_curves_pilot_v2.json \
+  --minimum-annotated-samples 24
+```
+
+Bu kontrol curve noktalarının ham mesh yüzeyine uzaklığını, ilgili uzman
+landmarkının eğriye uzaklığını ve polyline örnekleme aralığını raporlar.
+`annotated_pilot` ve `annotated_fold1` presetleri bu QA'yı eğitimden önce
+otomatik çalıştırır; koordinat sistemi hatasında pahalı koşu başlamaz.
+
 ## Colab Çalıştırma
 
 Mimari ve I/O smoke testi:
@@ -83,30 +116,41 @@ Mimari ve I/O smoke testi:
   --preset pseudo_smoke --seed 42
 ```
 
-Tam pseudo-curve ablation:
+Tam pseudo-curve ablation yalnız V2 regresyon karşılaştırması içindir:
 
 ```python
 !python -u curve_supervised_hard3_refinement/colab_run_curve_hard3.py \
   --preset pseudo_fold1 --seed 42
 ```
 
-Gerçek eğri anotasyonlu Fold-1 karar deneyi:
+24 gerçek eğri anotasyonlu, yayın dışı pilot:
+
+```python
+!python -u curve_supervised_hard3_refinement/colab_run_curve_hard3.py \
+  --preset annotated_pilot --seed 42 \
+  --annotation-manifest /content/drive/MyDrive/orthodontic/annotations/hard3_curves_pilot_v2.json \
+  --pilot-annotated-samples 24
+```
+
+Pilot sinyal verdiğinde gerçek eğri anotasyonlu Fold-1 yayın kapısı:
 
 ```python
 !python -u curve_supervised_hard3_refinement/colab_run_curve_hard3.py \
   --preset annotated_fold1 --seed 42 \
-  --annotation-manifest /content/drive/MyDrive/orthodontic/annotations/hard3_curves_v1.json \
+  --annotation-manifest /content/drive/MyDrive/orthodontic/annotations/hard3_curves_publication_v2.json \
   --minimum-annotated-samples 60
 ```
 
-`pseudo_smoke` ve `pseudo_fold1` yayın sonucu değildir. Gerçek deneyde en az 60
-dış-train örneğinde üç eğrinin de bulunması zorunludur. Eksik train örnekleri
-düşük ağırlıklı pseudo hedefle yarı gözetimli olarak kullanılabilir.
+`pseudo_*` ve `annotated_pilot` koşulları daima `publication_ready=False`
+kalır. CLI ile düşük bir eşik verilse bile yalnız `publication` modu ve en az 60
+dış-train örneğinde üç eğri bulunması yayın hazır durumunu açar. Eksik train
+örnekleri düşük ağırlıklı pseudo hedefle yarı gözetimli kullanılabilir.
 
 ## Çıktılar
 
 ```text
-fold_1/curve_supervised_hard3_v1/
+fold_1/curve_supervised_hard3_v2/
+  annotation_preflight.json
   curve_hard3_model.pth
   curve_hard3_training_report.json
   hard3_blend_selection.json
@@ -114,8 +158,9 @@ fold_1/curve_supervised_hard3_v1/
   predictions_val.csv
 ```
 
-`curve_hard3_training_report.json`; anotasyon kapsamını, manifest SHA256
-değerini, OOF Hard3/landmark metriklerini, iç-fold sample ID'lerini, parametre
+`curve_hard3_training_report.json`; anotasyon kapsamını, train-only manifest
+SHA256 değerini, source-aware fold dağılımını, curve-support Dice/mesafesini,
+OOF Hard3/landmark metriklerini, hata-belirsizlik korelasyonunu, parametre
 sayısını ve süreyi kaydeder.
 
 ## Fold-1 Karar Kuralı

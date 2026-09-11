@@ -410,7 +410,21 @@ def build_parser():
     )
     parser.add_argument("--hard3-dual-view-target-ale", type=float, default=4.0)
     parser.add_argument("--hard3-curve-annotation-manifest")
+    parser.add_argument(
+        "--hard3-curve-run-mode",
+        choices=("pseudo", "pilot", "publication"),
+        default="pseudo",
+    )
     parser.add_argument("--hard3-curve-min-annotated-samples", type=int, default=0)
+    parser.add_argument(
+        "--hard3-curve-publication-min-annotated-samples", type=int, default=60
+    )
+    parser.add_argument(
+        "--hard3-curve-max-annotation-surface-distance-mm", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--hard3-curve-max-landmark-curve-distance-mm", type=float, default=5.0
+    )
     parser.add_argument(
         "--hard3-curve-allow-pseudo",
         dest="hard3_curve_allow_pseudo",
@@ -436,12 +450,17 @@ def build_parser():
     parser.add_argument("--hard3-curve-lr", type=float, default=5e-4)
     parser.add_argument("--hard3-curve-weight-decay", type=float, default=1e-3)
     parser.add_argument("--hard3-curve-grad-clip", type=float, default=1.0)
+    parser.add_argument("--hard3-curve-pretrain-epochs", type=int, default=20)
+    parser.add_argument("--hard3-curve-pretrain-lr", type=float, default=5e-4)
+    parser.add_argument("--hard3-curve-real-sample-fraction", type=float, default=0.5)
+    parser.add_argument("--hard3-curve-checkpoint-weight", type=float, default=0.05)
     parser.add_argument("--hard3-curve-sigma-mm", type=float, default=2.0)
     parser.add_argument("--hard3-curve-point-sigma-lm0", type=float, default=2.5)
     parser.add_argument("--hard3-curve-point-sigma-gonion", type=float, default=3.0)
     parser.add_argument("--hard3-curve-pseudo-weight", type=float, default=0.20)
     parser.add_argument("--hard3-curve-bce-weight", type=float, default=0.75)
     parser.add_argument("--hard3-curve-dice-weight", type=float, default=0.25)
+    parser.add_argument("--hard3-curve-distance-weight", type=float, default=0.20)
     parser.add_argument("--hard3-curve-listwise-weight", type=float, default=1.0)
     parser.add_argument("--hard3-curve-coordinate-weight", type=float, default=0.25)
     parser.add_argument("--hard3-curve-clinical-weight", type=float, default=0.25)
@@ -708,6 +727,7 @@ def hard3_dual_view_config_from_args(args):
 
 def hard3_curve_config_from_args(args):
     return CurveHard3Config(
+        run_mode=args.hard3_curve_run_mode,
         folds=args.hard3_curve_folds,
         epochs=args.hard3_curve_epochs,
         min_epochs=args.hard3_curve_min_epochs,
@@ -722,12 +742,17 @@ def hard3_curve_config_from_args(args):
         lr=args.hard3_curve_lr,
         weight_decay=args.hard3_curve_weight_decay,
         grad_clip=args.hard3_curve_grad_clip,
+        curve_pretrain_epochs=args.hard3_curve_pretrain_epochs,
+        curve_pretrain_lr=args.hard3_curve_pretrain_lr,
+        real_sample_fraction=args.hard3_curve_real_sample_fraction,
+        curve_checkpoint_weight=args.hard3_curve_checkpoint_weight,
         curve_sigma_mm=args.hard3_curve_sigma_mm,
         point_sigma_lm0_mm=args.hard3_curve_point_sigma_lm0,
         point_sigma_gonion_mm=args.hard3_curve_point_sigma_gonion,
         pseudo_curve_weight=args.hard3_curve_pseudo_weight,
         curve_bce_weight=args.hard3_curve_bce_weight,
         curve_dice_weight=args.hard3_curve_dice_weight,
+        curve_distance_weight=args.hard3_curve_distance_weight,
         listwise_weight=args.hard3_curve_listwise_weight,
         coordinate_weight=args.hard3_curve_coordinate_weight,
         clinical_weight=args.hard3_curve_clinical_weight,
@@ -736,6 +761,15 @@ def hard3_curve_config_from_args(args):
         temperature=args.hard3_curve_temperature,
         annotation_manifest=args.hard3_curve_annotation_manifest,
         minimum_annotated_samples=args.hard3_curve_min_annotated_samples,
+        publication_minimum_annotated_samples=(
+            args.hard3_curve_publication_min_annotated_samples
+        ),
+        maximum_annotation_surface_distance_mm=(
+            args.hard3_curve_max_annotation_surface_distance_mm
+        ),
+        maximum_landmark_curve_distance_mm=(
+            args.hard3_curve_max_landmark_curve_distance_mm
+        ),
         allow_pseudo_curves=args.hard3_curve_allow_pseudo,
         maximum_step_lm0=args.hard3_structured_max_step_lm0,
         maximum_step_gonion=args.hard3_structured_max_step_gonion,
@@ -778,7 +812,7 @@ def hard3_artifact_contract(args):
         name, version = hard3_dual_view_revision(args)
         return name, version, "hard3_dual_view_model.pth"
     if mode == "curve_supervised":
-        return "curve_supervised_hard3_v1", 15, "curve_hard3_model.pth"
+        return "curve_supervised_hard3_v2", 16, "curve_hard3_model.pth"
     return "hard3_structured", 2, "hard3_structured_model.pth"
 
 
@@ -1289,7 +1323,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             hard3_name, _, _ = hard3_artifact_contract(args)
             hard3_output_dir = fold_dir / hard3_name
             hard3_config = hard3_curve_config_from_args(args)
-            if hard3_config.minimum_annotated_samples <= 0:
+            if hard3_config.run_mode == "pseudo":
                 print(
                     "Curve-H3 is running in pseudo-curve development mode; "
                     "this result is not publication-ready.",

@@ -145,8 +145,17 @@ class CurveFirstHard3Net(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
-        self.landmark_head = nn.Sequential(
+        self.support_encoder = nn.Sequential(
             nn.Linear(hidden * 2 + 1, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.support_graph = SurfaceGraphBlock(hidden, dropout)
+        self.landmark_head = nn.Sequential(
+            nn.Linear(hidden * 3 + 1, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -208,9 +217,31 @@ class CurveFirstHard3Net(nn.Module):
         context[:, 1:3] = context[:, 1:3] + bilateral
         expanded_context = context[:, :, None].expand(-1, -1, encoded.shape[2], -1)
         curve_logits = self.curve_head(encoded + expanded_context).squeeze(-1)
+        curve_probability = torch.sigmoid(curve_logits).masked_fill(
+            ~candidate_mask, 0.0
+        )
+        support = self.support_encoder(
+            torch.cat([encoded, expanded_context, curve_probability[..., None]], dim=-1)
+        )
+        # The second graph pass is explicitly conditioned on predicted curve
+        # membership. It lets the landmark head reason along the support curve
+        # instead of treating the complete 2D ROI as an unordered candidate set.
+        support = support * (0.25 + curve_probability[..., None])
+        support = self.support_graph(
+            support,
+            geometry,
+            neighbor_index,
+            neighbor_mask,
+            candidate_mask,
+        )
         landmark_logits = self.landmark_head(
             torch.cat(
-                [encoded, expanded_context, torch.sigmoid(curve_logits)[..., None]],
+                [
+                    encoded,
+                    support,
+                    expanded_context,
+                    curve_probability[..., None],
+                ],
                 dim=-1,
             )
         ).squeeze(-1)

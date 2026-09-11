@@ -251,7 +251,9 @@ V8-V13 serisinde aday oracle hatası düşük kalmasına rağmen seçici hatası
 genellenemediği için, sonraki deney bağımsız bir curve-first hedef kullanır.
 `--hard3-refiner-mode curve_supervised` seçeneği Trichion için saç çizgisini,
 LM21/22 için mandibular destek eğrilerini öğrenir ve landmarkı bu eğri üzerinde
-lokalize eder. Uygulama, anotasyon şeması ve Colab komutları
+lokalize eder. V2; curve-only ön eğitim, gerçek/pseudo kaynak dengesi,
+curve-conditioned ikinci surface-graph geçişi ve eğitim öncesi mesh-koordinat
+QA'sı kullanır. Uygulama, anotasyon şeması ve Colab komutları
 [`curve_supervised_hard3_refinement/README_TR.md`](../curve_supervised_hard3_refinement/README_TR.md)
 dosyasındadır. Pseudo-curve presetleri yalnız geliştirme içindir; makale sonucu
 olarak raporlanmamalıdır.
