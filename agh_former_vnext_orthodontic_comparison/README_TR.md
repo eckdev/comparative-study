@@ -36,6 +36,12 @@ checkpoint'leri değiştirilmez.
   - `LM0=12 mm`, Gonion=`15 mm` düzeltme sınırı ve validation-kilitli blend.
 - Önceki pointwise ranker `--hard3-refiner-mode structured` ile ablation olarak korunur.
 - TTA, confidence calibration, bootstrap CI, landmark/sınıf/cinsiyet sonuçları.
+- Opsiyonel Core20-MVSC Stage 4:
+  - Hard3 V10 koordinatlarını bit düzeyinde dondurur,
+  - `LM1-LM20` için üç görünüm RGB-D/geometri FPN'i ve altı anatomik head kullanır,
+  - hedef landmarkı girdiden çıkaran train-only conditional Gaussian prior'ı
+    inner OOF ile fit eder,
+  - top-8 soft coordinate, confidence ve base/proposal gate üretir.
 
 ## Bilimsel protokol
 
@@ -150,6 +156,24 @@ Fold 1 kabul kapısını geçerse yayın koşusu:
 !python -u colab_run_aghformer_vnext.py --preset cv --seed 42
 ```
 
+Core20-MVSC geliştirmesi için pahalı koşular şu sırayla açılır:
+
+```python
+!python -u colab_run_aghformer_vnext.py --preset core20_preflight --seed 42
+!python -u colab_run_aghformer_vnext.py --preset core20_fold1 --seed 42
+```
+
+Fold 1'de Core20 `<=1.70 mm`, bootstrap `P(improved)>=0.95` ve anatomik grup
+regresyonu `<=0.10 mm` ise:
+
+```python
+!python -u colab_run_aghformer_vnext.py --preset core20_cv --seed 42
+```
+
+Bu üç preset Hard3 için bugüne kadarki en iyi Fold 1 sonucu veren V10'u
+(`crossfit_set_context`) kilitler. Ayrıntılı mimari ve çıktı sözleşmesi
+`core20_mvsc_refinement/README_TR.md` dosyasındadır.
+
 `cv` preset'i önce aynı run klasöründeki
 `fold_1/hard3_stage3_decision.json` dosyasını okur. `hard3_fold1` kapısı başarıyla
 geçilmemişse pahalı beş-fold koşuyu bilinçli olarak durdurur; bu bir çalışma hatası
@@ -233,6 +257,12 @@ fold_*/hard3_dual_view_v13/hard3_blend_selection.json
 fold_*/hard3_dual_view_v13/hard3_dual_view_training_report.json
 fold_*/hard3_dual_view_v13/metrics_val.json
 fold_*/hard3_stage3_decision.json
+fold_*/core20_mvsc_v1/best_model.pth
+fold_*/core20_mvsc_v1/spatial_prior.json
+fold_*/core20_mvsc_v1/core20_stage4_decision.json
+fold_*/core20_mvsc_v1/core20_metrics_val.json
+fold_*/core20_mvsc_v1/core20_metrics_test.json
+fold_*/core20_mvsc_v1/anatomical_group_metrics_*.csv
 fold_*/split_and_leakage_report.json
 summary_fold_metrics.csv
 summary_metrics.json

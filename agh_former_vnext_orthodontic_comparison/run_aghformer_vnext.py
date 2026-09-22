@@ -31,6 +31,17 @@ from curve_supervised_hard3_refinement import (
     CurveHard3Config,
     fit_or_load_curve_hard3_refiner,
 )
+from core20_mvsc_refinement import (
+    Core20MVSCConfig,
+    apply_core20_refinement,
+    calibrate_core20_policy,
+    fit_or_load_core20_refiner,
+    run_core20_preflight,
+)
+from core20_mvsc_refinement.refiner import (
+    write_core20_reports,
+    write_core20_split_report,
+)
 from all23_rgb_geodesic_cascade.anatomy import (
     ANATOMICAL_EDGES,
     CORE20,
@@ -467,6 +478,36 @@ def build_parser():
     parser.add_argument("--hard3-curve-bilateral-weight", type=float, default=0.10)
     parser.add_argument("--hard3-curve-confidence-weight", type=float, default=0.05)
     parser.add_argument("--hard3-curve-temperature", type=float, default=0.75)
+    parser.add_argument("--core20-mvsc", action="store_true")
+    parser.add_argument(
+        "--core20-mvsc-ablation", choices=("C1", "C2", "C3", "C4"), default="C4"
+    )
+    parser.add_argument("--core20-mvsc-folds", type=int, default=5)
+    parser.add_argument("--core20-mvsc-epochs", type=int, default=120)
+    parser.add_argument("--core20-mvsc-min-epochs", type=int, default=40)
+    parser.add_argument("--core20-mvsc-patience", type=int, default=25)
+    parser.add_argument("--core20-mvsc-batch-size", type=int, default=32)
+    parser.add_argument("--core20-mvsc-image-size", type=int, default=96)
+    parser.add_argument("--core20-mvsc-width", type=int, default=48)
+    parser.add_argument("--core20-mvsc-dropout", type=float, default=0.10)
+    parser.add_argument("--core20-mvsc-lr", type=float, default=3e-4)
+    parser.add_argument("--core20-mvsc-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--core20-mvsc-grad-clip", type=float, default=1.0)
+    parser.add_argument("--core20-mvsc-coordinate-topk", type=int, default=8)
+    parser.add_argument("--core20-mvsc-coordinate-temperature", type=float, default=0.5)
+    parser.add_argument("--core20-mvsc-color-noise", type=float, default=0.02)
+    parser.add_argument("--core20-mvsc-candidate-dropout", type=float, default=0.05)
+    parser.add_argument("--core20-mvsc-hard-negative-count", type=int, default=16)
+    parser.add_argument("--core20-mvsc-prior-l2-grid", default="0.1,1,10,100")
+    parser.add_argument("--core20-mvsc-target-ale", type=float, default=1.70)
+    parser.add_argument("--core20-mvsc-stretch-ale", type=float, default=1.647)
+    parser.add_argument(
+        "--core20-mvsc-min-improvement-probability", type=float, default=0.95
+    )
+    parser.add_argument(
+        "--core20-mvsc-max-group-regression-mm", type=float, default=0.10
+    )
+    parser.add_argument("--core20-mvsc-blend-grid", default="0,0.25,0.5,0.75,1")
     parser.add_argument("--no-tta", dest="tta", action="store_false")
     parser.add_argument(
         "--no-tta-validation", dest="tta_validation", action="store_false"
@@ -493,12 +534,57 @@ def vnext_signature(args, splits):
             for key, value in vars(args).items()
             if key not in ignored
             and not key.startswith("hard3_")
+            and not key.startswith("core20_")
             and isinstance(value, (str, int, float, bool, type(None)))
         },
         "splits": {name: list(values) for name, values in splits.items()},
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def core20_config_from_args(args):
+    return Core20MVSCConfig(
+        enabled=args.core20_mvsc,
+        ablation=args.core20_mvsc_ablation,
+        folds=args.core20_mvsc_folds,
+        epochs=args.core20_mvsc_epochs,
+        min_epochs=args.core20_mvsc_min_epochs,
+        patience=args.core20_mvsc_patience,
+        batch_size=args.core20_mvsc_batch_size,
+        image_size=args.core20_mvsc_image_size,
+        width=args.core20_mvsc_width,
+        dropout=args.core20_mvsc_dropout,
+        lr=args.core20_mvsc_lr,
+        weight_decay=args.core20_mvsc_weight_decay,
+        grad_clip=args.core20_mvsc_grad_clip,
+        coordinate_topk=args.core20_mvsc_coordinate_topk,
+        coordinate_temperature=args.core20_mvsc_coordinate_temperature,
+        color_noise=args.core20_mvsc_color_noise,
+        candidate_dropout=args.core20_mvsc_candidate_dropout,
+        hard_negative_count=args.core20_mvsc_hard_negative_count,
+        prior_folds=args.core20_mvsc_folds,
+        prior_l2_grid=tuple(
+            float(value.strip())
+            for value in args.core20_mvsc_prior_l2_grid.split(",")
+            if value.strip()
+        ),
+        target_core20_ale=args.core20_mvsc_target_ale,
+        stretch_core20_ale=args.core20_mvsc_stretch_ale,
+        minimum_improvement_probability=(
+            args.core20_mvsc_min_improvement_probability
+        ),
+        maximum_group_regression_mm=(args.core20_mvsc_max_group_regression_mm),
+        blend_grid=tuple(
+            float(value.strip())
+            for value in args.core20_mvsc_blend_grid.split(",")
+            if value.strip()
+        ),
+        bootstrap_iters=args.bootstrap_iters,
+        mixed_precision=args.mixed_precision,
+        amp_dtype=args.amp_dtype,
+        seed=args.seed,
+    )
 
 
 def hard3_config_from_args(args):
@@ -1166,6 +1252,7 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
     model.set_refinement_gate_trainable(False)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     hard3_parameter_count = 0
+    core20_parameter_count = 0
     print(f"AGH-Former vNext parameters: {parameter_count:,}", flush=True)
     loss_weights = LossWeights(
         heatmap=args.heatmap_weight,
@@ -1446,19 +1533,103 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
                 f"clinical_both={proposal['clinical_both_coverage']:.3f}",
                 flush=True,
             )
+    core20_refiner = None
+    core20_policy = None
+    core20_output_dir = None
+    core20_report = {"enabled": False, "reason": "disabled_by_argument"}
+    if getattr(args, "core20_mvsc", False):
+        core20_output_dir = fold_dir / "core20_mvsc_v1"
+        core20_config = core20_config_from_args(args)
+        print(
+            f"Starting Core20-MVSC Stage 4 ({core20_config.ablation}); "
+            "Hard3 coordinates are frozen...",
+            flush=True,
+        )
+        hard3_before = validation["prediction"][:, list(HARD3)].copy()
+        core20_refiner = fit_or_load_core20_refiner(
+            datasets["train"], core20_output_dir, core20_config, device
+        )
+        core20_parameter_count = int(
+            core20_refiner.report.get(
+                "parameter_count",
+                sum(parameter.numel() for parameter in core20_refiner.model.parameters()),
+            )
+        )
+        core20_validation = core20_refiner.predict(
+            datasets["val"], validation, "Core20-MVSC validation patches"
+        )
+        core20_policy = calibrate_core20_policy(
+            validation, core20_validation, core20_config
+        )
+        validation = apply_core20_refinement(
+            validation, core20_validation, core20_policy
+        )
+        np.testing.assert_array_equal(
+            validation["prediction"][:, list(HARD3)], hard3_before
+        )
+        calibration = calibrate_confidence(
+            validation["log_var"], validation["errors"]
+        )
+        validation_metrics = save_evaluation(
+            fold_dir,
+            "val",
+            validation,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        core20_validation_metrics = save_evaluation(
+            core20_output_dir,
+            "val",
+            validation,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        write_core20_reports(core20_output_dir, core20_policy, "val")
+        write_core20_split_report(
+            core20_output_dir,
+            "val",
+            validation,
+            core20_validation,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        core20_report = {
+            "enabled": True,
+            "version": "Core20-MVSC-v1",
+            "ablation": core20_config.ablation,
+            "training": core20_refiner.report,
+            "policy": core20_policy,
+            "validation": core20_validation_metrics,
+            "hard3_byte_identical": True,
+        }
+        print(
+            "Core20-MVSC Stage 4: "
+            f"accepted={core20_policy['accepted']} "
+            f"Core20={core20_policy['base_core20']['ale']:.4f}->"
+            f"{core20_policy['selected_core20']['ale']:.4f} "
+            f"oracle={core20_policy['candidate_oracle_core20']['ale']:.4f} "
+            f"P(improved)={core20_policy['bootstrap_vs_base']['probability_improved']:.3f} "
+            f"run_full_cv={core20_policy['run_full_cv']}",
+            flush=True,
+        )
     if args.validation_only:
         _, postprocess_version, _ = hard3_artifact_contract(args)
         result = {
             "postprocess_version": postprocess_version,
             "stage2_signature": args.stage2_signature,
             "parameter_count": parameter_count,
-            "total_inference_parameter_count": parameter_count + hard3_parameter_count,
+            "total_inference_parameter_count": (
+                parameter_count + hard3_parameter_count + core20_parameter_count
+            ),
             "training": training,
             "hard3_structured": hard3_report,
             "shape_prior": prior_report,
             "neural_validation": neural_validation_metrics,
             "shape_prior_validation": shape_prior_validation_metrics,
             "stage3_decision": stage3_decision,
+            "core20_stage4": core20_report,
             "validation": validation_metrics,
             "test": None,
         }
@@ -1537,6 +1708,32 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
             args.bootstrap_iters,
             args.seed,
         )
+    core20_test_metrics = None
+    if core20_refiner is not None:
+        hard3_before = test["prediction"][:, list(HARD3)].copy()
+        core20_test = core20_refiner.predict(
+            datasets["test"], test, "Core20-MVSC test patches"
+        )
+        test = apply_core20_refinement(test, core20_test, core20_policy)
+        np.testing.assert_array_equal(
+            test["prediction"][:, list(HARD3)], hard3_before
+        )
+        core20_test_metrics = save_evaluation(
+            core20_output_dir,
+            "test",
+            test,
+            calibration,
+            args.bootstrap_iters,
+            args.seed,
+        )
+        write_core20_split_report(
+            core20_output_dir,
+            "test",
+            test,
+            core20_test,
+            args.bootstrap_iters,
+            args.seed,
+        )
     test_metrics = save_evaluation(
         fold_dir,
         "test",
@@ -1550,7 +1747,9 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         "postprocess_version": postprocess_version,
         "stage2_signature": args.stage2_signature,
         "parameter_count": parameter_count,
-        "total_inference_parameter_count": parameter_count + hard3_parameter_count,
+        "total_inference_parameter_count": (
+            parameter_count + hard3_parameter_count + core20_parameter_count
+        ),
         "training": training,
         "hard3_structured": {
             **hard3_report,
@@ -1562,6 +1761,10 @@ def run_fold(samples, splits, args, fold_dir, device, preprocessing_dir=None):
         "shape_prior_validation": shape_prior_validation_metrics,
         "shape_prior_test": shape_prior_test_metrics,
         "stage3_decision": stage3_decision,
+        "core20_stage4": {
+            **core20_report,
+            "test": core20_test_metrics,
+        },
         "validation": validation_metrics,
         "test": test_metrics,
     }
@@ -1586,10 +1789,16 @@ def aggregate(output_dir, summaries, elapsed):
             .get("training", {})
             .get("training_seconds", 0.0)
         )
+        core20_training_seconds = (
+            result.get("core20_stage4", {})
+            .get("training", {})
+            .get("training_seconds", 0.0)
+        )
         training_seconds = (
             result["training"].get("training_seconds", 0.0)
             + result["training"].get("separate_gate", {}).get("training_seconds", 0.0)
             + hard3_training_seconds
+            + core20_training_seconds
         )
         rows.append(
             {
@@ -1668,6 +1877,24 @@ def load_completed_fold(fold_dir, args, splits):
         ):
             print(
                 f"Completed Stage 2 found, but Hard3 Stage 3 is missing: {fold_dir}",
+                flush=True,
+            )
+            return None
+    if getattr(args, "core20_mvsc", False):
+        core20_root = fold_dir / "core20_mvsc_v1"
+        core20_required = (
+            core20_root / "best_model.pth",
+            core20_root / "spatial_prior.json",
+            core20_root / "core20_stage4_decision.json",
+            core20_root / "metrics_val.json",
+            core20_root / "metrics_test.json",
+        )
+        if (
+            not result.get("core20_stage4", {}).get("enabled", False)
+            or not all(path.exists() for path in core20_required)
+        ):
+            print(
+                f"Completed upstream stages found, but Core20 Stage 4 is missing: {fold_dir}",
                 flush=True,
             )
             return None
@@ -1754,7 +1981,7 @@ def main():
             flush=True,
         )
         if args.preflight_only:
-            prepare_fold(
+            datasets, _ = prepare_fold(
                 samples,
                 splits,
                 args,
@@ -1763,6 +1990,14 @@ def main():
                 enforce_oracle_gate=False,
                 preprocessing_dir=preprocessing_dir,
             )
+            if args.core20_mvsc:
+                run_core20_preflight(
+                    datasets["train"],
+                    datasets["val"],
+                    fold_dir / "core20_mvsc_v1",
+                    core20_config_from_args(args),
+                    device,
+                )
             print(f"Preflight fold {fold_index} complete", flush=True)
             continue
         result = load_completed_fold(fold_dir, args, splits)

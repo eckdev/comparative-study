@@ -36,6 +36,25 @@ def require_hard3_development_gate(output_dir):
     return decision
 
 
+def require_core20_development_gate(output_dir):
+    decision_path = Path(output_dir) / "fold_1/core20_mvsc_v1/core20_stage4_decision.json"
+    if not decision_path.exists():
+        raise RuntimeError(
+            "Fold 1 Core20-MVSC gate is missing. Run --preset core20_fold1 first: "
+            f"{decision_path}"
+        )
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    if not decision.get("run_full_cv", False):
+        failed = [
+            name for name, passed in decision.get("checks", {}).items() if not passed
+        ]
+        raise RuntimeError(
+            "Fold 1 Core20-MVSC gate failed; four expensive folds remain blocked. "
+            f"Failed checks: {failed or ['run_full_cv']}"
+        )
+    return decision
+
+
 def command_for(preset, seed, fold_indices):
     script = (
         CODE_ROOT / "agh_former_vnext_orthodontic_comparison/run_aghformer_vnext.py"
@@ -301,9 +320,42 @@ def command_for(preset, seed, fold_indices):
         command.extend(["--preprocessing-root", str(PREPROCESSING_ROOT)])
     if fold_indices:
         command.extend(["--fold-indices", fold_indices])
-    if preset == "cv_preflight":
+    if preset.startswith("core20_"):
+        command.extend(
+            [
+                "--core20-mvsc",
+                "--core20-mvsc-ablation",
+                "C4",
+                "--core20-mvsc-epochs",
+                "120",
+                "--core20-mvsc-min-epochs",
+                "40",
+                "--core20-mvsc-patience",
+                "25",
+                "--core20-mvsc-batch-size",
+                "32",
+                "--core20-mvsc-image-size",
+                "96",
+                "--core20-mvsc-width",
+                "48",
+                "--core20-mvsc-lr",
+                "0.0003",
+                "--core20-mvsc-coordinate-topk",
+                "8",
+                "--core20-mvsc-target-ale",
+                "1.70",
+                "--core20-mvsc-stretch-ale",
+                "1.647",
+                # Freeze the empirically strongest Hard3 revision (V10).
+                "--hard3-dual-view-decoder-mode",
+                "crossfit_set_context",
+            ]
+        )
+    if preset in ("cv_preflight", "core20_preflight"):
         command.append("--preflight-only")
-    elif preset in ("dev_fold1", "hard3_fold1"):
+        if preset == "core20_preflight":
+            command.extend(["--fold-indices", "1"])
+    elif preset in ("dev_fold1", "hard3_fold1", "core20_fold1"):
         command.extend(["--fold-indices", "1", "--validation-only"])
     return command
 
@@ -312,7 +364,16 @@ def main():
     parser = argparse.ArgumentParser(description="Colab runner for AGH-Former vNext")
     parser.add_argument(
         "--preset",
-        choices=("smoke", "cv_preflight", "dev_fold1", "hard3_fold1", "cv"),
+        choices=(
+            "smoke",
+            "cv_preflight",
+            "dev_fold1",
+            "hard3_fold1",
+            "cv",
+            "core20_preflight",
+            "core20_fold1",
+            "core20_cv",
+        ),
         default="smoke",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -324,6 +385,10 @@ def main():
     command = command_for(args.preset, args.seed, args.fold_indices)
     if args.preset == "cv":
         require_hard3_development_gate(RUN_ROOT / f"publication_cv_seed{args.seed}")
+    elif args.preset == "core20_cv":
+        require_core20_development_gate(
+            RUN_ROOT / f"publication_cv_seed{args.seed}"
+        )
     print("Working directory:", CODE_ROOT, flush=True)
     print("Running:", " ".join(map(str, command)), flush=True)
     environment = os.environ.copy()

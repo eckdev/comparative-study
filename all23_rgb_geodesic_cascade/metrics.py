@@ -148,6 +148,10 @@ def prediction_rows(outputs, confidence):
                 coordinate_names.append("pre_hard3_prediction")
             if "hard3_candidate" in outputs:
                 coordinate_names.append("hard3_candidate")
+            if "pre_core20_prediction" in outputs:
+                coordinate_names.append("pre_core20_prediction")
+            if "core20_candidate" in outputs:
+                coordinate_names.append("core20_candidate")
             for name in coordinate_names:
                 for axis_index, axis in enumerate(("x", "y", "z")):
                     row[f"{name}_{axis}"] = float(outputs[name][sample_index, landmark, axis_index])
@@ -165,6 +169,12 @@ def prediction_rows(outputs, confidence):
                 "hard3_reliability",
                 "hard3_ensemble_spread",
                 "hard3_effective_alpha",
+                "core20_confidence",
+                "core20_gate_alpha",
+                "core20_entropy",
+                "core20_margin",
+                "core20_prior_disagreement",
+                "core20_effective_alpha",
             ):
                 if name in outputs:
                     row[name] = float(outputs[name][sample_index, landmark])

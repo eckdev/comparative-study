@@ -625,6 +625,9 @@ def test_hybrid_roi_recovers_target_across_disconnected_mesh(tmp_path):
         roi_mode="hybrid", euclidean_radius_scale=1.25, multi_seed_count=3,
     )
     with np.load(geodesic_path) as geodesic, np.load(hybrid_path) as hybrid:
+        assert "roi_center_distance" in geodesic.files
+        assert "roi_center_distance" in hybrid.files
+        assert np.isfinite(hybrid["roi_center_distance"]).all()
         assert float(hybrid["oracle_error"].max()) < float(geodesic["oracle_error"].min())
 
 

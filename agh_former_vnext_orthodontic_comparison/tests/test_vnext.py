@@ -25,6 +25,8 @@ from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import (
     vnext_signature,
 )
 from agh_former_vnext_orthodontic_comparison.colab_run_aghformer_vnext import (
+    command_for,
+    require_core20_development_gate,
     require_hard3_development_gate,
 )
 from agh_former_vnext_orthodontic_comparison.shape_prior import TrainOnlyShapePrior
@@ -616,6 +618,87 @@ def test_hard3_options_do_not_invalidate_expensive_stage2_signature():
         hard3_stage3_full_cv_max_overall=2.10,
     )
     assert vnext_signature(first, splits) == vnext_signature(second, splits)
+
+
+def test_core20_options_do_not_invalidate_expensive_stage2_signature():
+    splits = {"train": ["a"], "val": ["b"], "test": ["c"]}
+    first = SimpleNamespace(
+        width=128,
+        epochs=220,
+        output_dir="first",
+        core20_mvsc=False,
+        core20_mvsc_width=24,
+        core20_mvsc_target_ale=1.80,
+    )
+    second = SimpleNamespace(
+        width=128,
+        epochs=220,
+        output_dir="second",
+        core20_mvsc=True,
+        core20_mvsc_width=64,
+        core20_mvsc_target_ale=1.60,
+    )
+    assert vnext_signature(first, splits) == vnext_signature(second, splits)
+
+
+def test_completed_fold_cache_requires_core20_artifacts_when_enabled(tmp_path):
+    args = SimpleNamespace(
+        resume_stage2=True,
+        force_stage2_retrain=False,
+        validation_only=False,
+        hard3_structured=False,
+        core20_mvsc=True,
+        output_dir="ignored",
+    )
+    splits = {"train": ["a"], "val": ["b"], "test": ["c"]}
+    for name in ("metrics_val.json", "metrics_test.json", "predictions_test.csv"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    result = {
+        "stage2_signature": vnext_signature(args, splits),
+        "hard3_structured": {"enabled": False},
+        "core20_stage4": {"enabled": True},
+    }
+    (tmp_path / "run_summary.json").write_text(json.dumps(result), encoding="utf-8")
+    assert load_completed_fold(tmp_path, args, splits) is None
+
+    core20 = tmp_path / "core20_mvsc_v1"
+    core20.mkdir()
+    for name in (
+        "best_model.pth",
+        "spatial_prior.json",
+        "core20_stage4_decision.json",
+        "metrics_val.json",
+        "metrics_test.json",
+    ):
+        (core20 / name).write_bytes(b"artifact")
+    assert load_completed_fold(tmp_path, args, splits) == result
+
+
+def test_core20_colab_presets_lock_v10_and_gate_full_cv(tmp_path):
+    command = list(map(str, command_for("core20_fold1", 42, None)))
+    assert "--core20-mvsc" in command
+    decoder_positions = [
+        index
+        for index, value in enumerate(command)
+        if value == "--hard3-dual-view-decoder-mode"
+    ]
+    assert command[decoder_positions[-1] + 1] == "crossfit_set_context"
+    assert command[-3:] == ["--fold-indices", "1", "--validation-only"]
+
+    fold = tmp_path / "fold_1/core20_mvsc_v1"
+    fold.mkdir(parents=True)
+    decision_path = fold / "core20_stage4_decision.json"
+    decision_path.write_text(
+        json.dumps({"run_full_cv": False, "checks": {"target": False}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="four expensive folds remain blocked"):
+        require_core20_development_gate(tmp_path)
+    decision_path.write_text(
+        json.dumps({"run_full_cv": True, "checks": {"target": True}}),
+        encoding="utf-8",
+    )
+    assert require_core20_development_gate(tmp_path)["run_full_cv"] is True
 
 
 def test_stage3_decision_exposes_two_mm_hard3_budget():

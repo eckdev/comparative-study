@@ -430,7 +430,7 @@ def build_roi_cache(
         indices=np.concatenate([coarse_seeds.reshape(-1), expert_seeds]),
         limit=max(90.0, max_radius * 2.0),
     ).astype(np.float32)
-    roi_indices, roi_masks, targets, regions, oracles = [], [], [], [], []
+    roi_indices, roi_masks, targets, regions, oracles, center_distances = [], [], [], [], [], []
     geodesic_counts, euclidean_counts = [], []
     for landmark in range(NUM_LANDMARKS):
         radius = roi_radius_mm(landmark) * radius_scale
@@ -472,6 +472,10 @@ def build_roi_cache(
             roi_points,
             seed + landmark * 997,
         )
+        center_distance_lookup = np.full(len(points), np.inf, dtype=np.float32)
+        center_distance_lookup[candidates] = ranking_distance
+        selected_center_distance = center_distance_lookup[selected]
+        selected_center_distance[~mask] = 0.0
         # Expert-distance heatmaps use mesh geodesics where connected, Euclidean fallback otherwise.
         expert_offset = NUM_LANDMARKS * seed_count
         selected_distances = distance_matrix[expert_offset + landmark, selected]
@@ -490,6 +494,7 @@ def build_roi_cache(
         targets.append(target)
         regions.append(region)
         oracles.append(float(np.min(np.linalg.norm(points[selected[mask]] - landmarks[landmark], axis=1))))
+        center_distances.append(selected_center_distance)
     np.savez_compressed(
         path,
         roi_index=np.stack(roi_indices),
@@ -497,6 +502,7 @@ def build_roi_cache(
         heatmap_target=np.stack(targets),
         region_target=np.stack(regions),
         oracle_error=np.asarray(oracles, dtype=np.float32),
+        roi_center_distance=np.stack(center_distances).astype(np.float32),
         geodesic_candidate_count=np.asarray(geodesic_counts, dtype=np.int32),
         euclidean_candidate_count=np.asarray(euclidean_counts, dtype=np.int32),
     )
@@ -794,6 +800,13 @@ class RGBGeodesicDataset(Dataset):
         heatmap_target = roi["heatmap_target"]
         region_target = roi["region_target"]
         oracle_error = roi["oracle_error"]
+        roi_center_distance = roi.get("roi_center_distance")
+        if roi_center_distance is None:
+            roi_points = points[roi_index]
+            roi_center_distance = np.linalg.norm(
+                roi_points - coarse[:, None], axis=-1
+            ).astype(np.float32)
+            roi_center_distance[~roi_mask] = 0.0
         if self.training and self.mirror_probability > 0 and rng.random() < self.mirror_probability:
             center_x = float(self.mean[0])
             points[:, 0] = 2.0 * center_x - points[:, 0]
@@ -809,6 +822,7 @@ class RGBGeodesicDataset(Dataset):
             heatmap_target = heatmap_target[permutation]
             region_target = region_target[permutation]
             oracle_error = oracle_error[permutation]
+            roi_center_distance = roi_center_distance[permutation]
         if not self.use_rgb:
             raw_features[:, 3:9] = 0.0
 
@@ -834,6 +848,9 @@ class RGBGeodesicDataset(Dataset):
             "heatmap_target": torch.from_numpy(heatmap_target.astype(np.float32)),
             "region_target": torch.from_numpy(region_target.astype(np.float32)),
             "oracle_error": torch.from_numpy(oracle_error.astype(np.float32)),
+            "roi_center_distance": torch.from_numpy(
+                roi_center_distance.astype(np.float32)
+            ),
             "sample_radius_scale": torch.tensor(sample_radius_scale, dtype=torch.float32),
         }
 
@@ -870,6 +887,19 @@ def collate_graphs(items):
         "heatmap_target": torch.stack([item["heatmap_target"] for item in items]),
         "region_target": torch.stack([item["region_target"] for item in items]),
         "oracle_error": torch.stack([item["oracle_error"] for item in items]),
+        "roi_center_distance": torch.stack(
+            [
+                item.get(
+                    "roi_center_distance",
+                    torch.linalg.norm(
+                        item["points"][item["roi_index"]]
+                        - item["coarse"][:, None],
+                        dim=-1,
+                    ),
+                )
+                for item in items
+            ]
+        ),
         "sample_radius_scale": torch.stack(
             [item.get("sample_radius_scale", torch.tensor(1.0)) for item in items]
         ),
