@@ -222,7 +222,8 @@ class Core20MVSCNet(nn.Module):
         for group_index, head in enumerate(self.group_heads):
             selected = group == group_index
             if selected.any():
-                logits[selected] = head(candidate_state[selected].float()).squeeze(-1)
+                group_logits = head(candidate_state[selected].float()).squeeze(-1)
+                logits[selected] = group_logits.to(dtype=logits.dtype)
         prior = self._normalize_prior(batch["prior_score"], mask)
         prior_weight = F.softplus(self.prior_weights[group])[:, None]
         if not self.use_spatial_prior:

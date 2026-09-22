@@ -92,6 +92,25 @@ def test_core20_model_and_full_loss_are_finite_without_batchnorm():
     )
 
 
+def test_core20_model_is_bfloat16_autocast_safe():
+    batch = synthetic_model_batch()
+    model = Core20MVSCNet(16, 28, width=24, dropout=0.0)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        outputs = model(batch)
+        loss, _, _ = _loss(
+            outputs,
+            batch,
+            Core20MVSCConfig(epochs=1, min_epochs=1, patience=1),
+        )
+    assert outputs["logits"].dtype == torch.float32
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
 def test_geometry_only_fallback_is_finite():
     batch = synthetic_model_batch()
     model = Core20MVSCNet(
