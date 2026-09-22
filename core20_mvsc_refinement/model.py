@@ -280,7 +280,8 @@ class Core20MVSCNet(nn.Module):
             dim=-1,
         )
         log_variance = self.log_variance_head(context).squeeze(-1).clamp(-4.0, 4.0)
-        gate_alpha = torch.sigmoid(self.gate_head(context).squeeze(-1))
+        gate_logit = self.gate_head(context).squeeze(-1)
+        gate_alpha = torch.sigmoid(gate_logit)
         if not self.use_confidence_gate:
             gate_alpha = torch.ones_like(gate_alpha)
         final = batch["base"].float() + gate_alpha[:, None] * (
@@ -294,6 +295,7 @@ class Core20MVSCNet(nn.Module):
             "probability": probability,
             "proposal": proposal,
             "final": final,
+            "gate_logit": gate_logit,
             "gate_alpha": gate_alpha,
             "confidence": confidence,
             "log_variance": log_variance,

@@ -297,7 +297,9 @@ def _loss(outputs, batch, config):
     regret = F.relu(final_error - base_error).square().mean() / 4.0
     gate_target = (proposal_error < base_error).float()
     gate_loss = (
-        F.binary_cross_entropy(outputs["gate_alpha"], gate_target)
+        F.binary_cross_entropy_with_logits(
+            outputs["gate_logit"].float(), gate_target
+        )
         if config.ablation == "C4"
         else torch.zeros((), device=final_error.device)
     )

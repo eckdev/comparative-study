@@ -103,6 +103,12 @@ def test_core20_model_is_bfloat16_autocast_safe():
             Core20MVSCConfig(epochs=1, min_epochs=1, patience=1),
         )
     assert outputs["logits"].dtype == torch.float32
+    torch.testing.assert_close(
+        outputs["gate_alpha"].float(),
+        torch.sigmoid(outputs["gate_logit"].float()),
+        rtol=2e-2,
+        atol=2e-2,
+    )
     assert torch.isfinite(loss)
     loss.backward()
     assert all(
