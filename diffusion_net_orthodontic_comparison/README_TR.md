@@ -63,6 +63,34 @@ PAL-Net, DiffusionNet ve PointNet++ karsilastirmasinda ayni 180 egitim, 60 valid
 --splits-json ../shared_splits/orthodontic_180_60_60_seed42.json
 ```
 
+## Leakage-Free 5-Fold Makale Kosusu
+
+AGH-Former vNext ile eslenmis ana DiffusionNet karsilastirmasi yeni runner ile
+calistirilir:
+
+```bash
+python -u colab_run_diffusionnet_cv.py --preset preflight --seed 42
+python -u colab_run_diffusionnet_cv.py --preset smoke --seed 42
+python -u colab_run_diffusionnet_cv.py --preset cv --seed 42
+```
+
+Bu protokol ortak `192/48/60` fold manifestini ve AGH preprocessing
+klasorundeki train-only, label-free rigid ICP matrislerini kullanir. Checkpoint
+`validation ALE` ile secilir; test etiketleri bundan sonra acilir. Tamamlanan
+foldlar tekrar egitilmez ve yarim kalan fold `last_model.pth` uzerinden devam
+eder.
+
+Varsayilan ana cikti:
+
+```text
+/content/drive/MyDrive/orthodontic/diffusion_runs/
+  diffusionnet_publication_cv_seed42/
+```
+
+Tek fold calistirmak icin `--fold-indices 1` kullanilabilir. Bes fold
+tamamlandiginda `summary_metrics.json`, pooled OOF metriklerini ve patient-level
+bootstrap guven araligini icerir.
+
 ## Çıktılar
 
 - `metrics.json`: PAL-Net raporlarıyla aynı ana metrik ailesinde ALE özeti.

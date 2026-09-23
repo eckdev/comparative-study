@@ -2,6 +2,40 @@
 
 Bu klasor DiffusionNet landmark lokalizasyonunu Google Colab GPU uzerinde calistirmak icin hazirlandi.
 
+## Makale Icin 5-Fold CV
+
+Kod ve Drive baglantisi hazirlandiktan sonra once fold ve label-free hizalama
+provenance kontrolunu calistirin:
+
+```python
+%cd /content/comparative-study/diffusion_net_orthodontic_comparison
+!python -u colab_run_diffusionnet_cv.py --preset preflight --seed 42
+```
+
+Kisa teknik test:
+
+```python
+!python -u colab_run_diffusionnet_cv.py --preset smoke --seed 42
+```
+
+Ana A100 kosusu:
+
+```python
+!python -u colab_run_diffusionnet_cv.py --preset cv --seed 42
+```
+
+Colab oturumu kesilirse ayni ana kosu komutunu tekrar calistirin. Tamamlanan
+foldlar atlanir; yarim kalan fold son tamamlanan epochtan devam eder. Foldlari
+ayri oturumlarda calistirmak icin `--fold-indices 1`, daha sonra
+`--fold-indices 2` seklinde ilerlenebilir.
+
+Ana ozet dosyasi:
+
+```text
+/content/drive/MyDrive/orthodontic/diffusion_runs/
+  diffusionnet_publication_cv_seed42/summary_metrics.json
+```
+
 ## Dosyalar
 
 - `run_orthodontic_diffusion.py`: Colab/yerel ortak egitim scripti.

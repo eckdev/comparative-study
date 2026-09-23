@@ -1,0 +1,46 @@
+{
+  "protocol_version": 1,
+  "status": "frozen_before_diffusionnet_outer_test_evaluation",
+  "model": "DiffusionNet",
+  "manifest": "shared_splits/orthodontic_5fold_192_48_60_seed42.json",
+  "manifest_sha256": "48e8e8d9c96a4eb1afd402962c21101d21c9dd5f3439d2a3cb6862418249f673",
+  "folds": 5,
+  "samples_per_fold": {
+    "train": 192,
+    "validation": 48,
+    "test": 60
+  },
+  "alignment": {
+    "source": "AGH/All-23 fold-specific preprocessing",
+    "method": "train-only label-free rigid mesh ICP",
+    "scale": false,
+    "expert_landmarks_used": false
+  },
+  "model_configuration": {
+    "surface_points": 12000,
+    "k_eig": 96,
+    "width": 192,
+    "blocks": 8,
+    "mlp_hidden_dims": [384],
+    "input_features": "xyz",
+    "loss_mode": "mask_bce",
+    "mask_radius_mm": 3.5,
+    "epochs": 220,
+    "minimum_epochs": 80,
+    "patience": 35,
+    "learning_rate": 0.001,
+    "checkpoint_metric": "validation_ALE"
+  },
+  "postprocess": {
+    "method": "topk_softmax",
+    "topk": 30,
+    "temperature": 1.0,
+    "selection_source": "locked from pre-CV development experiments"
+  },
+  "evaluation": {
+    "primary_metric": "all-23 ALE in millimetres",
+    "test_policy": "one evaluation after validation checkpoint lock",
+    "confidence_interval_unit": "patient",
+    "bootstrap_iterations": 10000
+  }
+}
