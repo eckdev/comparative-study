@@ -36,6 +36,39 @@ Ana ozet dosyasi:
   diffusionnet_publication_cv_seed42/summary_metrics.json
 ```
 
+## Sonuclari Ayrintili Inceleme Icin Indirme
+
+Bes fold tamamlandiktan sonra metrikleri, train/validation gecmislerini, OOF
+tahminlerini, split/leakage raporlarini ve label-free alignment provenance
+dosyalarini tek bir ZIP arsivinde indirmek icin Colab hucrelerinde sunlari
+calistirin:
+
+```python
+%cd /content/comparative-study/diffusion_net_orthodontic_comparison
+%run colab_download_diffusionnet_cv_results.py --download
+```
+
+Olusan varsayilan arsiv:
+
+```text
+/content/diffusionnet_publication_cv_seed42_analysis_bundle.zip
+```
+
+Arac ayrica `sample_error_summary.csv`, `worst_landmark_predictions.csv` ve
+`integrity_report.json` uretir. Bunlar 172 mm gibi uc hatalarin fold, ornek ve
+landmark kaynagini dogrudan gosterir. Varsayilan arsiv checkpoint, mesh, point
+cache ve operator cache icermez. Checkpointler de gerekiyorsa komuta
+`--include-checkpoints` eklenebilir; bu durumda arsiv belirgin bicimde buyur.
+
+Tarayici indirmesi baslamazsa arsivi once terminal komutuyla olusturup sonraki
+hucrede indirin:
+
+```python
+!python -u colab_download_diffusionnet_cv_results.py
+from google.colab import files
+files.download('/content/diffusionnet_publication_cv_seed42_analysis_bundle.zip')
+```
+
 ## Dosyalar
 
 - `run_orthodontic_diffusion.py`: Colab/yerel ortak egitim scripti.
