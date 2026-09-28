@@ -7,7 +7,10 @@ Bu klasör, `data/dataset` altındaki sınıflandırılmış 3B hasta yüz meshl
 - `upstream/`: GitHub'dan indirilen PAL-Net kodu.
 - `upstream/src/datasets/orthodontic_dataset.py`: Bu veri setinin `Class*/men|women/*.ply` ve `Class*-Landmark/*.txt` düzenini PAL-Net formatına çeviren dataset adapter'ı.
 - `upstream/run_orthodontic.py`: Eğitim, doğrulama, test ve ALE raporlama script'i.
+- `colab_run_palnet_cv.py`: Ortak 5-fold manifest ve fold-specific label-free ICP ile Colab çalıştırıcısı.
+- `publication_cv_protocol.json`: Makale koşusundan önce dondurulmuş PAL-Net hiperparametreleri ve değerlendirme protokolü.
 - `colab_palnet_orthodontic_gpu.ipynb`: Google Colab GPU uzerinde calistirilacak notebook.
+- `colab_palnet_5fold.ipynb`: Leakage-free makale 5-fold koşusu için hazır Colab notebook'u.
 - `COLAB_TR.md`: Colab Drive yapisi ve kosu presetleri.
 - `runs/`: Çalıştırmaların model, metrik ve tahmin çıktıları buraya yazılır.
 
@@ -85,11 +88,26 @@ python ensemble_palnet_predictions.py \
 
 ## Ortak Split
 
-DiffusionNet ve PointNet++ ile adil karsilastirma icin PAL-Net de ayni split dosyasi ile calistirilmalidir:
+Makaledeki ana karşılaştırma için PAL-Net, DiffusionNet ve AGH-Former vNext ile aynı outer fold örneklerini kullanır:
 
 ```bash
---splits-json ../../shared_splits/orthodontic_180_60_60_seed42.json
+shared_splits/orthodontic_5fold_192_48_60_seed42.json
 ```
+
+Her fold `192 train / 48 validation / 60 outer-test` içerir. Beş outer-test kümesi birbirinden ayrıdır ve 300 örneğin her biri tam bir kez test edilir. Hizalama, ilgili fold'un yalnız train meshleriyle fit edilen, ölçek değiştirmeyen ve uzman landmark kullanmayan rigid mesh ICP dönüşümleridir.
+
+Eski `orthodontic_180_60_60_seed42.json` koşuları geliştirme/baseline geçmişi olarak korunur; makaledeki 5-fold sonuç tablosuna doğrudan karıştırılmamalıdır.
+
+Colab 5-fold akışı:
+
+```bash
+cd /content/comparative-study/palnet_orthodontic_comparison
+python -u colab_run_palnet_cv.py --preset preflight --seed 42
+python -u colab_run_palnet_cv.py --preset smoke --seed 42
+python -u colab_run_palnet_cv.py --preset cv --seed 42
+```
+
+`cv` preset'i dondurulmuş PAL-Net ayarlarını kullanır: `patch_size=1000`, `surface_points=100000`, `epochs=220`, `min_epochs=80`, `patience=35`, `batch_size=2`. Checkpoint seçimi validation snapped ALE ile yapılır; outer-test patch'leri checkpoint kilitlenmeden hazırlanmaz.
 
 ## Google Colab GPU
 
@@ -121,4 +139,9 @@ palnet_orthodontic_comparison/runs/orthodontic_palnet/
 - `gender_metrics_test.csv`: Female / male bazli performans.
 - `difficult_landmarks_test.csv`: En zor landmark siralamasi.
 - `splits.json`: Train/validation/test ayrımı ve landmark dosyası eksik olan meshler.
-- `best_model.pth`: En iyi validation kaybına sahip PAL-Net ağırlıkları.
+- `best_model.pth`: 5-fold protokolünde en iyi validation snapped ALE'ye sahip PAL-Net ağırlıkları.
+- `last_model.pth`: Kesilen fold eğitimini aynı komutla sürdüren optimizer/scheduler/RNG checkpoint'i.
+- `metrics_val.json`, `predictions_val.csv`: Checkpoint seçimi sonrasındaki doğrulama çıktıları.
+- `split_and_leakage_report.json`: Split çakışması, alignment kaynağı ve test-sealing denetimi.
+
+Tam 5-fold koşunun kök klasöründe ayrıca `summary_metrics.json`, `summary_fold_metrics.csv`, `summary_landmark_metrics.csv`, `summary_class_metrics.csv`, `summary_gender_metrics.csv` ve `pooled_predictions_test.csv` üretilir. Ana PAL-Net sonucu `summary_metrics.json > pooled > ale` değeridir.

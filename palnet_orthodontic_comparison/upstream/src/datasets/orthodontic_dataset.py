@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -96,13 +97,14 @@ def discover_orthodontic_samples(root_dir):
     return samples, missing_landmarks
 
 
-def ensure_point_count(points, count):
+def ensure_point_count(points, count, rng=None):
     if len(points) == count:
         return points.astype(np.float32)
     if len(points) == 0:
         raise ValueError("Cannot resample an empty point array")
     replace = len(points) < count
-    indices = np.random.choice(len(points), count, replace=replace)
+    rng = rng if rng is not None else np.random.default_rng()
+    indices = rng.choice(len(points), count, replace=replace)
     return points[indices].astype(np.float32)
 
 
@@ -123,6 +125,8 @@ class OrthodonticDataset(Dataset):
         transform=None,
         normalize=False,
         transformation_dir=None,
+        transformation_npz=None,
+        seed=42,
     ):
         self.root_dir = Path(root_dir)
         self.samples, self.missing_landmarks = discover_orthodontic_samples(self.root_dir)
@@ -136,6 +140,41 @@ class OrthodonticDataset(Dataset):
         self.transform = transform
         self.normalize = normalize
         self.transformation_dir = Path(transformation_dir) if transformation_dir else None
+        self.transformation_npz = Path(transformation_npz) if transformation_npz else None
+        if self.transformation_dir is not None and self.transformation_npz is not None:
+            raise ValueError("Use only one of transformation_dir and transformation_npz")
+        self.transformation_matrices = None
+        self.transformation_digest = None
+        if self.transformation_npz is not None:
+            if not self.transformation_npz.exists():
+                raise FileNotFoundError(f"Transformation archive not found: {self.transformation_npz}")
+            digest = hashlib.sha256()
+            with open(self.transformation_npz, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            self.transformation_digest = digest.hexdigest()
+            with np.load(self.transformation_npz) as stored:
+                self.transformation_matrices = {}
+                for key in stored.files:
+                    matrix = stored[key]
+                    if matrix.shape != (4, 4):
+                        raise ValueError(
+                            f"Transformation for {key} has shape {matrix.shape}; expected (4, 4)"
+                        )
+                    if not np.isfinite(matrix).all():
+                        raise ValueError(f"Transformation for {key} contains non-finite values")
+                    self.transformation_matrices[key] = matrix.astype(np.float64)
+            missing_transforms = sorted(
+                sample.sample_id
+                for sample in self.samples
+                if sample.sample_id not in self.transformation_matrices
+            )
+            if missing_transforms:
+                raise KeyError(
+                    "Transformation archive does not cover the dataset; missing sample IDs: "
+                    f"{missing_transforms[:10]}"
+                )
+        self.seed = int(seed)
 
     def __len__(self):
         return len(self.samples)
@@ -144,9 +183,17 @@ class OrthodonticDataset(Dataset):
         if not self.cache_dir:
             return None
         safe_mesh = str(sample.mesh_path.relative_to(self.root_dir)).replace(os.sep, "__")
-        transform_tag = "aligned" if self.transformation_dir else "raw"
+        if self.transformation_npz is not None:
+            transform_tag = f"aligned_npz_{self.transformation_digest[:12]}"
+        elif self.transformation_dir is not None:
+            digest = hashlib.sha256(str(self.transformation_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+            transform_tag = f"aligned_dir_{digest}"
+        else:
+            transform_tag = "raw"
         norm_tag = "normalized" if self.normalize else "original"
-        return self.cache_dir / f"{safe_mesh}.{self.num_surface_points}.{transform_tag}.{norm_tag}.npz"
+        return self.cache_dir / (
+            f"{safe_mesh}.{self.num_surface_points}.{transform_tag}.{norm_tag}.s{self.seed}.npz"
+        )
 
     def _transformation_path(self, sample):
         if not self.transformation_dir:
@@ -155,6 +202,13 @@ class OrthodonticDataset(Dataset):
         return self.transformation_dir / rel_parent / f"{sample.mesh_path.stem}_transformation_matrix.npy"
 
     def _load_transformation(self, sample):
+        if self.transformation_matrices is not None:
+            if sample.sample_id not in self.transformation_matrices:
+                raise KeyError(
+                    f"Transformation archive has no matrix for {sample.sample_id}: "
+                    f"{self.transformation_npz}"
+                )
+            return self.transformation_matrices[sample.sample_id]
         path = self._transformation_path(sample)
         if path is None:
             return None
@@ -168,11 +222,12 @@ class OrthodonticDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         cache_path = self._cache_path(sample)
+        rng = np.random.default_rng(self.seed + idx)
 
         if cache_path and cache_path.exists():
             data = np.load(cache_path)
             vertices_raw = data["vertices"]
-            points = ensure_point_count(data["points"], self.num_surface_points)
+            points = ensure_point_count(data["points"], self.num_surface_points, rng=rng)
             landmarks = data["landmarks"]
         else:
             mesh = trimesh.load(sample.mesh_path, force="mesh")
@@ -188,12 +243,19 @@ class OrthodonticDataset(Dataset):
                 landmarks = transform_points(landmarks, matrix).astype(np.float32)
 
             if len(getattr(mesh, "faces", [])) > 0:
-                points = trimesh.sample.sample_surface_even(mesh, self.num_surface_points)[0].astype(np.float32)
+                state = np.random.get_state()
+                np.random.seed(self.seed + idx)
+                try:
+                    points = trimesh.sample.sample_surface_even(mesh, self.num_surface_points)[0].astype(
+                        np.float32
+                    )
+                finally:
+                    np.random.set_state(state)
             else:
                 replace = len(vertices_raw) < self.num_surface_points
-                indices = np.random.choice(len(vertices_raw), self.num_surface_points, replace=replace)
+                indices = rng.choice(len(vertices_raw), self.num_surface_points, replace=replace)
                 points = vertices_raw[indices].astype(np.float32)
-            points = ensure_point_count(points, self.num_surface_points)
+            points = ensure_point_count(points, self.num_surface_points, rng=rng)
 
             if self.normalize:
                 center, scale = mesh_normalization(vertices_raw)
@@ -219,5 +281,8 @@ class OrthodonticDataset(Dataset):
     def normalization_params(self, idx):
         sample = self.samples[idx]
         mesh = trimesh.load(sample.mesh_path, force="mesh")
+        matrix = self._load_transformation(sample)
+        if matrix is not None:
+            mesh.apply_transform(matrix)
         vertices_raw = np.asarray(mesh.vertices, dtype=np.float32)
         return mesh_normalization(vertices_raw)

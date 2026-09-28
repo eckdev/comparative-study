@@ -1,8 +1,11 @@
 import argparse
 import csv
+import hashlib
 import json
+import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +15,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
-from src.datasets.orthodontic_dataset import OrthodonticDataset
+from src.datasets.orthodontic_dataset import OrthodonticDataset, read_orthodontic_landmarks
 from src.datasets.patch_dataset import PatchDataset
 from src.models.loss import CombinedLoss, localizationLoss
 from src.models.model import PALNET, PLNET_noatt
@@ -25,6 +28,9 @@ for parent in Path(__file__).resolve().parents:
 from shared_metrics.orthodontic_analysis import build_error_analysis, write_analysis_csvs
 
 
+DISABLE_TQDM = False
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -32,6 +38,57 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def resolve_device(value):
+    if value != "auto":
+        return torch.device(value)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def config_sha256(payload):
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def load_torch(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
 
 
 def make_splits(dataset, test_size, val_size, seed):
@@ -61,6 +118,26 @@ def ids_to_indices(dataset, sample_ids):
     if missing:
         raise ValueError(f"Split file references samples not found in dataset: {missing[:10]}")
     return [index_by_id[sample_id] for sample_id in sample_ids]
+
+
+def validate_split_indices(dataset, train_idx, val_idx, test_idx):
+    split_sets = {
+        "train": set(train_idx),
+        "val": set(val_idx),
+        "test": set(test_idx),
+    }
+    for name, indices in (("train", train_idx), ("val", val_idx), ("test", test_idx)):
+        if len(indices) != len(split_sets[name]):
+            raise ValueError(f"Duplicate sample detected inside {name} split")
+    if split_sets["train"] & split_sets["val"]:
+        raise ValueError("Train/validation split overlap detected")
+    if split_sets["train"] & split_sets["test"]:
+        raise ValueError("Train/test split overlap detected")
+    if split_sets["val"] & split_sets["test"]:
+        raise ValueError("Validation/test split overlap detected")
+    unknown = set.union(*split_sets.values()) - set(range(len(dataset)))
+    if unknown:
+        raise ValueError(f"Split contains invalid dataset indices: {sorted(unknown)[:10]}")
 
 
 def limit_split_indices(dataset, indices, max_count, seed):
@@ -113,19 +190,32 @@ def localization_errors(y_true, y_pred):
     return np.linalg.norm(y_pred - y_true, axis=-1)
 
 
+def summarize_error_values(errors):
+    values = np.asarray(errors, dtype=np.float64).reshape(-1)
+    summary = {
+        "ale": float(values.mean()),
+        "std": float(values.std()),
+        "median": float(np.median(values)),
+        "p75": float(np.percentile(values, 75)),
+        "p90": float(np.percentile(values, 90)),
+        "p95": float(np.percentile(values, 95)),
+        "p99": float(np.percentile(values, 99)),
+        "max": float(values.max()),
+    }
+    for threshold in (2.0, 2.5, 3.0, 4.0):
+        key = ("%g" % threshold).replace(".", "_")
+        summary[f"pck_at_{key}mm"] = float((values <= threshold).mean())
+        summary[f"sdr_at_{key}mm"] = summary[f"pck_at_{key}mm"]
+    return summary
+
+
 def ale_summary(y_true, y_pred):
     errors = localization_errors(y_true, y_pred)
     summary = {
-        "ale": float(errors.mean()),
-        "std": float(errors.std()),
-        "median": float(np.median(errors)),
-        "max": float(errors.max()),
+        **summarize_error_values(errors),
         "per_landmark_ale": errors.mean(axis=0).tolist(),
         "per_sample_ale": errors.mean(axis=1).tolist(),
     }
-    for threshold in (2.0, 2.5, 3.0):
-        key = ("%g" % threshold).replace(".", "_")
-        summary[f"pck_at_{key}mm"] = float((errors <= threshold).mean())
     return summary
 
 
@@ -164,6 +254,29 @@ def collect_predictions(model, loader, device, snap_k):
     point_clouds = np.concatenate(point_clouds, axis=0)
     snapped = nearest_surface_predictions(point_clouds, preds.copy(), k=snap_k)
     return preds, snapped, truths, point_clouds
+
+
+def evaluate_model(model, loader, criterion, device, snap_k):
+    model.eval()
+    preds = []
+    truths = []
+    point_clouds = []
+    total_loss = 0.0
+    with torch.no_grad():
+        for patches, landmarks, sampled_points in loader:
+            patches = patches.to(device, non_blocking=True)
+            landmarks_device = landmarks.to(device, non_blocking=True)
+            outputs = model(patches)
+            total_loss += criterion(landmarks_device, outputs).item() * patches.size(0)
+            preds.append(outputs.cpu().numpy())
+            truths.append(landmarks.numpy())
+            point_clouds.append(sampled_points.numpy())
+
+    preds = np.concatenate(preds, axis=0)
+    truths = np.concatenate(truths, axis=0)
+    point_clouds = np.concatenate(point_clouds, axis=0)
+    snapped = nearest_surface_predictions(point_clouds, preds.copy(), k=snap_k)
+    return total_loss / len(loader.dataset), preds, snapped, truths, point_clouds
 
 
 def write_prediction_csv(path, samples, y_true, y_pred):
@@ -614,11 +727,120 @@ def train_refiner(
     return metrics
 
 
+def build_patch_dataset(dataset, indices, train_mean, template_bank, args, cache_dir):
+    subset = Subset(dataset, indices)
+    if args.template_mode == "global":
+        patches = PatchDataset(subset, train_mean, args.patch_size, cache_dir)
+    else:
+        centers = snap_centers_to_surface(
+            subset,
+            template_centers_for_indices(dataset, indices, template_bank, args.template_mode),
+        )
+        patches = RefinerPatchDataset(
+            subset,
+            centers,
+            args.patch_size,
+            cache_dir,
+            augment=False,
+            return_centers=False,
+        )
+    return subset, patches
+
+
+def precache_patches(name, patch_dataset):
+    print(f"  cache {name}: {len(patch_dataset)} samples", flush=True)
+    iterator = tqdm(
+        range(len(patch_dataset)),
+        desc=f"cache {name}",
+        leave=True,
+        mininterval=1.0,
+        file=sys.stdout,
+        disable=DISABLE_TQDM,
+    )
+    for position, idx in enumerate(iterator, start=1):
+        _ = patch_dataset[idx]
+        if DISABLE_TQDM and (position % 10 == 0 or position == len(patch_dataset)):
+            print(f"  cache {name}: {position}/{len(patch_dataset)}", flush=True)
+    print(f"  cache {name}: done", flush=True)
+
+
+def common_metrics(args, train_idx, val_idx, test_idx, parameter_count, run_signature):
+    return {
+        "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
+        "unit": "millimetres in the rigidly aligned source coordinate system",
+        "clinical_threshold_unit": "mm",
+        "model": args.model,
+        "adaptation": "PAL-Net orthodontic 23-landmark patch regression",
+        "seed": args.seed,
+        "fold": args.fold_number,
+        "n_train": len(train_idx),
+        "n_val": len(val_idx),
+        "n_test": len(test_idx),
+        "patch_size": args.patch_size,
+        "surface_points": args.surface_points,
+        "snap_k": args.snap_k,
+        "template_mode": args.template_mode,
+        "loss": args.loss,
+        "checkpoint_metric": args.checkpoint_metric,
+        "normalize": args.normalize,
+        "parameter_count": int(parameter_count),
+        "run_signature": run_signature,
+    }
+
+
+def prepare_evaluation_arrays(dataset, indices, train_mean, normalize, raw, snapped, truth, point_clouds):
+    baseline_raw = template_baseline(train_mean.numpy(), truth)
+    baseline_snapped = template_baseline(train_mean.numpy(), truth, point_clouds)
+    if normalize:
+        raw, snapped, truth, point_clouds, baseline_raw, baseline_snapped = inverse_normalize_arrays(
+            dataset,
+            indices,
+            raw,
+            snapped,
+            truth,
+            point_clouds,
+            baseline_raw,
+            baseline_snapped,
+        )
+    return raw, snapped, truth, point_clouds, baseline_raw, baseline_snapped
+
+
+def evaluation_payload(common, split, loss, samples, truth, raw, snapped, baseline_raw, baseline_snapped):
+    errors = localization_errors(truth, snapped)
+    analysis = build_error_analysis(samples, errors)
+    return {
+        **common,
+        "split": split,
+        "loss_value": float(loss),
+        "palnet_raw": ale_summary(truth, raw),
+        "palnet_snapped": ale_summary(truth, snapped),
+        "core20": summarize_error_values(errors[:, 1:21]),
+        "hard3": summarize_error_values(errors[:, [0, 21, 22]]),
+        "mean_shape_baseline_raw": ale_summary(truth, baseline_raw),
+        "mean_shape_baseline_snapped": ale_summary(truth, baseline_snapped),
+        **analysis,
+    }
+
+
+def write_evaluation(output_dir, split, payload, samples, truth, snapped):
+    metrics_name = "metrics.json" if split == "test" else f"metrics_{split}.json"
+    (output_dir / metrics_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if split == "test":
+        (output_dir / "metrics_test.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    write_prediction_csv(output_dir / f"predictions_{split}.csv", samples, truth, snapped)
+    write_prediction_csv(output_dir / f"stage1_predictions_{split}.csv", samples, truth, snapped)
+    write_group_metrics(output_dir / f"group_metrics_{split}.csv", samples, truth, snapped)
+    write_analysis_csvs(output_dir, payload, suffix=split)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train PAL-Net on the 23-point orthodontic dataset and report ALE.")
     parser.add_argument("--data-root", default="../../data/dataset", help="Path to Class*/ mesh and landmark folders.")
     parser.add_argument("--output-dir", default="../runs/orthodontic_palnet")
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--min-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--patch-size", type=int, default=250)
     parser.add_argument(
@@ -641,6 +863,12 @@ def main():
     parser.add_argument("--snap-k", type=int, default=1, help="Nearest sampled surface points used to snap PAL-Net output.")
     parser.add_argument("--model", choices=["PALNET", "PLNET_noatt"], default="PALNET")
     parser.add_argument("--loss", choices=["combined", "localization"], default="combined")
+    parser.add_argument("--checkpoint-metric", choices=["val_ale", "val_loss"], default="val_loss")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--fold-number", type=int, default=1)
+    parser.add_argument("--no-tqdm", action="store_true")
     parser.add_argument("--normalize", action="store_true", help="Normalize each face to unit scale before training.")
     parser.add_argument("--template-mode", choices=["global", "class", "gender", "class_gender"], default="global")
     parser.add_argument("--stage1-model-path", default=None, help="Optional existing PAL-Net checkpoint for stage 1.")
@@ -657,11 +885,30 @@ def main():
         default=None,
         help="Directory containing PAL-Net-style *_transformation_matrix.npy files.",
     )
+    parser.add_argument(
+        "--transformation-npz",
+        default=None,
+        help="Fold-specific archive containing sample_id -> rigid 4x4 matrices.",
+    )
+    parser.add_argument("--alignment-report", default=None)
+    parser.add_argument("--require-label-free-alignment", action="store_true")
     args = parser.parse_args()
 
+    global DISABLE_TQDM
+    DISABLE_TQDM = bool(args.no_tqdm)
+    if args.require_label_free_alignment and args.train_refiner:
+        raise ValueError(
+            "The legacy residual refiner is not part of the frozen publication CV protocol. "
+            "Run Stage 1 PAL-Net alone or use a separately frozen refiner protocol."
+        )
     set_seed(args.seed)
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+    device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "experiment_config.json").write_text(
+        json.dumps(vars(args), indent=2), encoding="utf-8"
+    )
 
     dataset = OrthodonticDataset(
         args.data_root,
@@ -669,14 +916,20 @@ def main():
         num_surface_points=args.surface_points,
         normalize=args.normalize,
         transformation_dir=args.transformation_dir,
+        transformation_npz=args.transformation_npz,
+        seed=args.seed,
     )
     print(f"Paired samples: {len(dataset)}", flush=True)
     print(f"Meshes without matching landmark file: {len(dataset.missing_landmarks)}", flush=True)
+    print(f"Device: {device}", flush=True)
 
     source_splits_json = None
+    split_sha256 = None
     if args.splits_json:
-        source_splits_json = str(Path(args.splits_json))
-        split_source = json.loads(Path(args.splits_json).read_text(encoding="utf-8"))
+        split_path = Path(args.splits_json)
+        source_splits_json = str(split_path)
+        split_sha256 = file_sha256(split_path)
+        split_source = json.loads(split_path.read_text(encoding="utf-8"))
         train_idx = ids_to_indices(dataset, split_source["train"])
         val_idx = ids_to_indices(dataset, split_source["val"])
         test_idx = ids_to_indices(dataset, split_source["test"])
@@ -684,9 +937,11 @@ def main():
         train_idx, val_idx, test_idx = make_splits(dataset, args.test_size, args.val_size, args.seed)
 
     full_counts = {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)}
+    alignment_train_ids = {dataset.samples[index].sample_id for index in train_idx}
     train_idx = limit_split_indices(dataset, train_idx, args.max_train_samples, args.seed + 101)
     val_idx = limit_split_indices(dataset, val_idx, args.max_val_samples, args.seed + 202)
     test_idx = limit_split_indices(dataset, test_idx, args.max_test_samples, args.seed + 303)
+    validate_split_indices(dataset, train_idx, val_idx, test_idx)
     print(
         "Using samples: "
         f"train={len(train_idx)}/{full_counts['train']} "
@@ -696,10 +951,12 @@ def main():
     )
 
     split_payload = {
+        "fold": args.fold_number,
         "train": [dataset.samples[i].sample_id for i in train_idx],
         "val": [dataset.samples[i].sample_id for i in val_idx],
         "test": [dataset.samples[i].sample_id for i in test_idx],
         "source_splits_json": source_splits_json,
+        "source_splits_sha256": split_sha256,
         "source_split_counts": full_counts,
         "sample_limits": {
             "max_train_samples": args.max_train_samples,
@@ -710,9 +967,83 @@ def main():
     }
     (output_dir / "splits.json").write_text(json.dumps(split_payload, indent=2), encoding="utf-8")
 
-    train_ds = Subset(dataset, train_idx)
-    val_ds = Subset(dataset, val_idx)
-    test_ds = Subset(dataset, test_idx)
+    alignment_report = None
+    if args.alignment_report:
+        alignment_report_path = Path(args.alignment_report)
+        if not alignment_report_path.exists():
+            raise FileNotFoundError(f"Alignment report not found: {alignment_report_path}")
+        alignment_report = json.loads(alignment_report_path.read_text(encoding="utf-8"))
+        if alignment_report.get("uses_expert_landmarks") is not False:
+            raise ValueError("Alignment report does not certify label-free registration")
+        if alignment_report.get("scale") is not False:
+            raise ValueError("Alignment report indicates scale-changing registration")
+        fitted_ids = set(alignment_report.get("atlas_sample_ids", []))
+        fitted_ids.update(alignment_report.get("train_template_sample_ids", []))
+        medoid_id = alignment_report.get("train_medoid_sample_id")
+        if medoid_id:
+            fitted_ids.add(medoid_id)
+        if fitted_ids and not fitted_ids <= alignment_train_ids:
+            raise ValueError("Alignment atlas contains validation/test samples")
+    if args.require_label_free_alignment:
+        if alignment_report is None:
+            raise ValueError("--require-label-free-alignment requires --alignment-report")
+        if not args.transformation_npz:
+            raise ValueError("Publication CV requires --transformation-npz")
+
+    transform_info = {
+        "transformation_dir": args.transformation_dir,
+        "transformation_npz": args.transformation_npz,
+        "transformation_npz_sha256": (
+            file_sha256(args.transformation_npz) if args.transformation_npz else None
+        ),
+        "alignment_report": args.alignment_report,
+        "alignment_report_sha256": (
+            file_sha256(args.alignment_report) if args.alignment_report else None
+        ),
+        "method": alignment_report.get("method") if alignment_report else None,
+        "uses_expert_landmarks": (
+            alignment_report.get("uses_expert_landmarks") if alignment_report else None
+        ),
+        "scale": alignment_report.get("scale") if alignment_report else None,
+        "atlas_train_only": True if alignment_report else None,
+    }
+    audit = {
+        "fold": args.fold_number,
+        "counts": {"train": len(train_idx), "val": len(val_idx), "test": len(test_idx)},
+        "overlap": {"train_val": [], "train_test": [], "val_test": []},
+        "split_source": source_splits_json,
+        "split_sha256": split_sha256,
+        "alignment": transform_info,
+        "test_label_protocol": {
+            "consumed_only_after_validation_checkpoint_lock": True,
+            "test_evaluated": False,
+        },
+    }
+    audit_path = output_dir / "split_and_leakage_report.json"
+    audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    if args.preflight_only:
+        for sample in dataset.samples:
+            read_orthodontic_landmarks(sample.landmark_path)
+            matrix = dataset._load_transformation(sample)
+            if args.require_label_free_alignment and matrix is None:
+                raise ValueError(f"No alignment matrix for {sample.sample_id}")
+        report = {
+            **audit,
+            "passed": True,
+            "dataset_samples": len(dataset),
+            "landmarks_per_sample": 23,
+            "physical_scale_preserved": not args.normalize and transform_info["scale"] is False,
+        }
+        (output_dir / "preflight_report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        print(
+            f"Preflight passed for fold {args.fold_number}: "
+            f"{len(train_idx)}/{len(val_idx)}/{len(test_idx)}",
+            flush=True,
+        )
+        return
 
     train_mean = mean_landmarks(dataset, train_idx)
     np.save(output_dir / "train_mean_landmarks.npy", train_mean.numpy())
@@ -728,84 +1059,93 @@ def main():
         class_gender_template_keys=np.asarray(list(template_bank["class_gender"].keys())),
     )
 
-    if args.template_mode == "global":
-        train_patches = PatchDataset(train_ds, train_mean, args.patch_size, output_dir / "patch_cache_train")
-        val_patches = PatchDataset(val_ds, train_mean, args.patch_size, output_dir / "patch_cache_val")
-        test_patches = PatchDataset(test_ds, train_mean, args.patch_size, output_dir / "patch_cache_test")
-    else:
-        train_template_centers = snap_centers_to_surface(
-            train_ds,
-            template_centers_for_indices(dataset, train_idx, template_bank, args.template_mode),
-        )
-        val_template_centers = snap_centers_to_surface(
-            val_ds,
-            template_centers_for_indices(dataset, val_idx, template_bank, args.template_mode),
-        )
-        test_template_centers = snap_centers_to_surface(
-            test_ds,
-            template_centers_for_indices(dataset, test_idx, template_bank, args.template_mode),
-        )
-        train_patches = RefinerPatchDataset(
-            train_ds,
-            train_template_centers,
-            args.patch_size,
-            output_dir / "patch_cache_train",
-            augment=False,
-            return_centers=False,
-        )
-        val_patches = RefinerPatchDataset(
-            val_ds,
-            val_template_centers,
-            args.patch_size,
-            output_dir / "patch_cache_val",
-            augment=False,
-            return_centers=False,
-        )
-        test_patches = RefinerPatchDataset(
-            test_ds,
-            test_template_centers,
-            args.patch_size,
-            output_dir / "patch_cache_test",
-            augment=False,
-            return_centers=False,
-        )
+    train_ds, train_patches = build_patch_dataset(
+        dataset, train_idx, train_mean, template_bank, args, output_dir / "patch_cache_train"
+    )
+    val_ds, val_patches = build_patch_dataset(
+        dataset, val_idx, train_mean, template_bank, args, output_dir / "patch_cache_val"
+    )
 
-    print("Pre-caching train/val/test patches...", flush=True)
-    for split_name, patch_ds in (("train", train_patches), ("val", val_patches), ("test", test_patches)):
-        print(f"  cache {split_name}: {len(patch_ds)} samples", flush=True)
-        for i in tqdm(range(len(patch_ds)), desc=f"cache {split_name}", leave=True, mininterval=1.0, file=sys.stdout):
-            _ = patch_ds[i]
-        print(f"  cache {split_name}: done", flush=True)
+    print("Pre-caching train/validation patches; outer test remains sealed...", flush=True)
+    precache_patches("train", train_patches)
+    precache_patches("val", val_patches)
 
     train_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     train_eval_loader = DataLoader(train_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     val_loader = DataLoader(val_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = DataLoader(test_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     first_patch, first_landmark, _ = train_patches[0]
     input_shape = first_patch.shape
     output_shape = first_landmark.shape
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}", flush=True)
     model_cls = PALNET if args.model == "PALNET" else PLNET_noatt
     model = model_cls(input_shape, output_shape, seed=args.seed).to(device)
     criterion = CombinedLoss(alpha=0.6, beta=0.4) if args.loss == "combined" else localizationLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Parameters: {parameter_count:,}", flush=True)
 
-    best_val = float("inf")
+    signature_payload = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"output_dir", "resume", "preflight_only"}
+    }
+    signature_payload.update(
+        {
+            "split_sha256": split_sha256,
+            "transformation_npz_sha256": transform_info["transformation_npz_sha256"],
+            "alignment_report_sha256": transform_info["alignment_report_sha256"],
+        }
+    )
+    run_signature = config_sha256(signature_payload)
+
+    best_selection = float("inf")
+    best_val_loss = float("inf")
+    best_val_ale = float("inf")
+    best_epoch = 0
     epochs_no_improve = 0
     best_path = output_dir / "best_model.pth"
+    last_path = output_dir / "last_model.pth"
     history = []
+    start_epoch = 1
+    previous_training_seconds = 0.0
 
     if args.stage1_model_path:
         print(f"Loading stage 1 model: {args.stage1_model_path}", flush=True)
-        model.load_state_dict(torch.load(args.stage1_model_path, map_location=device))
+        model.load_state_dict(load_torch(args.stage1_model_path, device))
+        torch.save(model.state_dict(), best_path)
         history.append({"stage": "loaded_stage1", "model_path": str(args.stage1_model_path)})
-        best_val = None
     else:
-        for epoch in range(args.epochs):
+        if args.resume and last_path.exists():
+            state = load_torch(last_path, device)
+            if state.get("run_signature") != run_signature:
+                raise RuntimeError(
+                    "Resume checkpoint configuration does not match the current fold command. "
+                    "Use a new output directory or rerun without --resume."
+                )
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            history = state["history"]
+            best_selection = float(state["best_selection"])
+            best_val_loss = float(state["best_val_loss"])
+            best_val_ale = float(state["best_val_ale"])
+            best_epoch = int(state["best_epoch"])
+            epochs_no_improve = int(state["epochs_no_improve"])
+            previous_training_seconds = float(state.get("training_seconds", 0.0))
+            start_epoch = int(state["epoch"]) + 1
+            restore_rng_state(state.get("rng_state"))
+            print(f"Resuming after epoch {start_epoch - 1}; best epoch={best_epoch}", flush=True)
+
+        training_started = time.time()
+        training_already_stopped = (
+            start_epoch > args.min_epochs and epochs_no_improve >= args.patience
+        )
+        epoch_range = range(start_epoch, args.epochs + 1) if not training_already_stopped else ()
+        if training_already_stopped:
+            print(f"Training was already complete; best epoch={best_epoch}", flush=True)
+        for epoch in epoch_range:
             model.train()
             train_loss = 0.0
             for patches, landmarks, _ in train_loader:
@@ -819,107 +1159,180 @@ def main():
                 train_loss += loss.item() * patches.size(0)
             train_loss /= len(train_patches)
 
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for patches, landmarks, _ in val_loader:
-                    patches = patches.to(device, non_blocking=True)
-                    landmarks = landmarks.to(device, non_blocking=True)
-                    outputs = model(patches)
-                    val_loss += criterion(landmarks, outputs).item() * patches.size(0)
-            val_loss /= len(val_patches)
+            val_loss, val_raw_epoch, val_snapped_epoch, y_val_epoch, _ = evaluate_model(
+                model, val_loader, criterion, device, args.snap_k
+            )
             scheduler.step(val_loss)
-
-            history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
-            print(f"Epoch {epoch + 1:04d}/{args.epochs} train={train_loss:.4f} val={val_loss:.4f}", flush=True)
-
-            if val_loss < best_val:
-                best_val = val_loss
+            val_ale = ale_summary(y_val_epoch, val_snapped_epoch)["ale"]
+            val_raw_ale = ale_summary(y_val_epoch, val_raw_epoch)["ale"]
+            selection = val_ale if args.checkpoint_metric == "val_ale" else val_loss
+            if selection < best_selection:
+                best_selection = selection
+                best_val_loss = val_loss
+                best_val_ale = val_ale
+                best_epoch = epoch
                 epochs_no_improve = 0
                 torch.save(model.state_dict(), best_path)
             else:
                 epochs_no_improve += 1
-                if epochs_no_improve >= args.patience:
-                    print(f"Early stopping at epoch {epoch + 1}", flush=True)
-                    break
-        model.load_state_dict(torch.load(best_path, map_location=device))
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_ale_raw": val_raw_ale,
+                    "val_ale_snapped": val_ale,
+                    "selection": selection,
+                    "best_epoch": best_epoch,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                }
+            )
+            print(
+                f"Epoch {epoch:04d}/{args.epochs} train={train_loss:.4f} "
+                f"val={val_loss:.4f} val_ALE={val_ale:.4f} best={best_epoch}",
+                flush=True,
+            )
+            elapsed = previous_training_seconds + (time.time() - training_started)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "history": history,
+                    "best_selection": best_selection,
+                    "best_val_loss": best_val_loss,
+                    "best_val_ale": best_val_ale,
+                    "best_epoch": best_epoch,
+                    "epochs_no_improve": epochs_no_improve,
+                    "training_seconds": elapsed,
+                    "run_signature": run_signature,
+                    "rng_state": capture_rng_state(),
+                },
+                last_path,
+            )
+            (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+            if epoch >= args.min_epochs and epochs_no_improve >= args.patience:
+                print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}", flush=True)
+                break
+
+        training_seconds = previous_training_seconds + (time.time() - training_started)
+        if not best_path.exists():
+            raise RuntimeError("Training did not produce best_model.pth")
+        model.load_state_dict(load_torch(best_path, device))
+
+    if args.stage1_model_path:
+        training_seconds = 0.0
+        val_loss_loaded, _, val_snapped_loaded, y_val_loaded, _ = evaluate_model(
+            model, val_loader, criterion, device, args.snap_k
+        )
+        best_val_loss = val_loss_loaded
+        best_val_ale = ale_summary(y_val_loaded, val_snapped_loaded)["ale"]
 
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
-    print("Collecting stage 1 predictions...", flush=True)
-    stage1_train_raw, stage1_train_snapped, y_train, train_point_clouds = collect_predictions(
-        model, train_eval_loader, device, args.snap_k
+    common = common_metrics(
+        args, train_idx, val_idx, test_idx, parameter_count, run_signature
     )
-    stage1_val_raw, stage1_val_snapped, y_val, val_point_clouds = collect_predictions(
-        model, val_loader, device, args.snap_k
+    common.update(
+        {
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "best_val_ale": best_val_ale,
+            "training_seconds": training_seconds,
+            "stage1_model_path": args.stage1_model_path,
+            "alignment": transform_info,
+        }
     )
-    raw_pred, snapped_pred, y_test, point_clouds = collect_predictions(model, test_loader, device, args.snap_k)
-    stage1_test_snapped_internal = snapped_pred.copy()
-    test_samples = [dataset.samples[i] for i in test_idx]
-    baseline_raw_pred = template_baseline(train_mean.numpy(), y_test)
-    baseline_snapped_pred = template_baseline(train_mean.numpy(), y_test, point_clouds)
 
-    val_samples = [dataset.samples[i] for i in val_idx]
-    val_raw_out, val_snapped_out, y_val_out = maybe_inverse(
+    print("Evaluating locked checkpoint on validation split...", flush=True)
+    val_loss, stage1_val_raw, stage1_val_snapped, y_val, val_point_clouds = evaluate_model(
+        model, val_loader, criterion, device, args.snap_k
+    )
+    stage1_val_snapped_internal = stage1_val_snapped.copy()
+    y_val_internal = y_val.copy()
+    (
+        val_raw_out,
+        val_snapped_out,
+        y_val_out,
+        _,
+        val_baseline_raw,
+        val_baseline_snapped,
+    ) = prepare_evaluation_arrays(
         dataset,
         val_idx,
+        train_mean,
         args.normalize,
         stage1_val_raw,
         stage1_val_snapped,
         y_val,
+        val_point_clouds,
     )
-    write_prediction_csv(output_dir / "stage1_predictions_val.csv", val_samples, y_val_out, val_snapped_out)
+    val_samples = subset_samples(dataset, val_idx)
+    val_metrics = evaluation_payload(
+        common,
+        "val",
+        val_loss,
+        val_samples,
+        y_val_out,
+        val_raw_out,
+        val_snapped_out,
+        val_baseline_raw,
+        val_baseline_snapped,
+    )
+    write_evaluation(output_dir, "val", val_metrics, val_samples, y_val_out, val_snapped_out)
 
-    if args.normalize:
-        raw_pred, snapped_pred, y_test, point_clouds, baseline_raw_pred, baseline_snapped_pred = inverse_normalize_arrays(
-            dataset,
-            test_idx,
-            raw_pred,
-            snapped_pred,
-            y_test,
-            point_clouds,
-            baseline_raw_pred,
-            baseline_snapped_pred,
-        )
-
-    write_prediction_csv(output_dir / "stage1_predictions_test.csv", test_samples, y_test, snapped_pred)
-
-    palnet_raw = ale_summary(y_test, raw_pred)
-    palnet_snapped = ale_summary(y_test, snapped_pred)
-    baseline_raw = ale_summary(y_test, baseline_raw_pred)
-    baseline_snapped = ale_summary(y_test, baseline_snapped_pred)
-    advanced_analysis = build_error_analysis(test_samples, localization_errors(y_test, snapped_pred))
-
-    metrics = {
-        "metric": "Average Localization Error (mean Euclidean distance over 23 landmarks)",
-        "unit": "dataset coordinate unit",
-        "clinical_threshold_unit": "mm",
-        "model": args.model,
-        "stage1_model_path": args.stage1_model_path,
-        "template_mode": args.template_mode,
-        "train_refiner": args.train_refiner,
-        "refine_center": args.refine_center,
-        "residual_target": args.residual_target,
-        "landmark_weighting": args.landmark_weighting,
-        "center_jitter_mm": args.center_jitter_mm,
-        "point_noise_mm": args.point_noise_mm,
-        "point_dropout": args.point_dropout,
-        "n_train": len(train_idx),
-        "n_val": len(val_idx),
-        "n_test": len(test_idx),
-        "palnet_raw": palnet_raw,
-        "palnet_snapped": palnet_snapped,
-        "mean_shape_baseline_raw": baseline_raw,
-        "mean_shape_baseline_snapped": baseline_snapped,
-        **advanced_analysis,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    write_prediction_csv(output_dir / "predictions_test.csv", test_samples, y_test, snapped_pred)
-    write_group_metrics(output_dir / "group_metrics_test.csv", test_samples, y_test, snapped_pred)
-    write_analysis_csvs(output_dir, advanced_analysis, suffix="test")
+    print("Checkpoint locked. Preparing outer-test patches and consuming test labels...", flush=True)
+    test_ds, test_patches = build_patch_dataset(
+        dataset, test_idx, train_mean, template_bank, args, output_dir / "patch_cache_test"
+    )
+    precache_patches("test", test_patches)
+    test_loader = DataLoader(
+        test_patches, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
+    test_loss, raw_pred_internal, snapped_pred_internal, y_test_internal, point_clouds_internal = evaluate_model(
+        model, test_loader, criterion, device, args.snap_k
+    )
+    stage1_test_snapped_internal = snapped_pred_internal.copy()
+    (
+        raw_pred,
+        snapped_pred,
+        y_test,
+        point_clouds,
+        baseline_raw_pred,
+        baseline_snapped_pred,
+    ) = prepare_evaluation_arrays(
+        dataset,
+        test_idx,
+        train_mean,
+        args.normalize,
+        raw_pred_internal,
+        snapped_pred_internal,
+        y_test_internal,
+        point_clouds_internal,
+    )
+    test_samples = subset_samples(dataset, test_idx)
+    metrics = evaluation_payload(
+        common,
+        "test",
+        test_loss,
+        test_samples,
+        y_test,
+        raw_pred,
+        snapped_pred,
+        baseline_raw_pred,
+        baseline_snapped_pred,
+    )
+    write_evaluation(output_dir, "test", metrics, test_samples, y_test, snapped_pred)
+    audit["test_label_protocol"]["test_evaluated"] = True
+    audit["test_label_protocol"]["best_epoch"] = best_epoch
+    audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
 
     refined_metrics = None
     if args.train_refiner:
+        stage1_train_raw, stage1_train_snapped, _, _ = collect_predictions(
+            model, train_eval_loader, device, args.snap_k
+        )
         refined_metrics = train_refiner(
             args,
             output_dir,
@@ -928,21 +1341,23 @@ def main():
             val_idx,
             test_idx,
             stage1_train_snapped,
-            stage1_val_snapped,
+            stage1_val_snapped_internal,
             stage1_test_snapped_internal,
-            y_val,
-            stage1_val_snapped,
+            y_val_internal,
+            stage1_val_snapped_internal,
             device,
             model_cls,
             output_shape,
         )
 
     print("\nEvaluation against expert orthodontist landmarks", flush=True)
-    print(f"PAL-Net raw ALE:      {palnet_raw['ale']:.4f}", flush=True)
-    print(f"PAL-Net snapped ALE:  {palnet_snapped['ale']:.4f}", flush=True)
+    print(f"PAL-Net raw ALE:      {metrics['palnet_raw']['ale']:.4f}", flush=True)
+    print(f"PAL-Net snapped ALE:  {metrics['palnet_snapped']['ale']:.4f}", flush=True)
+    print(f"PAL-Net Core20 ALE:   {metrics['core20']['ale']:.4f}", flush=True)
+    print(f"PAL-Net Hard3 ALE:    {metrics['hard3']['ale']:.4f}", flush=True)
     if refined_metrics:
         print(f"PAL-Net refined ALE:  {refined_metrics['palnet_refined_snapped']['ale']:.4f}", flush=True)
-    print(f"Mean-template ALE:    {baseline_snapped['ale']:.4f}", flush=True)
+    print(f"Mean-template ALE:    {metrics['mean_shape_baseline_snapped']['ale']:.4f}", flush=True)
     print(f"Results saved to:     {output_dir}", flush=True)
 
 

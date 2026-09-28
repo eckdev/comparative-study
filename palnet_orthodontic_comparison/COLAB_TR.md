@@ -2,10 +2,64 @@
 
 Bu dosyalar PAL-Net adaptasyonunu Google Colab GPU uzerinde calistirmak icin hazirlandi. DiffusionNet ve PointNet++ ile adil karsilastirma icin ortak split dosyasi kullanilir.
 
+## Makale Icin 5-Fold Protokol
+
+Ana akademik koşu `colab_run_palnet_cv.py` ile yapılır. Bu çalıştırıcı:
+
+- aynı `orthodontic_5fold_192_48_60_seed42.json` manifestini kullanır,
+- her fold için aynı `192/48/60` örneklerini seçer,
+- yalnız train meshleriyle fit edilmiş label-free rigid ICP dönüşümlerini doğrular,
+- validation snapped ALE ile checkpoint seçer,
+- checkpoint kilitlenmeden outer-test patch'lerini veya etiketlerini yüklemez,
+- yarım kalan fold'u `last_model.pth` üzerinden sürdürür,
+- beş fold bittiğinde pooled ALE, Core20, Hard3, SDR ve bootstrap güven aralığını toplar.
+
+Colab hücreleri:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+```python
+%cd /content/comparative-study/palnet_orthodontic_comparison
+!python -u colab_run_palnet_cv.py --preset preflight --seed 42
+```
+
+Beş fold preflight başarılı olduktan sonra kısa pipeline testi:
+
+```python
+%cd /content/comparative-study/palnet_orthodontic_comparison
+!python -u colab_run_palnet_cv.py --preset smoke --seed 42
+```
+
+A100 ana koşusu:
+
+```python
+%cd /content/comparative-study/palnet_orthodontic_comparison
+!python -u colab_run_palnet_cv.py --preset cv --seed 42
+```
+
+Colab oturumu kesilirse aynı `cv` hücresini yeniden çalıştır. Tamamlanmış fold'lar atlanır; yarım fold son `last_model.pth` checkpoint'inden devam eder. Belirli fold'lar da seçilebilir:
+
+```python
+!python -u colab_run_palnet_cv.py --preset cv --seed 42 --fold-indices 3,4,5
+```
+
+Varsayılan çıktı:
+
+```text
+/content/drive/MyDrive/orthodontic/palnet_runs/palnet_publication_cv_seed42/
+```
+
+Bu protokol Stage 1 PAL-Net baseline'ını ölçer. Eski residual refiner, frozen CV protokolüne dahil değildir; `--require-label-free-alignment` ile birlikte bilerek engellenir.
+
 ## Dosyalar
 
 - `upstream/run_orthodontic.py`: Yerel/Colab ortak egitim scripti.
 - `colab_palnet_orthodontic_gpu.ipynb`: Colab uzerinde hucre hucre calistirilacak notebook.
+- `colab_palnet_5fold.ipynb`: Ortak leakage-free 5-fold makale koşusu notebook'u.
+- `colab_run_palnet_cv.py`: Preflight, smoke, resume ve fold aggregation çalıştırıcısı.
 - `requirements.txt`: Python bagimliliklari.
 
 ## Google Drive yapisi
@@ -22,6 +76,17 @@ MyDrive/
         Class3/
     transforms/
       orthodontic_procrustes_rigid_20260627_143801/
+    all23_rgb_geodesic_runs/
+      publication_cv_stage1_v4_seed42/
+        fold_1/
+          alignment/
+            mesh_only_transforms.npz
+            alignment_report.json
+          split_and_leakage_report.json
+        fold_2/
+        fold_3/
+        fold_4/
+        fold_5/
     palnet_runs/
 ```
 
@@ -36,6 +101,8 @@ Notebook ve komutlar repo icindeki ortak split dosyasini kullanir:
 ```
 
 Bu split 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 60 test hastasina ayirir.
+
+Bu `180/60/60` bölüm yalnız eski sabit-split deneyleri içindir. Makale 5-fold koşusu `orthodontic_5fold_192_48_60_seed42.json` kullanır ve her örneği tam bir kez outer-test olarak değerlendirir.
 
 ## Smoke Test
 
