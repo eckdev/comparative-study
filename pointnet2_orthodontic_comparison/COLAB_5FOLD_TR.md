@@ -44,7 +44,7 @@ Egitim yapmadan bes foldun split ve ICP dosyalarini denetler:
 
 ```python
 %cd /content/comparative-study/pointnet2_orthodontic_comparison
-!python -u colab_run_pointnet2_cv.py --preset preflight --seed 42
+!python -u colab_run_pointnet2_cv.py --preset=preflight --seed=42
 ```
 
 Her fold icin `Preflight passed ... 192/48/60` gorulmelidir.
@@ -55,7 +55,7 @@ Pipeline'i Fold 1'de 24 ornek ve 2 epoch ile kontrol eder. Smoke ALE bilimsel so
 
 ```python
 %cd /content/comparative-study/pointnet2_orthodontic_comparison
-!python -u colab_run_pointnet2_cv.py --preset smoke --seed 42
+!python -u colab_run_pointnet2_cv.py --preset=smoke --seed=42
 ```
 
 ## 4. Ana 5-fold kosu
@@ -64,7 +64,7 @@ Colab A100/L4 GPU ile:
 
 ```python
 %cd /content/comparative-study/pointnet2_orthodontic_comparison
-!python -u colab_run_pointnet2_cv.py --preset cv --seed 42
+!python -u colab_run_pointnet2_cv.py --preset=cv --seed=42
 ```
 
 Oturum kesilirse ayni komutu tekrar calistirin. Tamamlanan foldlar atlanir; yarida kalan fold `last_model.pth` dosyasindan devam eder.
@@ -72,7 +72,7 @@ Oturum kesilirse ayni komutu tekrar calistirin. Tamamlanan foldlar atlanir; yari
 Belirli foldlari calistirmak icin:
 
 ```python
-!python -u colab_run_pointnet2_cv.py --preset cv --seed 42 --fold-indices 3,4,5
+!python -u colab_run_pointnet2_cv.py --preset=cv --seed=42 --fold-indices=3,4,5
 ```
 
 ## 5. Sonuclar

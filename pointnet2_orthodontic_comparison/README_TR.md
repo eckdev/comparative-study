@@ -7,9 +7,9 @@ Bu klasor, mevcut 23 landmarkli ortodontik PLY datasetine uygun PointNet++ taban
 Ana akademik karsilastirma artik ortak `192/48/60` 5-fold manifesti ve train-only label-free mesh ICP kullanir. Colab adimlari icin `COLAB_5FOLD_TR.md` veya `colab_pointnet2_5fold.ipynb` dosyasini kullanin:
 
 ```bash
-python -u colab_run_pointnet2_cv.py --preset preflight --seed 42
-python -u colab_run_pointnet2_cv.py --preset smoke --seed 42
-python -u colab_run_pointnet2_cv.py --preset cv --seed 42
+python -u colab_run_pointnet2_cv.py --preset=preflight --seed=42
+python -u colab_run_pointnet2_cv.py --preset=smoke --seed=42
+python -u colab_run_pointnet2_cv.py --preset=cv --seed=42
 ```
 
 Ana kosu kesilirse ayni `--preset cv` komutu tamamlanan foldlari atlar ve yarim foldlari checkpointten devam ettirir. Dondurulmus model ve postprocess ayarlari `publication_cv_protocol.json` dosyasindadir.
