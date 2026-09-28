@@ -1,5 +1,7 @@
 # PointNet++ Google Colab Pro Kullanimi
 
+> Makalenin ana leakage-free 5-fold karsilastirmasi icin bu eski sabit-split kilavuzu yerine `COLAB_5FOLD_TR.md` ve `colab_pointnet2_5fold.ipynb` kullanilmalidir.
+
 Bu dosya mevcut PointNet++ modelini degistirmeden Google Colab Pro GPU uzerinde calistirmak icin hazirlandi. DiffusionNet sonuclari sabit tutulacaksa, bu kosular PointNet++ karsilastirma sonucunu GPU ortaminda yeniden uretmek icindir.
 
 ## Dosyalar

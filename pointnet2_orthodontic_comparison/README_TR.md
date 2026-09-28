@@ -2,6 +2,18 @@
 
 Bu klasor, mevcut 23 landmarkli ortodontik PLY datasetine uygun PointNet++ tabanli bir karsilastirma modeli kurar.
 
+## Makale Icin 5-Fold Protokolu
+
+Ana akademik karsilastirma artik ortak `192/48/60` 5-fold manifesti ve train-only label-free mesh ICP kullanir. Colab adimlari icin `COLAB_5FOLD_TR.md` veya `colab_pointnet2_5fold.ipynb` dosyasini kullanin:
+
+```bash
+python -u colab_run_pointnet2_cv.py --preset preflight --seed 42
+python -u colab_run_pointnet2_cv.py --preset smoke --seed 42
+python -u colab_run_pointnet2_cv.py --preset cv --seed 42
+```
+
+Ana kosu kesilirse ayni `--preset cv` komutu tamamlanan foldlari atlar ve yarim foldlari checkpointten devam ettirir. Dondurulmus model ve postprocess ayarlari `publication_cv_protocol.json` dosyasindadir.
+
 ## Optimal v2 Yaklasimi
 
 Ilk baseline sert 3.5 mm landmark maskesi ve yalnizca XYZ koordinatlariyla egitilmisti. V2 protokolunde model landmark lokalizasyonuna daha uygun hale getirildi:
@@ -190,6 +202,6 @@ Bu nedenle bu checkpoint icin en iyi pratik ayar `surface_points=1024`, `topk=10
 - `history.json`: epoch bazli train/validation ve learning rate.
 - `best_model.pth`: en iyi validation ALE checkpoint.
 
-## Ortak Split
+## Eski Sabit Split
 
-Uc modelin adil karsilastirilmasi icin repo kokundeki `shared_splits/orthodontic_180_60_60_seed42.json` dosyasi kullanilir. Bu dosya 300 hastayi sinif/cinsiyet dengeli olarak 180 egitim, 60 validasyon ve 60 test hasta dosyasina ayirir.
+`shared_splits/orthodontic_180_60_60_seed42.json` kullanan eski kosular tamamlayici deneydir. Makalenin ana model karsilastirmasinda `shared_splits/orthodontic_5fold_192_48_60_seed42.json` kullanilmalidir.
