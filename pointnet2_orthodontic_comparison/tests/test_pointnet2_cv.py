@@ -1,12 +1,14 @@
 import hashlib
 import importlib.util
 import json
+import random
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 import trimesh
 
 
@@ -14,7 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 POINTNET_ROOT = ROOT / "pointnet2_orthodontic_comparison"
 sys.path.insert(0, str(POINTNET_ROOT))
 
-from run_orthodontic_pointnet2 import OrthodonticPointCloudDataset  # noqa: E402
+from run_orthodontic_pointnet2 import (  # noqa: E402
+    OrthodonticPointCloudDataset,
+    capture_rng_state,
+    restore_rng_state,
+)
 
 
 def load_cv_runner():
@@ -136,6 +142,17 @@ class PointNet2CVTest(unittest.TestCase):
                     cache_dir=Path(temporary) / "cache",
                     transformation_npz=transform_path,
                 )
+
+    def test_rng_restore_coerces_loaded_state_to_cpu_byte_tensor(self):
+        random.seed(17)
+        np.random.seed(17)
+        torch.manual_seed(17)
+        state = capture_rng_state()
+        state["torch"] = state["torch"].to(dtype=torch.int64)
+        restore_rng_state(state)
+        restored = torch.get_rng_state()
+        self.assertEqual(restored.device.type, "cpu")
+        self.assertEqual(restored.dtype, torch.uint8)
 
 
 if __name__ == "__main__":

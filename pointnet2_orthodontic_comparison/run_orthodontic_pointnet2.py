@@ -609,9 +609,27 @@ def restore_rng_state(state):
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    cpu_rng_state = state["torch"]
+    if not torch.is_tensor(cpu_rng_state):
+        cpu_rng_state = torch.as_tensor(cpu_rng_state, dtype=torch.uint8)
+    cpu_rng_state = cpu_rng_state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    torch.set_rng_state(cpu_rng_state)
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_rng_states = []
+        for cuda_state in state["cuda"]:
+            if not torch.is_tensor(cuda_state):
+                cuda_state = torch.as_tensor(cuda_state, dtype=torch.uint8)
+            cuda_rng_states.append(
+                cuda_state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+            )
+        device_count = torch.cuda.device_count()
+        if len(cuda_rng_states) == device_count:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        elif cuda_rng_states:
+            # Checkpoints may move between single- and multi-GPU runtimes.
+            for device_index in range(device_count):
+                source_index = min(device_index, len(cuda_rng_states) - 1)
+                torch.cuda.set_rng_state(cuda_rng_states[source_index], device=device_index)
 
 
 def load_torch(path, device):
