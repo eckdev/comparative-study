@@ -96,6 +96,23 @@ pooled_predictions_test.csv
 
 Her fold icinde `metrics_val.json`, `metrics.json`, `predictions_val.csv`, `predictions_test.csv`, `history.json`, `best_model.pth` ve leakage raporu bulunur.
 
+## 6. Analiz arsivini indir
+
+Tum fold sonuclarini yerel makinede ayrintili incelemek icin:
+
+```python
+%cd /content/comparative-study/pointnet2_orthodontic_comparison
+%run colab_download_pointnet2_cv_results.py --download
+```
+
+Komut once fold sayilarini, her ornekteki 23 landmark satirini, foldlar arasi test ornegi tekrarini ve kaydedilen ALE ile yeniden hesaplanan ALE uyumunu denetler. Ardindan su dosyayi olusturup tarayici indirmesini baslatir:
+
+```text
+/content/pointnet2_publication_cv_seed42_analysis_bundle.zip
+```
+
+Varsayilan arsiv checkpoint ve buyuk cache dosyalarini disarida birakir. Checkpointleri de indirmek icin `--include-checkpoints` kullanin.
+
 ## Dondurulmus ayarlar
 
 Ana protokol `publication_cv_protocol.json` icinde saklanir. PointNet++ kosusu `4096` nokta, XYZ+normal, Gaussian heatmap, AdamW, cosine scheduler ve `topk=20` kullanir. Bu ayarlar outer-test sonucuna bakilarak degistirilmemelidir.

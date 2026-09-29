@@ -14,6 +14,15 @@ python -u colab_run_pointnet2_cv.py --preset=cv --seed=42
 
 Ana kosu kesilirse ayni `--preset cv` komutu tamamlanan foldlari atlar ve yarim foldlari checkpointten devam ettirir. Dondurulmus model ve postprocess ayarlari `publication_cv_protocol.json` dosyasindadir.
 
+Bes fold tamamlandiktan sonra analiz icin gerekli sonuclari tek ZIP dosyasi olarak indirmek icin Colab'de:
+
+```python
+%cd /content/comparative-study/pointnet2_orthodontic_comparison
+%run colab_download_pointnet2_cv_results.py --download
+```
+
+Varsayilan arsiv `/content/pointnet2_publication_cv_seed42_analysis_bundle.zip` olarak olusturulur. Tahminler, fold ve landmark metrikleri, egitim gecmisi, split/hizalama kaynak bilgileri ve butunluk raporu eklenir; buyuk checkpoint ve cache dosyalari eklenmez. Checkpointler de gerekliyse komuta `--include-checkpoints` ekleyin.
+
 ## Optimal v2 Yaklasimi
 
 Ilk baseline sert 3.5 mm landmark maskesi ve yalnizca XYZ koordinatlariyla egitilmisti. V2 protokolunde model landmark lokalizasyonuna daha uygun hale getirildi:
