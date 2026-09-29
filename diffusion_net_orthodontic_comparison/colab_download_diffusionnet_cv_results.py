@@ -106,11 +106,11 @@ def json_bytes(payload):
     return (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
-def reported_ale(metrics_path):
+def reported_ale(metrics_path, metric_key):
     if not metrics_path.exists():
         return None
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    for key in ("diffusionnet_heatmap", "pooled", "overall"):
+    for key in (metric_key, "pooled", "overall"):
         value = payload.get(key)
         if isinstance(value, dict) and value.get("ale") is not None:
             return float(value["ale"])
@@ -119,7 +119,7 @@ def reported_ale(metrics_path):
     return None
 
 
-def collect_prediction_rows(run_dir, folds, allow_partial):
+def collect_prediction_rows(run_dir, folds, allow_partial, metric_key):
     all_rows = []
     fold_reports = []
     missing_required = []
@@ -151,7 +151,7 @@ def collect_prediction_rows(run_dir, folds, allow_partial):
         values = [row["error_mm"] for row in rows]
         sample_ids = {row.get("sample_id", "") for row in rows}
         computed = summarize(values)
-        source_ale = reported_ale(metrics_path)
+        source_ale = reported_ale(metrics_path, metric_key)
         fold_reports.append(
             {
                 "fold": fold,
@@ -344,7 +344,7 @@ def create_bundle(args):
     run_dir = Path(args.run_dir).expanduser().resolve()
     preprocessing_root = Path(args.preprocessing_root).expanduser().resolve()
     if not run_dir.exists():
-        raise FileNotFoundError(f"DiffusionNet run directory not found: {run_dir}")
+        raise FileNotFoundError(f"{args.model_name} run directory not found: {run_dir}")
     if not args.skip_preprocessing and not preprocessing_root.exists():
         raise FileNotFoundError(
             f"Preprocessing directory not found: {preprocessing_root}. "
@@ -358,7 +358,7 @@ def create_bundle(args):
     output.parent.mkdir(parents=True, exist_ok=True)
 
     rows, fold_reports, completed, missing_required = collect_prediction_rows(
-        run_dir, args.folds, args.allow_partial
+        run_dir, args.folds, args.allow_partial, args.metric_key
     )
     integrity = build_integrity_report(
         run_dir,
@@ -388,7 +388,7 @@ def create_bundle(args):
     )
     generated["analysis/integrity_report.json"] = json_bytes(integrity)
 
-    readme = f"""DiffusionNet 5-fold analysis bundle
+    readme = f"""{args.model_name} 5-fold analysis bundle
 
 Source run: {run_dir}
 Created (UTC): {datetime.now(timezone.utc).isoformat()}
@@ -442,6 +442,8 @@ when --include-checkpoints is explicitly supplied.
             "schema_version": 1,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "source_run_dir": str(run_dir),
+            "model": args.model_name,
+            "metric_key": args.metric_key,
             "source_preprocessing_root": (
                 None if args.skip_preprocessing else str(preprocessing_root)
             ),
@@ -452,6 +454,11 @@ when --include-checkpoints is explicitly supplied.
             "integrity_report": integrity,
         }
         archive.writestr(f"{bundle_root}/MANIFEST.json", json_bytes(manifest))
+
+    with zipfile.ZipFile(output, "r") as archive:
+        invalid_member = archive.testzip()
+    if invalid_member is not None:
+        raise RuntimeError(f"Archive verification failed at: {invalid_member}")
 
     print(f"Archive created: {output}", flush=True)
     print(f"Archive size: {output.stat().st_size / (1024 * 1024):.2f} MiB", flush=True)
@@ -486,9 +493,11 @@ def trigger_colab_download(path):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Package DiffusionNet CV results for local detailed analysis."
+        description="Package 5-fold CV results for local detailed analysis."
     )
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument("--model-name", default="DiffusionNet")
+    parser.add_argument("--metric-key", default="diffusionnet_heatmap")
     parser.add_argument(
         "--preprocessing-root", type=Path, default=DEFAULT_PREPROCESSING_ROOT
     )

@@ -109,11 +109,21 @@ python -u colab_run_palnet_cv.py --preset cv --seed 42
 
 `cv` preset'i dondurulmuş PAL-Net ayarlarını kullanır: `patch_size=1000`, `surface_points=100000`, `epochs=220`, `min_epochs=80`, `patience=35`, `batch_size=2`. Checkpoint seçimi validation snapped ALE ile yapılır; outer-test patch'leri checkpoint kilitlenmeden hazırlanmaz.
 
+Tamamlanan 5-fold sonuçlarını cache ve checkpointler olmadan indirilebilir bir ZIP arşivine dönüştürmek için Colab hücresinde:
+
+```python
+%cd /content/comparative-study/palnet_orthodontic_comparison
+%run colab_download_palnet_cv_results.py --download
+```
+
+Arşiv; fold ve pooled tahminleri, metrikleri, history dosyalarını, leakage/provenance kayıtlarını, örnek bazlı hata özetini ve en yüksek hatalı landmark tablosunu içerir. Model ağırlıkları da gerekiyorsa `--include-checkpoints` eklenebilir.
+
 ## Google Colab GPU
 
 Colab icin hazir dosyalar:
 
 - `colab_palnet_orthodontic_gpu.ipynb`
+- `colab_palnet_5fold.ipynb`
 - `COLAB_TR.md`
 
 ## Çıktılar
