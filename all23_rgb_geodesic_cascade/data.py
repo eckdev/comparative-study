@@ -382,6 +382,7 @@ def build_roi_cache(
     roi_mode="hybrid",
     euclidean_radius_scale=1.25,
     multi_seed_count=3,
+    geometry_only=False,
 ):
     radius_scale = float(radius_scale)
     roi_mode = str(roi_mode)
@@ -399,18 +400,20 @@ def build_roi_cache(
         ]
     )
     digest = hashlib.sha1(digest_source).hexdigest()[:10]
-    path = Path(cache_dir) / f"{sample_id}.v4.{roi_points}.r{radius_scale:g}.{digest}.npz"
+    suffix = ".geometry" if geometry_only else ""
+    path = Path(cache_dir) / f"{sample_id}.v4.{roi_points}.r{radius_scale:g}.{digest}{suffix}.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return path
     with np.load(record_path) as data:
         points = data["points"].copy()
         edge_index = data["edge_index"].copy()
-        if landmarks is None:
+        if landmarks is None and not geometry_only:
             if "landmarks" not in data.files:
                 raise ValueError(f"Landmarks must be supplied for geometry-only record: {record_path}")
             landmarks = data["landmarks"].copy()
-    landmarks = np.asarray(landmarks, dtype=np.float32)
+    if not geometry_only:
+        landmarks = np.asarray(landmarks, dtype=np.float32)
     tree = __import__("scipy.spatial", fromlist=["cKDTree"]).cKDTree(points)
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import dijkstra
@@ -422,7 +425,11 @@ def build_roi_cache(
     coarse_seeds = np.asarray(tree.query(coarse, k=seed_count)[1], dtype=np.int64)
     if coarse_seeds.ndim == 1:
         coarse_seeds = coarse_seeds[:, None]
-    expert_seeds = tree.query(landmarks, k=1)[1].astype(np.int64)
+    expert_seeds = (
+        np.empty(0, dtype=np.int64)
+        if geometry_only
+        else tree.query(landmarks, k=1)[1].astype(np.int64)
+    )
     max_radius = max(roi_radius_mm(index) for index in range(NUM_LANDMARKS)) * radius_scale
     distance_matrix = dijkstra(
         graph,
@@ -476,24 +483,30 @@ def build_roi_cache(
         center_distance_lookup[candidates] = ranking_distance
         selected_center_distance = center_distance_lookup[selected]
         selected_center_distance[~mask] = 0.0
-        # Expert-distance heatmaps use mesh geodesics where connected, Euclidean fallback otherwise.
-        expert_offset = NUM_LANDMARKS * seed_count
-        selected_distances = distance_matrix[expert_offset + landmark, selected]
-        missing = ~np.isfinite(selected_distances)
-        if np.any(missing):
-            selected_distances[missing] = np.linalg.norm(
-                points[selected[missing]] - landmarks[landmark], axis=1
-            )
-        sigma = heatmap_sigma_mm(landmark)
-        target = np.exp(-(selected_distances**2) / (2.0 * sigma**2)).astype(np.float32)
-        target[~mask] = 0.0
-        region = (selected_distances <= 3.5).astype(np.float32)
-        region[~mask] = 0.0
+        if geometry_only:
+            target = np.zeros(roi_points, dtype=np.float32)
+            region = np.zeros(roi_points, dtype=np.float32)
+            oracle = 0.0
+        else:
+            # Expert-distance heatmaps use mesh geodesics where connected, Euclidean fallback otherwise.
+            expert_offset = NUM_LANDMARKS * seed_count
+            selected_distances = distance_matrix[expert_offset + landmark, selected]
+            missing = ~np.isfinite(selected_distances)
+            if np.any(missing):
+                selected_distances[missing] = np.linalg.norm(
+                    points[selected[missing]] - landmarks[landmark], axis=1
+                )
+            sigma = heatmap_sigma_mm(landmark)
+            target = np.exp(-(selected_distances**2) / (2.0 * sigma**2)).astype(np.float32)
+            target[~mask] = 0.0
+            region = (selected_distances <= 3.5).astype(np.float32)
+            region[~mask] = 0.0
+            oracle = float(np.min(np.linalg.norm(points[selected[mask]] - landmarks[landmark], axis=1)))
         roi_indices.append(selected)
         roi_masks.append(mask)
         targets.append(target)
         regions.append(region)
-        oracles.append(float(np.min(np.linalg.norm(points[selected[mask]] - landmarks[landmark], axis=1))))
+        oracles.append(oracle)
         center_distances.append(selected_center_distance)
     np.savez_compressed(
         path,
@@ -561,7 +574,10 @@ class GlobalSurfaceDataset(Dataset):
                     "points": stored["points"].astype(np.float32),
                     "features": stored["features"].astype(np.float32),
                     "edge_index": stored["edge_index"].astype(np.int64),
-                    "landmarks": stored["landmarks"].astype(np.float32) if "landmarks" in stored.files else None,
+                    "landmarks": (
+                        stored["landmarks"].astype(np.float32)
+                        if self.include_expert and "landmarks" in stored.files else None
+                    ),
                 }
             if self.memory_cache:
                 self._record_memory[sample.sample_id] = record
@@ -678,6 +694,7 @@ class RGBGeodesicDataset(Dataset):
         coarse_in_target_space=False,
         sample_radius_scales=None,
         memory_cache=True,
+        include_expert=True,
         seed=42,
     ):
         by_id = {sample.sample_id: sample for sample in samples}
@@ -707,6 +724,9 @@ class RGBGeodesicDataset(Dataset):
             str(key): float(value) for key, value in (sample_radius_scales or {}).items()
         }
         self.memory_cache = bool(memory_cache)
+        self.include_expert = bool(include_expert)
+        if self.training and not self.include_expert:
+            raise ValueError("Training requires expert landmarks")
         self._record_memory = {}
         self._roi_memory = {}
         self.seed = int(seed)
@@ -736,7 +756,10 @@ class RGBGeodesicDataset(Dataset):
                     "points": stored["points"].astype(np.float32),
                     "features": stored["features"].astype(np.float32),
                     "edge_index": stored["edge_index"].astype(np.int64),
-                    "landmarks": stored["landmarks"].astype(np.float32) if "landmarks" in stored.files else None,
+                    "landmarks": (
+                        stored["landmarks"].astype(np.float32)
+                        if self.include_expert and "landmarks" in stored.files else None
+                    ),
                 }
             if self.memory_cache:
                 self._record_memory[sample.sample_id] = record
@@ -745,7 +768,9 @@ class RGBGeodesicDataset(Dataset):
         points = record["points"].copy()
         raw_features = record["features"].copy()
         edge_index = record["edge_index"]
-        if record["landmarks"] is None:
+        if not self.include_expert:
+            expert = np.zeros((NUM_LANDMARKS, 3), dtype=np.float32)
+        elif record["landmarks"] is None:
             expert = apply_transform(read_landmarks(sample.landmark_path), self.transforms[sample.sample_id]).astype(np.float32)
         else:
             expert = record["landmarks"].copy()
@@ -754,7 +779,7 @@ class RGBGeodesicDataset(Dataset):
         roi_path = build_roi_cache(
             self.records[sample.sample_id], coarse, self.roi_points,
             self.cache_dir / "roi", sample.sample_id, self.seed,
-            landmarks=expert,
+            landmarks=expert if self.include_expert else None,
             radius_scale=(
                 self.roi_radius_scale
                 * sample_radius_scale
@@ -762,6 +787,7 @@ class RGBGeodesicDataset(Dataset):
             roi_mode=self.roi_mode,
             euclidean_radius_scale=self.roi_euclidean_scale,
             multi_seed_count=self.roi_multi_seeds,
+            geometry_only=not self.include_expert,
         )
         if sample.sample_id not in self._roi_memory:
             with np.load(roi_path) as stored:
