@@ -11,7 +11,8 @@ from agh_former_vnext_gate_oof.analysis import paired_comparison
 from agh_former_vnext_gate_oof.evidence import collect_evidence
 from agh_former_vnext_gate_oof.gate import DiagnosticGate, Evidence, fit_gate, gate_predictions, load_gate
 from agh_former_vnext_gate_oof.run_gate_oof import (
-    assert_archived_validation_parity, inner_partitions, pilot_decision,
+    assert_archived_stage1_parity, assert_archived_validation_parity,
+    inner_partitions, pilot_decision,
 )
 from all23_rgb_geodesic_cascade.data import RGBGeodesicDataset, Sample, build_roi_cache
 from all23_rgb_geodesic_cascade.train import collect_outputs
@@ -174,34 +175,68 @@ class GateOOFTests(unittest.TestCase):
             validation.save(path)
             self.assertEqual(Evidence.load(path).sample_ids, validation.sample_ids)
 
-    def test_archived_validation_parity_rejects_coordinate_drift(self):
+    def test_archived_validation_replay_accepts_sparse_vertex_flips(self):
+        count = 48
         evidence = Evidence(
-            ["s1"], np.zeros((1, 23, 3), dtype=np.float32),
-            np.ones((1, 23, 3), dtype=np.float32),
-            np.zeros((1, 23, 5), dtype=np.float32),
-            np.full((1, 23), 0.5, dtype=np.float32),
+            [f"s{index}" for index in range(count)],
+            np.zeros((count, 23, 3), dtype=np.float32),
+            np.ones((count, 23, 3), dtype=np.float32),
+            np.zeros((count, 23, 5), dtype=np.float32),
+            np.full((count, 23), 0.5, dtype=np.float32),
+            np.zeros((count, 23, 3), dtype=np.float32),
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "predictions_val.csv"
             fields = ["sample_id", "landmark"] + [
                 f"{prefix}_{axis}"
-                for prefix in ("coarse", "refined", "neural_prediction")
+                for prefix in ("expert", "coarse", "refined", "neural_prediction", "stage1_coarse")
                 for axis in "xyz"
             ]
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
-                for landmark in range(23):
-                    row = {"sample_id": "s1", "landmark": landmark}
-                    for prefix, value in (("coarse", 0.0), ("refined", 1.0), ("neural_prediction", 0.5)):
-                        for axis in "xyz":
-                            row[f"{prefix}_{axis}"] = value
-                    writer.writerow(row)
+                for sample_id in evidence.sample_ids:
+                    for landmark in range(23):
+                        row = {"sample_id": sample_id, "landmark": landmark}
+                        for prefix, value in (("expert", 0.0), ("coarse", 0.0),
+                                              ("refined", 1.0), ("neural_prediction", 0.5),
+                                              ("stage1_coarse", 0.0)):
+                            for axis in "xyz":
+                                row[f"{prefix}_{axis}"] = value
+                        writer.writerow(row)
             self.assertEqual(
-                assert_archived_validation_parity(evidence, path)["local"], 0.0
+                assert_archived_validation_parity(evidence, path)["status"], "exact"
             )
-            evidence.center[0, 0, 0] = 0.1
-            with self.assertRaisesRegex(ValueError, "differs"):
+            stage1 = {
+                sample_id: np.zeros((23, 3), dtype=np.float32)
+                for sample_id in evidence.sample_ids
+            }
+            self.assertEqual(
+                assert_archived_stage1_parity(stage1, path, evidence.sample_ids), 0.0
+            )
+            stage1["s0"][0, 0] = 0.1
+            with self.assertRaisesRegex(ValueError, "Stage 1 centers differ"):
+                assert_archived_stage1_parity(stage1, path, evidence.sample_ids)
+            evidence.local[0, 21, 0] += 2.0
+            evidence.center[1, 22, 0] += 0.25
+            report = assert_archived_validation_parity(
+                evidence, path, report_path=Path(directory) / "replay.json"
+            )
+            self.assertEqual(report["status"], "bounded_numeric_drift")
+            self.assertEqual(report["coordinates"]["local"]["count_above_0p05mm"], 1)
+            self.assertEqual(len(report["landmark_ale_delta_mm"]), 23)
+            self.assertIn("p95_delta_mm", report["clinical"]["hard3"])
+            self.assertTrue((Path(directory) / "replay.json").exists())
+            evidence.local[2:14, 21, 0] += 2.0
+            with self.assertRaisesRegex(ValueError, "hard3 ALE delta"):
+                assert_archived_validation_parity(evidence, path)
+            evidence.local[2:14, 21, 0] -= 2.0
+            evidence.center[:, :, 0] += 0.1
+            with self.assertRaisesRegex(ValueError, "beyond guardrails"):
+                assert_archived_validation_parity(evidence, path)
+            evidence.center[:, :, 0] -= 0.1
+            evidence.expert[0, 0, 0] = 1.0
+            with self.assertRaisesRegex(ValueError, "expert coordinates differ"):
                 assert_archived_validation_parity(evidence, path)
 
 

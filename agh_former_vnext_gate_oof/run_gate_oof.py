@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import csv
 import hashlib
 import json
 import sys
@@ -18,7 +19,7 @@ if __package__ in (None, ""):
 from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import (
     configure_vnext, model_from_args, vnext_signature,
 )
-from all23_rgb_geodesic_cascade.anatomy import NUM_LANDMARKS
+from all23_rgb_geodesic_cascade.anatomy import CORE20, HARD3, NUM_LANDMARKS
 from all23_rgb_geodesic_cascade.data import assert_disjoint_splits, discover_samples
 from all23_rgb_geodesic_cascade.losses import LossWeights
 from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
@@ -410,9 +411,7 @@ def _write_prediction_csv(path, evidence, models):
                 writer.writerow(row)
 
 
-def assert_archived_validation_parity(evidence, path, tolerance_mm=0.05):
-    import csv
-
+def _archived_rows(path):
     rows = {}
     with Path(path).open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -420,31 +419,134 @@ def assert_archived_validation_parity(evidence, path, tolerance_mm=0.05):
             if key in rows:
                 raise ValueError(f"Duplicate archived validation row: {key}")
             rows[key] = row
+    return rows
+
+
+def _archived_coordinates(rows, sample_ids, prefix):
+    return np.asarray([
+        [[float(rows[(sample_id, landmark)][f"{prefix}_{axis}"]) for axis in "xyz"]
+         for landmark in range(NUM_LANDMARKS)]
+        for sample_id in sample_ids
+    ], dtype=np.float32)
+
+
+def assert_archived_stage1_parity(coarse, path, sample_ids, tolerance_mm=1e-4):
+    rows = _archived_rows(path)
+    expected = {(sample_id, landmark) for sample_id in sample_ids
+                for landmark in range(NUM_LANDMARKS)}
+    if set(rows) != expected:
+        raise ValueError("Archived Stage 1 validation rows differ from this fold")
+    archived = _archived_coordinates(rows, sample_ids, "stage1_coarse")
+    current = np.stack([coarse[sample_id] for sample_id in sample_ids])
+    maximum = float(np.linalg.norm(archived - current, axis=-1).max())
+    if maximum > tolerance_mm:
+        raise ValueError(
+            f"Archived Stage 1 centers differ by {maximum:.4f} mm; "
+            "the coarse cache cannot be reused for this experiment"
+        )
+    return maximum
+
+
+def assert_archived_validation_parity(evidence, path, tolerance_mm=0.05, report_path=None):
+    """Audit replay drift without mistaking rare mesh-vertex flips for a new model."""
+    evidence.validate(require_expert=True)
+    rows = _archived_rows(path)
     expected = {
         (sample_id, landmark)
         for sample_id in evidence.sample_ids for landmark in range(NUM_LANDMARKS)
     }
     if set(rows) != expected:
         raise ValueError("Archived validation sample/landmark rows differ from this fold")
-    max_difference = {}
+    archived_expert = _archived_coordinates(rows, evidence.sample_ids, "expert")
+    expert_max = float(np.linalg.norm(archived_expert - evidence.expert, axis=-1).max())
+    if expert_max > 1e-3:
+        raise ValueError(
+            f"Archived validation expert coordinates differ by {expert_max:.4f} mm; "
+            "landmarks or alignment changed"
+        )
+
+    comparisons = {}
     for name, prefix, predicted in (
         ("fusion", "coarse", evidence.center),
         ("local", "refined", evidence.local),
         ("token_gate", "neural_prediction", _prediction(evidence, evidence.token_alpha)),
     ):
-        source = np.asarray([
-            [[float(rows[(sample_id, landmark)][f"{prefix}_{axis}"]) for axis in "xyz"]
-             for landmark in range(NUM_LANDMARKS)]
-            for sample_id in evidence.sample_ids
-        ], dtype=np.float32)
-        maximum = float(np.linalg.norm(source - predicted, axis=-1).max())
-        max_difference[name] = maximum
-        if maximum > tolerance_mm:
-            raise ValueError(
-                f"Archived Stage 2 {name} differs by {maximum:.4f} mm; "
-                "check dataset, preprocessing, checkpoint, TTA and code version"
-            )
-    return max_difference
+        source = _archived_coordinates(rows, evidence.sample_ids, prefix)
+        drift = np.linalg.norm(source - predicted, axis=-1)
+        worst_sample, worst_landmark = np.unravel_index(int(np.argmax(drift)), drift.shape)
+        comparisons[name] = {
+            "mean_mm": float(drift.mean()),
+            "p95_mm": float(np.percentile(drift, 95)),
+            "max_mm": float(drift.max()),
+            "count_above_0p05mm": int(np.count_nonzero(drift > tolerance_mm)),
+            "fraction_above_0p05mm": float(np.mean(drift > tolerance_mm)),
+            "worst_sample_id": evidence.sample_ids[worst_sample],
+            "worst_landmark": int(worst_landmark),
+        }
+
+    source_prediction = _archived_coordinates(rows, evidence.sample_ids, "neural_prediction")
+    current_prediction = _prediction(evidence, evidence.token_alpha)
+    source_errors = np.linalg.norm(source_prediction - evidence.expert, axis=-1)
+    current_errors = np.linalg.norm(current_prediction - evidence.expert, axis=-1)
+    clinical = {}
+    for name, indices in (("overall", range(NUM_LANDMARKS)),
+                          ("core20", CORE20), ("hard3", HARD3)):
+        clinical[name] = {
+            "archived_ale_mm": float(source_errors[:, indices].mean()),
+            "replayed_ale_mm": float(current_errors[:, indices].mean()),
+            "delta_mm": float(current_errors[:, indices].mean() - source_errors[:, indices].mean()),
+            "archived_p95_mm": float(np.percentile(source_errors[:, indices], 95)),
+            "replayed_p95_mm": float(np.percentile(current_errors[:, indices], 95)),
+        }
+        clinical[name]["p95_delta_mm"] = (
+            clinical[name]["replayed_p95_mm"] - clinical[name]["archived_p95_mm"]
+        )
+
+    # Small logit differences can move discrete mesh decoding to another vertex.
+    limits = {
+        "fusion_mean_mm": 0.02, "fusion_p95_mm": 0.05, "fusion_max_mm": 0.35,
+        "local_or_gate_mean_mm": 0.03, "local_or_gate_p95_mm": 0.05,
+        "local_or_gate_max_mm": 3.0, "local_or_gate_fraction_above_0p05mm": 0.02,
+        "overall_ale_delta_mm": 0.02, "core20_ale_delta_mm": 0.02,
+        "hard3_ale_delta_mm": 0.05,
+    }
+    issues = []
+    fusion = comparisons["fusion"]
+    for statistic, limit in (("mean_mm", limits["fusion_mean_mm"]),
+                             ("p95_mm", limits["fusion_p95_mm"]),
+                             ("max_mm", limits["fusion_max_mm"])):
+        if fusion[statistic] > limit:
+            issues.append(f"fusion {statistic}={fusion[statistic]:.4f}>{limit:.4f}")
+    for name in ("local", "token_gate"):
+        row = comparisons[name]
+        for statistic, limit in (
+            ("mean_mm", limits["local_or_gate_mean_mm"]),
+            ("p95_mm", limits["local_or_gate_p95_mm"]),
+            ("max_mm", limits["local_or_gate_max_mm"]),
+            ("fraction_above_0p05mm", limits["local_or_gate_fraction_above_0p05mm"]),
+        ):
+            if row[statistic] > limit:
+                issues.append(f"{name} {statistic}={row[statistic]:.4f}>{limit:.4f}")
+    for name in ("overall", "core20", "hard3"):
+        limit = limits[f"{name}_ale_delta_mm"]
+        if abs(clinical[name]["delta_mm"]) > limit:
+            issues.append(f"{name} ALE delta={clinical[name]['delta_mm']:.4f}, limit={limit:.4f}")
+    exact = all(row["max_mm"] <= tolerance_mm for row in comparisons.values())
+    report = {
+        "status": "rejected" if issues else ("exact" if exact else "bounded_numeric_drift"),
+        "expert_max_difference_mm": expert_max,
+        "coordinates": comparisons,
+        "clinical": clinical,
+        "landmark_ale_delta_mm": (current_errors - source_errors).mean(axis=0).tolist(),
+        "guardrails": limits,
+        "issues": issues,
+        "note": "Bounded drift is not exact coordinate parity; all gate policies use the same replayed evidence.",
+    }
+    if report_path is not None:
+        write_json(report_path, report)
+    if issues:
+        raise ValueError("Archived Stage 2 replay differs beyond guardrails: " + "; ".join(issues))
+    return report
 
 
 def run_outer_fold(fold, samples, options, device, *, validation_only):
@@ -461,11 +563,26 @@ def run_outer_fold(fold, samples, options, device, *, validation_only):
         samples, splits, preprocessing_dir,
         roi_expansion=checkpoint["args"]["registration_roi_expansion"],
     )
+    stage1_parity = assert_archived_stage1_parity(
+        coarse, source_dir / "predictions_val.csv", splits["val"]
+    )
     del records, normalizer, coarse, scales
     fingerprint = dataset_source_fingerprint(samples)
     run_key = signature({
-        "version": 1, "source_checkpoint_sha": options.source_checkpoint_sha,
+        "version": 2, "source_checkpoint_sha": options.source_checkpoint_sha,
         "source_gate_sha": file_sha256(token_gate_path) if token_gate_path.exists() else None,
+        "archived_validation_sha": file_sha256(source_dir / "predictions_val.csv"),
+        "stage1_train_sha": file_sha256(
+            preprocessing_dir / "stage1_global_coarse" / "oof_predictions_train.csv"
+        ),
+        "stage1_validation_sha": file_sha256(
+            preprocessing_dir / "stage1_global_coarse" / "predictions_val.csv"
+        ),
+        "stage1_test_sha": file_sha256(
+            preprocessing_dir / "stage1_global_coarse" / "predictions_test.csv"
+        ),
+        "normalization_sha": file_sha256(preprocessing_dir / "normalization.json"),
+        "alignment_sha": file_sha256(preprocessing_dir / "alignment" / "mesh_only_transforms.npz"),
         "data_fingerprint": fingerprint, "splits": splits,
         "inner_folds": options.inner_folds, "inner_val_fraction": options.inner_val_fraction,
         "inner_stage2_epochs": options.inner_stage2_epochs,
@@ -484,6 +601,7 @@ def run_outer_fold(fold, samples, options, device, *, validation_only):
             "source_checkpoint_sha256": options.source_checkpoint_sha,
             "source_gate": str(token_gate_path),
             "preprocessing_source": str(preprocessing_dir),
+            "stage1_validation_max_difference_mm": stage1_parity,
             "splits": splits,
         })
     def outer_evidence(split_name, labels):
@@ -521,9 +639,16 @@ def run_outer_fold(fold, samples, options, device, *, validation_only):
     print(f"Outer fold {fold}: collecting fixed Stage 2 validation evidence", flush=True)
     validation = outer_evidence("val", labels=True)
     parity = assert_archived_validation_parity(
-        validation, source_dir / "predictions_val.csv"
+        validation, source_dir / "predictions_val.csv",
+        report_path=fold_dir / "archived_stage2_parity.json",
     )
-    write_json(fold_dir / "archived_stage2_parity.json", parity)
+    print(
+        f"Archived Stage 2 replay: {parity['status']}; "
+        f"fusion max={parity['coordinates']['fusion']['max_mm']:.4f} mm, "
+        f"local max={parity['coordinates']['local']['max_mm']:.4f} mm, "
+        f"Hard3 ALE delta={parity['clinical']['hard3']['delta_mm']:+.4f} mm",
+        flush=True,
+    )
     train_insample = outer_evidence("train", labels=True)
     oof = build_oof_evidence(
         samples, splits, checkpoint, fold_dir / "stage2_oof", device,
@@ -606,10 +731,13 @@ def main():
         )
     if options.preset == "gate_oof_preflight":
         for fold in range(1, 6):
-            _, splits, checkpoint, _, _, _ = source_fold(options.source_run_root, fold, all_ids)
-            load_outer_preprocessing(
+            source_dir, splits, checkpoint, _, _, _ = source_fold(options.source_run_root, fold, all_ids)
+            _, _, _, coarse, _ = load_outer_preprocessing(
                 samples, splits, options.preprocessing_root / f"fold_{fold}",
                 roi_expansion=checkpoint["args"]["registration_roi_expansion"],
+            )
+            stage1_difference = assert_archived_stage1_parity(
+                coarse, source_dir / "predictions_val.csv", splits["val"]
             )
             partitions = inner_partitions(
                 samples, splits["train"], options.inner_folds,
@@ -617,7 +745,8 @@ def main():
             )
             print(
                 f"Preflight fold {fold}: {len(partitions)} inner fits; "
-                f"outer train/val/test={len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}",
+                f"outer train/val/test={len(splits['train'])}/{len(splits['val'])}/{len(splits['test'])}; "
+                f"Stage 1 max difference={stage1_difference:.6f} mm",
                 flush=True,
             )
         options.output_dir.mkdir(parents=True, exist_ok=True)

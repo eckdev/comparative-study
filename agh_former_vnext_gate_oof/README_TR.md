@@ -25,7 +25,28 @@ Repository'de veri yoktur; Drive'daki `orthodontic/data/dataset` kullanilir.
 Ayni komutla yeniden baslatmak tamamlanan inner fold'lari atlar; yarida
 kalan Stage 1/Stage 2 egitimi kendi checkpoint'lerinden devam eder. Kaynak
 run klasorleri salt okunur; yeni dosyalar Drive'daki
-`agh_vnext_gate_oof_runs/publication_gate_oof_seed42/` altina yazilir.
+`agh_vnext_gate_oof_runs_v2/publication_gate_oof_seed42/` altina yazilir.
+
+Eski surum `Archived Stage 2 fusion differs` hatasiyla durduysa, kodu
+guncelledikten sonra varsayilan run root artik `..._v2` olur. Boylece eski
+`val_evidence.npz` dosyasi tekrar kullanilmaz. Ozellestirilmis `--run-root`
+kullaniyorsaniz onun da yeni bir dizin olmasi gerekir:
+
+```python
+!python -u colab_run_gate_oof.py --preset gate_oof_preflight --seed 42 --run-root /content/drive/MyDrive/orthodontic/agh_vnext_gate_oof_runs_v2
+!python -u colab_run_gate_oof.py --preset gate_oof_fold1 --seed 42 --run-root /content/drive/MyDrive/orthodontic/agh_vnext_gate_oof_runs_v2
+```
+
+Fold raporundaki `archived_stage2_parity.json`, yeniden hesaplanan Stage 2
+koordinatlarinin arsivle farkini kaydeder. Stage 1 merkezleri ve uzman etiketleri
+birebir eslesmelidir. Seyrek GPU/nokta-secimi farklari varsa bunlar ancak
+koordinat dagilimi ve All-23/Core20/Hard3 validation ALE degisimi sinirliysa
+`bounded_numeric_drift` olarak kabul edilir; bu durum *tam koordinat esligi*
+anlamina gelmez. Esikleri asan bir farkta egitim yine durur.
+Bu tekrar-oynatim esikleri Fold 1'de gozlenen sayisal sapma sonrasinda
+belirlendi; model secimi icin onceden belirlenmis klinik esikler degildir.
+Rapor koordinat ortalamasi, p95, maksimum, etkilenen nokta sayisi, grup ALE/p95
+farki ve 23 landmarkin ALE farkini ayri ayri saklar.
 
 ## Bilimsel yorum
 

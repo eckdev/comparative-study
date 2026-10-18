@@ -14,7 +14,7 @@ SOURCE_ROOT = Path("/content/drive/MyDrive/orthodontic/agh_vnext_runs/publicatio
 PREPROCESSING_ROOT = Path(
     "/content/drive/MyDrive/orthodontic/all23_rgb_geodesic_runs/publication_cv_stage1_v4_seed42"
 )
-RUN_ROOT = Path("/content/drive/MyDrive/orthodontic/agh_vnext_gate_oof_runs")
+RUN_ROOT = Path("/content/drive/MyDrive/orthodontic/agh_vnext_gate_oof_runs_v2")
 
 
 def main():
