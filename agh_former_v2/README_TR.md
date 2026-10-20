@@ -42,10 +42,10 @@ Aşama B (yerel)  : All23-MVSC × {1,2} iterasyon (ROI her iterasyonda öneriye 
 ## Çalıştırma (Colab)
 `colab_agh_v2_tr.ipynb` defterindeki hücreleri sırayla çalıştırın:
 1. `--preset v2_smoke`: Fold 1, 2 epoch, yalnızca validasyon.
-2. `--preset v2_val_all_folds`: 5 fold'un validasyon bölümleri (240 kişi). Sonunda `validation_gate.json` yazılır.
+2. `--preset v2_val_all_folds`: 5 fold'un validasyon bölümleri. Toplam 240 validasyon tahmini var; ama bölümler her fold içinde ayrı seçildiği için bunlar 184 farklı kişiye ait. Sonunda `validation_gate.json` yazılır.
 3. `--preset v2_final_test`: yalnızca kapı geçtiyse çalışır, testi bir kez koşar.
 
-**Validasyon kapısı** (vNext'in arşivdeki validasyon tahminleriyle aynı 240 kişi üzerinde):
+**Validasyon kapısı** (vNext'in arşivdeki validasyon tahminleriyle aynı 240 fold-tahmini üzerinde; bootstrap aynı kişinin tüm satırlarını birlikte örnekler):
 - all-23 ALE ≤ vNext,
 - Hard3 kötüleşmesi ≤ 0.10 mm,
 - Core20 kötüleşmesi ≤ 0.05 mm.

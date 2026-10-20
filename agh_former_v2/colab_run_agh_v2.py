@@ -84,6 +84,8 @@ def command_for(preset, seed, stage_a_run, fold_indices=None):
         command.append("--validation-only")
     elif preset == "v2_final_test":
         command.append("--final-test")
+    elif preset == "v2_gate_only":
+        command.append("--gate-only")
     else:
         raise ValueError(f"Unknown preset: {preset}")
     if fold_indices and preset != "v2_smoke":
@@ -91,11 +93,26 @@ def command_for(preset, seed, stage_a_run, fold_indices=None):
     return command, output_dir
 
 
+def diagnostics_commands(seed, stage_a_run):
+    """CPU-only: recompute the validation gate, then write the diagnostics report."""
+    gate, output_dir = command_for("v2_gate_only", seed, stage_a_run)
+    analysis = [
+        sys.executable,
+        "-u",
+        str(CODE_ROOT / "agh_former_v2/analyze_validation.py"),
+        "--v2-run",
+        str(output_dir),
+        "--vnext-run",
+        str(stage_a_run),
+    ]
+    return [gate, analysis], output_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="Colab runner for AGH-Former v2")
     parser.add_argument(
         "--preset",
-        choices=("v2_smoke", "v2_val_all_folds", "v2_final_test"),
+        choices=("v2_smoke", "v2_val_all_folds", "v2_diagnostics", "v2_final_test"),
         default="v2_smoke",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -107,15 +124,20 @@ def main():
     if not Path(args.stage_a_run, "fold_1", "predictions_val.csv").exists():
         raise FileNotFoundError(f"Archived vNext run not found: {args.stage_a_run}")
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
-    command, output_dir = command_for(
-        args.preset, args.seed, args.stage_a_run, args.fold_indices
-    )
-    if args.preset == "v2_final_test":
-        require_validation_gate(output_dir)
-    print("Running:", " ".join(map(str, command)), flush=True)
+    if args.preset == "v2_diagnostics":
+        commands, _ = diagnostics_commands(args.seed, args.stage_a_run)
+    else:
+        command, output_dir = command_for(
+            args.preset, args.seed, args.stage_a_run, args.fold_indices
+        )
+        if args.preset == "v2_final_test":
+            require_validation_gate(output_dir)
+        commands = [command]
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
-    subprocess.run(command, cwd=str(CODE_ROOT), check=True, env=environment)
+    for command in commands:
+        print("Running:", " ".join(map(str, command)), flush=True)
+        subprocess.run(command, cwd=str(CODE_ROOT), check=True, env=environment)
 
 
 if __name__ == "__main__":

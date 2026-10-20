@@ -105,6 +105,11 @@ def build_parser():
         "--no-all23-jaw-profile", dest="all23_jaw_profile", action="store_false"
     )
     parser.add_argument(
+        "--gate-only",
+        action="store_true",
+        help="Recompute validation_gate.json from existing predictions_val.csv files",
+    )
+    parser.add_argument(
         "--skip-manifest-check",
         action="store_true",
         help="Smoke runs only: do not require folds to equal the shared manifest",
@@ -484,9 +489,15 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
     return summary
 
 
-def pooled_csv_errors(paths, column_prefix=None):
+def pooled_csv_errors(paths_by_fold, column_prefix=None):
+    """Pool per-fold prediction errors keyed by (fold, sample_id).
+
+    Validation partitions are drawn independently inside each outer-train set,
+    so one participant can appear in several folds; each fold-prediction is a
+    separate row and the participant id is returned for cluster resampling.
+    """
     errors = {}
-    for path in paths:
+    for fold, path in paths_by_fold.items():
         with open(path, newline="", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 if column_prefix is None:
@@ -495,26 +506,66 @@ def pooled_csv_errors(paths, column_prefix=None):
                     prediction = np.asarray([float(row[f"{column_prefix}_{axis}"]) for axis in "xyz"])
                     expert = np.asarray([float(row[f"expert_{axis}"]) for axis in "xyz"])
                     value = float(np.linalg.norm(prediction - expert))
-                errors.setdefault(row["sample_id"], np.full(NUM_LANDMARKS, np.nan))[
+                errors.setdefault((int(fold), row["sample_id"]), np.full(NUM_LANDMARKS, np.nan))[
                     int(row["landmark"])
                 ] = value
-    matrix = np.stack([errors[key] for key in sorted(errors)])
+    keys = sorted(errors)
+    matrix = np.stack([errors[key] for key in keys])
     if not np.isfinite(matrix).all():
         raise RuntimeError("Pooled validation errors are incomplete")
-    return sorted(errors), matrix
+    return keys, matrix, [sample_id for _, sample_id in keys]
+
+
+def cluster_bootstrap_delta(base_errors, final_errors, clusters, iterations=2000, seed=42):
+    """Bootstrap of mean(final) - mean(base) resampling whole participants.
+
+    All rows (fold-predictions) of a resampled participant enter together, so
+    participants that were validated in several folds are not treated as
+    independent observations.
+    """
+    base = np.asarray(base_errors, dtype=np.float64).reshape(len(clusters), -1)
+    final = np.asarray(final_errors, dtype=np.float64).reshape(len(clusters), -1)
+    names = sorted(set(clusters))
+    index = {name: position for position, name in enumerate(names)}
+    labels = np.asarray([index[name] for name in clusters])
+    width = base.shape[1]
+    base_sum = np.bincount(labels, weights=base.sum(axis=1), minlength=len(names))
+    final_sum = np.bincount(labels, weights=final.sum(axis=1), minlength=len(names))
+    counts = np.bincount(labels, minlength=len(names)) * width
+    rng = np.random.default_rng(seed)
+    values = np.empty(int(iterations), dtype=np.float64)
+    for iteration in range(int(iterations)):
+        drawn = np.bincount(rng.integers(0, len(names), size=len(names)), minlength=len(names))
+        total = float((drawn * counts).sum())
+        values[iteration] = ((drawn * final_sum).sum() - (drawn * base_sum).sum()) / total
+    return {
+        "delta_ale": float(final.mean() - base.mean()),
+        "ci95": [float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))],
+        "probability_improved": float(np.mean(values < 0)),
+        "clusters": len(names),
+        "rows": len(clusters),
+    }
 
 
 def validation_gate(output_dir, stage_a_run, folds, seed, iterations=2000):
     """Compare pooled v2 validation errors with the archived vNext validation errors."""
-    v2_ids, v2 = pooled_csv_errors(
-        [Path(output_dir) / f"fold_{fold}" / "predictions_val.csv" for fold in folds]
+    v2_keys, v2, participants = pooled_csv_errors(
+        {fold: Path(output_dir) / f"fold_{fold}" / "predictions_val.csv" for fold in folds}
     )
-    vnext_ids, vnext = pooled_csv_errors(
-        [Path(stage_a_run) / f"fold_{fold}" / "predictions_val.csv" for fold in folds]
+    vnext_keys, vnext, _ = pooled_csv_errors(
+        {fold: Path(stage_a_run) / f"fold_{fold}" / "predictions_val.csv" for fold in folds}
     )
-    if v2_ids != vnext_ids:
-        raise RuntimeError("v2 and vNext validation participants differ")
-    delta = bootstrap_delta(vnext, v2, iterations, seed)
+    if v2_keys != vnext_keys:
+        raise RuntimeError("v2 and vNext validation fold-predictions differ")
+    delta = {
+        "all23": cluster_bootstrap_delta(vnext, v2, participants, iterations, seed),
+        "core20": cluster_bootstrap_delta(
+            vnext[:, list(CORE20)], v2[:, list(CORE20)], participants, iterations, seed
+        ),
+        "hard3": cluster_bootstrap_delta(
+            vnext[:, list(HARD3)], v2[:, list(HARD3)], participants, iterations, seed
+        ),
+    }
     checks = {
         "all23_not_worse": float(v2.mean()) <= float(vnext.mean()),
         "hard3_regression_at_most_0p10": float(v2[:, list(HARD3)].mean())
@@ -527,7 +578,8 @@ def validation_gate(output_dir, stage_a_run, folds, seed, iterations=2000):
     gate = {
         "version": VERSION,
         "folds": list(folds),
-        "participants": len(v2_ids),
+        "predictions": len(v2_keys),
+        "unique_participants": len(set(participants)),
         "v2_validation": {
             "all23": float(v2.mean()),
             "core20": float(v2[:, list(CORE20)].mean()),
@@ -586,8 +638,27 @@ def main():
     resolve_precision(args, device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.final_test and args.validation_only:
-        raise ValueError("--final-test and --validation-only are mutually exclusive")
+    if args.final_test and (args.validation_only or args.gate_only):
+        raise ValueError("--final-test cannot be combined with --validation-only/--gate-only")
+    if args.gate_only:
+        folds = (
+            [int(value) for value in str(args.fold_indices).split(",") if value.strip()]
+            if args.fold_indices
+            else list(range(1, args.folds + 1))
+        )
+        gate = validation_gate(
+            output_dir, args.stage_a_run, folds, args.seed, args.bootstrap_iters
+        )
+        shown = (
+            "predictions",
+            "unique_participants",
+            "v2_validation",
+            "vnext_validation",
+            "checks",
+            "run_final_test",
+        )
+        print(json.dumps({key: gate[key] for key in shown}, indent=2), flush=True)
+        return
     samples = discover_samples(args.data_root)
     preprocessing_root = (
         validate_preprocessing_root(args.preprocessing_root, args)
