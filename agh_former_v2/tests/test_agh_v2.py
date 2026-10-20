@@ -10,6 +10,7 @@ import pytest
 
 from agh_former_v2.analyze_validation import analyze, open_validation_csv
 from agh_former_v2.run_agh_v2 import (
+    check_locked_validation,
     cluster_bootstrap_delta,
     policy_digest,
     pooled_csv_errors,
@@ -200,3 +201,14 @@ def test_analyze_validation_builds_stage_gate_and_head_to_head_tables(tmp_path):
     ungated = next(row for row in report["ungated"] if row["set"] == "all23")
     assert ungated["gate_gain_vs_ungated_mm"] == pytest.approx(0.25)
     assert (tmp_path / "out/diagnostics_val.md").exists()
+
+
+def test_final_test_requires_reproduced_validation(tmp_path):
+    path = tmp_path / "locked.npz"
+    prediction = np.zeros((2, NUM_LANDMARKS, 3), dtype=np.float32)
+    np.savez_compressed(path, sample_ids=np.asarray(["A", "B"]), prediction=prediction)
+    assert check_locked_validation(path, ["A", "B"], prediction + 0.001) < 0.01
+    with pytest.raises(RuntimeError, match="drifted"):
+        check_locked_validation(path, ["A", "B"], prediction + 0.5)
+    with pytest.raises(RuntimeError, match="participants differ"):
+        check_locked_validation(path, ["B", "A"], prediction)

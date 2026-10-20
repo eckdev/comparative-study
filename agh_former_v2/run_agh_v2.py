@@ -64,7 +64,7 @@ from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
 )
 
 
-VERSION = "AGH-Former-v2-phase1"
+VERSION = "AGH-Former-v2.1"
 STAGE_A_COLUMN = "coarse"
 SHARED_MANIFEST = (
     Path(__file__).resolve().parent.parent
@@ -101,6 +101,22 @@ def build_parser():
     parser.add_argument("--all23-max-iterations", type=int, default=2)
     parser.add_argument("--all23-gate-folds", type=int, default=5)
     parser.add_argument("--all23-gate-epochs", type=int, default=300)
+    parser.add_argument("--all23-mc-samples", type=int, default=8)
+    parser.add_argument("--no-all23-ensemble", dest="all23_ensemble", action="store_false")
+    parser.add_argument(
+        "--refiner-source-run",
+        default=None,
+        help=(
+            "Earlier v2 run whose trained refiners (fold_k/all23_mvsc) are reused "
+            "without retraining; evidence, gates and policies are rebuilt here"
+        ),
+    )
+    parser.add_argument(
+        "--no-gate-evidence-prior",
+        dest="gate_evidence_prior",
+        action="store_false",
+        help="Do not pass gate-evidence centres through the selected shape prior",
+    )
     parser.add_argument(
         "--no-all23-jaw-profile", dest="all23_jaw_profile", action="store_false"
     )
@@ -116,7 +132,12 @@ def build_parser():
     )
     parser.add_argument("--no-v2-shape-prior", dest="v2_shape_prior", action="store_false")
     parser.add_argument("--v2-shape-prior-min-gain-mm", type=float, default=0.01)
-    parser.set_defaults(all23_jaw_profile=True, v2_shape_prior=True)
+    parser.set_defaults(
+        all23_jaw_profile=True,
+        v2_shape_prior=True,
+        all23_ensemble=True,
+        gate_evidence_prior=True,
+    )
     return parser
 
 
@@ -132,6 +153,8 @@ def all23_config_from_args(args):
         max_iterations=args.all23_max_iterations,
         gate_folds=args.all23_gate_folds,
         gate_epochs=args.all23_gate_epochs,
+        ensemble=args.all23_ensemble,
+        mc_samples=args.all23_mc_samples,
         use_jaw_profile=args.all23_jaw_profile,
         bootstrap_iters=args.bootstrap_iters,
         mixed_precision=bool(args.mixed_precision),
@@ -302,6 +325,37 @@ def fit_v2_shape_prior(args, train_dataset, base, expert, sample_ids, fold_dir):
     return prior, report
 
 
+def refinement_extras(applied):
+    return {
+        name: applied[name]
+        for name in (
+            "gate_alpha",
+            "effective_alpha",
+            "confidence",
+            "mc_spread",
+            "ensemble_spread",
+        )
+    }
+
+
+def check_locked_validation(path, sample_ids, prediction, tolerance_mm=0.01):
+    """The final-test run must reproduce the validation predictions it locked."""
+    if not Path(path).exists():
+        raise RuntimeError(f"Locked validation predictions are missing: {path}")
+    with np.load(path, allow_pickle=False) as record:
+        locked_ids = record["sample_ids"].tolist()
+        locked = record["prediction"]
+    if locked_ids != list(sample_ids):
+        raise RuntimeError("Validation participants differ from the locked run")
+    drift = float(np.linalg.norm(np.asarray(prediction) - locked, axis=-1).max())
+    if drift > tolerance_mm:
+        raise RuntimeError(
+            f"Validation predictions drifted {drift:.4f} mm from the locked run; "
+            "the pipeline is not the one that was validated"
+        )
+    return drift
+
+
 def policy_digest(policy):
     payload = {key: policy[key] for key in ("iterations", "alpha_caps", "accepted")}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -356,9 +410,32 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
     val_base = prior.transform(val_base_a) if prior else val_base_a.copy()
 
     started = time.time()
-    refinement = fit_or_load_all23_refinement(
-        datasets["train"], refine_dir, config, device, scratch_dir=scratch
+    model_dir = (
+        Path(args.refiner_source_run) / f"fold_{fold_index}" / "all23_mvsc"
+        if args.refiner_source_run
+        else None
     )
+    incoming_prior_config = (
+        {key: prior.config[key] for key in ("components", "l2", "alpha_core", "alpha_hard")}
+        if prior is not None and args.gate_evidence_prior and prior_report.get("accepted")
+        else None
+    )
+    refinement = fit_or_load_all23_refinement(
+        datasets["train"],
+        refine_dir,
+        config,
+        device,
+        scratch_dir=scratch,
+        model_dir=model_dir,
+        incoming_prior_config=incoming_prior_config,
+    )
+    inference = {
+        "stage_a_column": args.stage_a_column,
+        "ensemble_members": refinement.reports["ensemble_members"],
+        "mc_samples": config.mc_samples,
+        "model_dir": refinement.reports["model_dir"],
+        "gate_evidence_prior": incoming_prior_config,
+    }
     val_result = refinement.predict(
         val_dataset,
         {sample_id: val_base[index] for index, sample_id in enumerate(val_ids)},
@@ -377,6 +454,8 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
             raise RuntimeError("Locked policy file was modified after validation")
         if lock["shape_prior"].get("selected") != prior_report.get("selected"):
             raise RuntimeError("Shape-prior selection differs from the locked validation run")
+        if lock.get("inference") != json.loads(json.dumps(inference)):
+            raise RuntimeError("Inference settings differ from the locked validation run")
     else:
         policy = calibrate_policy(val_result, val_expert, config)
         write_policy(refine_dir, policy)
@@ -390,11 +469,7 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
         },
         "prediction": applied["prediction"],
     }
-    val_extras = {
-        "gate_alpha": applied["gate_alpha"],
-        "effective_alpha": applied["effective_alpha"],
-        "confidence": applied["confidence"],
-    }
+    val_extras = refinement_extras(applied)
     val_metrics = save_split(
         fold_dir, "val", val_ids, sample_meta(val_dataset), val_expert,
         val_columns, val_extras, args.seed, args.bootstrap_iters,
@@ -406,10 +481,19 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
         "policy": {key: policy[key] for key in ("accepted", "iterations", "alpha_caps")},
         "manifest_check": manifest_check,
         "frame_drift_mm": frame_drift,
+        "inference": inference,
         "test_labels_consumed": False,
     }
+    locked_predictions_path = fold_dir / "locked_validation_predictions.npz"
     if not args.final_test:
         prior_state_path.write_text(json.dumps(lock, indent=2), encoding="utf-8")
+        np.savez_compressed(
+            locked_predictions_path,
+            sample_ids=np.asarray(val_ids),
+            prediction=applied["prediction"],
+        )
+    else:
+        check_locked_validation(locked_predictions_path, val_ids, applied["prediction"])
     print(
         f"Fold {fold_index} validation: stage A={val_metrics['stages']['stage_a']['overall']['ale']:.4f} "
         f"prior={val_metrics['stages']['prior']['overall']['ale']:.4f} "
@@ -465,11 +549,7 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
     }
     test_metrics = save_split(
         fold_dir, "test", test_ids, sample_meta(test_dataset), test_expert, test_columns,
-        {
-            "gate_alpha": test_applied["gate_alpha"],
-            "effective_alpha": test_applied["effective_alpha"],
-            "confidence": test_applied["confidence"],
-        },
+        refinement_extras(test_applied),
         args.seed, args.bootstrap_iters,
     )
     summary["test"] = test_metrics

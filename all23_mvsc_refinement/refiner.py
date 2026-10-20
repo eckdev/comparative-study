@@ -57,7 +57,10 @@ from .patches import (
 from .spatial_prior import ConditionalSpatialPrior, SpatialPriorConfig, _folds_from_strata
 
 
-VERSION = "All23-MVSC-v1"
+VERSION = "All23-MVSC-v1.1"
+# Part of every trained-refiner signature. Inference-only changes must not bump
+# it, otherwise refiners trained by an earlier run can no longer be reused.
+MODEL_VERSION = "All23-MVSC-v1"
 
 
 @dataclass
@@ -105,6 +108,10 @@ class All23MVSCConfig:
     bootstrap_iters: int = 2000
     gate_epochs: int = 300
     gate_patience: int = 30
+    # Inference-only settings: averaging the cross-fit inner refiners with the
+    # full-fit refiner, and MC-dropout passes that feed the gate's spread signal.
+    ensemble: bool = True
+    mc_samples: int = 8
     mixed_precision: bool = True
     amp_dtype: str = "bfloat16"
     seed: int = 42
@@ -120,7 +127,10 @@ _POLICY_ONLY_FIELDS = (
     "gate_patience",
     "max_iterations",
     "gate_folds",
+    "ensemble",
+    "mc_samples",
 )
+EVIDENCE_VERSION = 2
 
 
 def config_signature(config, fit_sample_ids=()):
@@ -135,7 +145,7 @@ def config_signature(config, fit_sample_ids=()):
             "geometry_features": len(GEOMETRY_FEATURES),
             "views": list(VIEW_NAMES),
             "fit_sample_ids": sorted(fit_sample_ids),
-            "version": VERSION,
+            "version": MODEL_VERSION,
         }
     )
     encoded = json.dumps(payload, sort_keys=True, default=list).encode("utf-8")
@@ -625,8 +635,36 @@ def fit_network(candidates, output_dir, config, device, signature):
     return model, report
 
 
+def _mc_dropout_spread(model, loader, config, device, samples):
+    """RMS deviation (mm) of MC-dropout proposals around their mean.
+
+    The network has no batch normalization (GroupNorm/LayerNorm only), so
+    train mode changes nothing except the dropout layers.
+    """
+    passes = []
+    devices = [device] if device.type == "cuda" else []
+    # A fixed, isolated seed keeps the gate inputs (and hence the locked
+    # validation predictions) reproducible without touching the global RNG.
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(config.seed + 2027)
+        model.train()
+        try:
+            for _ in range(int(samples)):
+                rows = []
+                for batch in loader:
+                    batch = _move(batch, device)
+                    with _autocast(config, device):
+                        rows.append(model(batch)["proposal"].float().cpu().numpy())
+                passes.append(np.concatenate(rows, axis=0))
+        finally:
+            model.eval()
+    stacked = np.stack(passes)
+    deviation = np.linalg.norm(stacked - stacked.mean(axis=0, keepdims=True), axis=-1)
+    return np.sqrt(np.mean(deviation**2, axis=0))
+
+
 @torch.no_grad()
-def predict_candidates(model, candidates, config, device):
+def predict_candidates(model, candidates, config, device, mc_samples=0):
     loader = DataLoader(
         FlatAll23Dataset(candidates, np.arange(len(candidates)), config, training=False),
         batch_size=config.batch_size,
@@ -658,6 +696,10 @@ def predict_candidates(model, candidates, config, device):
     stacked["view_weights"] = stacked["view_weights"].reshape(
         samples, NUM_LANDMARKS, len(VIEW_NAMES)
     )
+    if mc_samples and mc_samples > 1:
+        stacked["mc_spread"] = _mc_dropout_spread(
+            model, loader, config, device, mc_samples
+        ).reshape(samples, NUM_LANDMARKS)
     if candidates.has_expert:
         stacked["oracle"] = np.where(
             candidates.mask, candidates.target_distance, np.inf
@@ -665,14 +707,49 @@ def predict_candidates(model, candidates, config, device):
     return stacked
 
 
-class FittedRefiner:
-    """A trained network together with the spatial prior of its fit set."""
+_AVERAGED_OUTPUTS = ("confidence", "entropy", "margin", "prior_disagreement", "log_variance")
 
-    def __init__(self, model, prior, config, report, device):
-        self.model = model
+
+def predict_members(models, candidates, config, device, mc_samples=0):
+    """Average member proposals; MC-dropout spread comes from the first member.
+
+    The gate is fitted on single-refiner evidence, so its spread signal is
+    always that of one network (the full-fit refiner at inference).
+    """
+    member_outputs = [
+        predict_candidates(
+            model, candidates, config, device, mc_samples=mc_samples if index == 0 else 0
+        )
+        for index, model in enumerate(models)
+    ]
+    proposals = np.stack([output["proposal"] for output in member_outputs])
+    result = {
+        "proposal": proposals.mean(axis=0),
+        "ensemble_spread": np.sqrt(
+            np.mean(
+                np.linalg.norm(proposals - proposals.mean(axis=0, keepdims=True), axis=-1)
+                ** 2,
+                axis=0,
+            )
+        ),
+        "members": len(models),
+    }
+    for name in _AVERAGED_OUTPUTS:
+        result[name] = np.mean([output[name] for output in member_outputs], axis=0)
+    result["view_weights"] = member_outputs[0]["view_weights"]
+    for name in ("mc_spread", "oracle"):
+        if name in member_outputs[0]:
+            result[name] = member_outputs[0][name]
+    return result
+
+
+class RefinerEnsemble:
+    """One or more trained networks sharing one spatial prior and candidate set."""
+
+    def __init__(self, models, prior, config, device):
+        self.models = list(models)
         self.prior = prior
         self.config = config
-        self.report = report
         self.device = device
 
     def iterate(
@@ -683,6 +760,7 @@ class FittedRefiner:
         scratch_dir=None,
         cache_dir=None,
         label="All23-MVSC inference",
+        mc_samples=0,
     ):
         """Run 1..iterations proposals, re-centring the ROI on each proposal."""
         sample_ids = [sample.sample_id for sample in dataset.samples]
@@ -713,7 +791,9 @@ class FittedRefiner:
                 storage_dir=storage,
                 label=f"{label} iteration {iteration}",
             )
-            prediction = predict_candidates(self.model, candidates, self.config, self.device)
+            prediction = predict_members(
+                self.models, candidates, self.config, self.device, mc_samples
+            )
             prediction["center"] = centers.copy()
             results.append(prediction)
             centers = prediction["proposal"].astype(np.float32)
@@ -723,7 +803,31 @@ class FittedRefiner:
         return sample_ids, results
 
 
-def fit_refiner(dataset, output_dir, config, device, scratch_dir=None, label="All23-MVSC"):
+class FittedRefiner:
+    """A trained network together with the spatial prior of its fit set."""
+
+    def __init__(self, model, prior, config, report, device):
+        self.model = model
+        self.prior = prior
+        self.config = config
+        self.report = report
+        self.device = device
+
+    def iterate(self, dataset, base_by_id, iterations, **kwargs):
+        return RefinerEnsemble([self.model], self.prior, self.config, self.device).iterate(
+            dataset, base_by_id, iterations, **kwargs
+        )
+
+
+def fit_refiner(
+    dataset,
+    output_dir,
+    config,
+    device,
+    scratch_dir=None,
+    label="All23-MVSC",
+    require_cached=False,
+):
     """Fit (or load) one refiner on all participants of ``dataset``."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -749,6 +853,11 @@ def fit_refiner(dataset, output_dir, config, device, scratch_dir=None, label="Al
                 model, ConditionalSpatialPrior.load(prior_path), config, report, device
             )
 
+    if require_cached:
+        raise RuntimeError(
+            f"{label}: no compatible trained refiner in {output_dir}; "
+            "the source run must have been trained with the same configuration"
+        )
     prior = ConditionalSpatialPrior(
         SpatialPriorConfig(
             folds=config.prior_folds, l2_grid=tuple(config.prior_l2_grid), seed=config.seed
@@ -807,15 +916,58 @@ def _expert_by_id(dataset):
     return {sample_id: shapes[index] for index, sample_id in enumerate(sample_ids)}
 
 
-def build_crossfit_evidence(train_dataset, output_dir, config, device, scratch_dir=None):
+def _incoming_transform(fit_dataset, prior_config):
+    """Shape prior refitted on the inner-fit participants with the outer config.
+
+    Gate evidence starts from Stage-1 OOF centres; applying the same shape-prior
+    step as the outer pipeline brings that incoming estimate closer to the one
+    the gate sees at inference. No held-out label is used.
+    """
+    if not prior_config:
+        return None
+    from .shape_prior import ProcrustesShapePrior
+
+    shapes, sample_ids, _, _ = dataset_shapes(fit_dataset)
+    prior = ProcrustesShapePrior().fit(shapes, sample_ids)
+    prior.config = {
+        key: prior_config[key] for key in ("components", "l2", "alpha_core", "alpha_hard")
+    }
+    return prior
+
+
+def evidence_signature(config, sample_ids, prior_config):
+    payload = {
+        "refiner": config_signature(config, sample_ids),
+        "evidence_version": EVIDENCE_VERSION,
+        "gate_folds": config.gate_folds,
+        "max_iterations": config.max_iterations,
+        "mc_samples": config.mc_samples,
+        "incoming_prior": prior_config or None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=list).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_crossfit_evidence(
+    train_dataset,
+    output_dir,
+    config,
+    device,
+    scratch_dir=None,
+    model_dir=None,
+    incoming_prior_config=None,
+    require_cached_models=False,
+):
     """Out-of-fold refiner evidence for every outer-train participant.
 
     Each inner refiner is trained without its held-out participants, and those
-    participants are refined starting from their Stage-1 OOF centres (which were
-    themselves produced by Stage-1 models that never saw them).
-    Returns {iterations: GateEvidence}.
+    participants are refined starting from their Stage-1 OOF centres (produced
+    by Stage-1 models that never saw them), optionally passed through the shape
+    prior. Inner refiners are read from ``model_dir`` (defaults to output_dir).
+    Returns ({iterations: GateEvidence}, [inner FittedRefiner]).
     """
     output_dir = Path(output_dir)
+    model_dir = Path(model_dir) if model_dir else output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_paths = {
         iterations: output_dir / f"evidence_iter{iterations}.npz"
@@ -823,51 +975,66 @@ def build_crossfit_evidence(train_dataset, output_dir, config, device, scratch_d
     }
     sample_ids = [sample.sample_id for sample in train_dataset.samples]
     manifest_path = output_dir / "crossfit_manifest.json"
-    signature = config_signature(config, sample_ids)
-    if manifest_path.exists() and all(path.exists() for path in evidence_paths.values()):
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("signature") == signature and manifest.get(
-            "gate_folds"
-        ) == config.gate_folds:
-            print("All23-MVSC cross-fit evidence cached", flush=True)
-            return {
-                iterations: GateEvidence.load(path)
-                for iterations, path in evidence_paths.items()
-            }
-
-    strata = [
-        f"{sample.class_name}|{sample.gender}" for sample in train_dataset.samples
-    ]
+    signature = evidence_signature(config, sample_ids, incoming_prior_config)
+    strata = [f"{sample.class_name}|{sample.gender}" for sample in train_dataset.samples]
     folds = _folds_from_strata(strata, config.gate_folds, config.seed + 7)
-    expert = _expert_by_id(train_dataset)
-    stage1 = {
-        sample.sample_id: train_dataset._coarse(sample) for sample in train_dataset.samples
-    }
-    collected = {iterations: [] for iterations in evidence_paths}
-    fold_rows = []
+
+    def inner_refiner(fold_number, fit_ids):
+        return fit_refiner(
+            subset_dataset(train_dataset, fit_ids),
+            model_dir / f"inner_fold_{fold_number}",
+            config,
+            device,
+            scratch_dir=scratch_dir,
+            label=f"All23-MVSC inner fold {fold_number}",
+            require_cached=require_cached_models,
+        )
+
+    split_rows = []
     for fold_number, held_out in enumerate(folds, start=1):
         held_ids = [sample_ids[index] for index in held_out]
         fit_ids = [sample_id for sample_id in sample_ids if sample_id not in set(held_ids)]
         if set(held_ids) & set(fit_ids):
             raise AssertionError("Cross-fit evidence participants leaked into the fit set")
-        refiner = fit_refiner(
-            subset_dataset(train_dataset, fit_ids),
-            output_dir / f"inner_fold_{fold_number}",
-            config,
-            device,
-            scratch_dir=scratch_dir,
-            label=f"All23-MVSC inner fold {fold_number}",
-        )
+        split_rows.append((fold_number, held_ids, fit_ids))
+
+    if manifest_path.exists() and all(path.exists() for path in evidence_paths.values()):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("signature") == signature:
+            print("All23-MVSC cross-fit evidence cached", flush=True)
+            refiners = [inner_refiner(number, fit_ids) for number, _, fit_ids in split_rows]
+            return (
+                {iterations: GateEvidence.load(path) for iterations, path in evidence_paths.items()},
+                refiners,
+            )
+
+    expert = _expert_by_id(train_dataset)
+    stage1 = {
+        sample.sample_id: train_dataset._coarse(sample) for sample in train_dataset.samples
+    }
+    collected = {iterations: [] for iterations in evidence_paths}
+    fold_rows, refiners = [], []
+    for fold_number, held_ids, fit_ids in split_rows:
+        refiner = inner_refiner(fold_number, fit_ids)
+        refiners.append(refiner)
         held_dataset = subset_dataset(train_dataset, held_ids)
+        incoming = {sample_id: stage1[sample_id] for sample_id in held_ids}
+        transform = _incoming_transform(
+            subset_dataset(train_dataset, fit_ids), incoming_prior_config
+        )
+        if transform is not None:
+            transformed = transform.transform(np.stack([incoming[key] for key in held_ids]))
+            incoming = {key: transformed[index] for index, key in enumerate(held_ids)}
         ordered_ids, results = refiner.iterate(
             held_dataset,
-            stage1,
+            incoming,
             config.max_iterations,
             scratch_dir=scratch_dir,
             cache_dir=roi_cache_dir(scratch_dir, output_dir / "roi_cache"),
             label=f"crossfit fold {fold_number}",
+            mc_samples=config.mc_samples,
         )
-        base = np.stack([stage1[sample_id] for sample_id in ordered_ids])
+        base = np.stack([incoming[sample_id] for sample_id in ordered_ids])
         experts = np.stack([expert[sample_id] for sample_id in ordered_ids])
         for iterations in evidence_paths:
             used = results[:iterations]
@@ -910,7 +1077,14 @@ def build_crossfit_evidence(train_dataset, output_dir, config, device, scratch_d
             {
                 "signature": signature,
                 "gate_folds": config.gate_folds,
-                "base_source": "stage1_nested_oof_centres",
+                "model_dir": str(model_dir),
+                "base_source": (
+                    "stage1_nested_oof_centres_plus_inner_shape_prior"
+                    if incoming_prior_config
+                    else "stage1_nested_oof_centres"
+                ),
+                "incoming_prior_config": incoming_prior_config or None,
+                "mc_samples": config.mc_samples,
                 "folds": fold_rows,
                 "uses_outer_validation_labels": False,
                 "uses_test_labels": False,
@@ -919,27 +1093,28 @@ def build_crossfit_evidence(train_dataset, output_dir, config, device, scratch_d
         ),
         encoding="utf-8",
     )
-    return evidence
+    return evidence, refiners
 
 
 class All23Refinement:
-    """Full-fit refiner plus one OOF gate per iteration count."""
+    """Refiner ensemble plus one OOF gate per iteration count."""
 
-    def __init__(self, refiner, gates, reports, config, device):
-        self.refiner = refiner
+    def __init__(self, ensemble, gates, reports, config, device):
+        self.ensemble = ensemble
         self.gates = gates
         self.reports = reports
         self.config = config
         self.device = device
 
     def predict(self, dataset, base_by_id, scratch_dir=None, cache_dir=None, label="All23-MVSC"):
-        sample_ids, results = self.refiner.iterate(
+        sample_ids, results = self.ensemble.iterate(
             dataset,
             base_by_id,
             self.config.max_iterations,
             scratch_dir=scratch_dir,
             cache_dir=cache_dir,
             label=label,
+            mc_samples=self.config.mc_samples,
         )
         base = np.stack([base_by_id[sample_id] for sample_id in sample_ids]).astype(np.float32)
         by_iterations = {}
@@ -953,23 +1128,52 @@ class All23Refinement:
                 "diagnostics": diagnostics,
                 "confidence": used[-1]["confidence"],
                 "entropy": used[-1]["entropy"],
+                "ensemble_spread": used[-1]["ensemble_spread"],
+                "mc_spread": used[-1].get(
+                    "mc_spread", np.zeros_like(used[-1]["entropy"])
+                ),
                 "oracle": used[-1].get("oracle"),
             }
         return {"sample_ids": sample_ids, "base": base, "iterations": by_iterations}
 
 
-def fit_or_load_all23_refinement(train_dataset, output_dir, config, device, scratch_dir=None):
+def fit_or_load_all23_refinement(
+    train_dataset,
+    output_dir,
+    config,
+    device,
+    scratch_dir=None,
+    model_dir=None,
+    incoming_prior_config=None,
+):
+    """Cross-fit evidence, OOF gates and the inference ensemble of one fold.
+
+    ``model_dir`` points at an earlier run whose refiners are reused unchanged
+    (no training happens then); evidence and gates are rebuilt in output_dir.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    evidence = build_crossfit_evidence(
-        train_dataset, output_dir / "crossfit", config, device, scratch_dir=scratch_dir
+    reuse = model_dir is not None and Path(model_dir) != output_dir
+    model_root = Path(model_dir) if model_dir else output_dir
+    evidence, inner_refiners = build_crossfit_evidence(
+        train_dataset,
+        output_dir / "crossfit",
+        config,
+        device,
+        scratch_dir=scratch_dir,
+        model_dir=model_root / "crossfit",
+        incoming_prior_config=incoming_prior_config,
+        require_cached_models=reuse,
     )
     gates, reports = {}, {"gates": {}}
     for iterations, rows in evidence.items():
         gate_dir = output_dir / f"gate_iter{iterations}"
         gate_path = gate_dir / "oof_gate.pth"
         report_path = gate_dir / "gate_report.json"
-        signature = config_signature(config, rows.sample_ids) + f"|gate{iterations}"
+        signature = (
+            evidence_signature(config, rows.sample_ids, incoming_prior_config)
+            + f"|gate{iterations}"
+        )
         cached = False
         if gate_path.exists() and report_path.exists():
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -996,27 +1200,29 @@ def fit_or_load_all23_refinement(train_dataset, output_dir, config, device, scra
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
             gates[iterations] = (model, mean, std)
         reports["gates"][iterations] = json.loads(report_path.read_text(encoding="utf-8"))
-    refiner = fit_refiner(
+    full = fit_refiner(
         train_dataset,
-        output_dir / "full_model",
+        model_root / "full_model",
         config,
         device,
         scratch_dir=scratch_dir,
         label="All23-MVSC full outer-train",
+        require_cached=reuse,
     )
-    reports["full_model"] = refiner.report
-    return All23Refinement(refiner, gates, reports, config, device)
+    reports["full_model"] = full.report
+    # The full-fit refiner leads: its prior renders the candidates and its
+    # MC-dropout spread feeds the gate. Inner refiners never saw val/test.
+    members = [full.model] + (
+        [refiner.model for refiner in inner_refiners] if config.ensemble else []
+    )
+    reports["ensemble_members"] = len(members)
+    reports["model_dir"] = str(model_root)
+    ensemble = RefinerEnsemble(members, full.prior, config, device)
+    return All23Refinement(ensemble, gates, reports, config, device)
 
 
 def _type_columns():
     return {name: list(landmarks) for name, landmarks in LANDMARK_TYPES.items()}
-
-
-def compose(base, proposal, gate_alpha, caps):
-    alpha = np.zeros_like(gate_alpha)
-    for name, columns in _type_columns().items():
-        alpha[:, columns] = float(caps[name]) * gate_alpha[:, columns]
-    return base + alpha[..., None] * (proposal - base), alpha
 
 
 def _group_rows(errors):
@@ -1032,15 +1238,45 @@ def _group_rows(errors):
     return rows
 
 
+def _policy_iterations(policy):
+    """Per-type iteration counts; v1 policies stored one shared count."""
+    iterations = policy["iterations"]
+    if isinstance(iterations, dict):
+        return {name: int(value) for name, value in iterations.items()}
+    return {name: int(iterations) for name in LANDMARK_TYPES}
+
+
+_COMPOSED_FIELDS = ("gate_alpha", "confidence", "entropy", "ensemble_spread", "mc_spread")
+
+
+def compose_policy(result, iterations, caps):
+    base = result["base"]
+    final = base.copy()
+    alpha = np.zeros(base.shape[:2], dtype=np.float32)
+    fields = {name: np.zeros(base.shape[:2], dtype=np.float32) for name in _COMPOSED_FIELDS}
+    proposal = base.copy()
+    for name, columns in _type_columns().items():
+        values = result["iterations"][int(iterations[name])]
+        alpha[:, columns] = float(caps[name]) * values["gate_alpha"][:, columns]
+        proposal[:, columns] = values["proposal"][:, columns]
+        final[:, columns] = base[:, columns] + alpha[:, columns, None] * (
+            values["proposal"][:, columns] - base[:, columns]
+        )
+        for field in _COMPOSED_FIELDS:
+            if field in values:
+                fields[field][:, columns] = values[field][:, columns]
+    return final, alpha, proposal, fields
+
+
+
 def calibrate_policy(result, expert, config):
-    """Choose iteration count and per-type alpha caps on outer validation."""
+    """Choose iteration count and alpha cap per landmark type on outer validation."""
     base = result["base"]
     base_error = np.linalg.norm(base - expert, axis=-1)
-    sweep, candidates = [], []
-    for iterations, values in result["iterations"].items():
-        caps = {}
-        for name, columns in _type_columns().items():
-            rows = []
+    sweep, iterations, caps = [], {}, {}
+    for name, columns in _type_columns().items():
+        rows = []
+        for count, values in result["iterations"].items():
             for cap in config.alpha_cap_grid:
                 alpha = float(cap) * values["gate_alpha"][:, columns]
                 final = base[:, columns] + alpha[..., None] * (
@@ -1048,20 +1284,18 @@ def calibrate_policy(result, expert, config):
                 )
                 error = np.linalg.norm(final - expert[:, columns], axis=-1)
                 row = {
-                    "iterations": iterations,
+                    "iterations": int(count),
                     "type": name,
                     "alpha_cap": float(cap),
                     **summarize(error),
                 }
                 rows.append(row)
                 sweep.append(row)
-            caps[name] = min(rows, key=lambda row: (row["ale"], row["alpha_cap"]))["alpha_cap"]
-        final, _ = compose(base, values["proposal"], values["gate_alpha"], caps)
-        error = np.linalg.norm(final - expert, axis=-1)
-        candidates.append((float(error.mean()), iterations, caps, error))
-    selected_ale, iterations, caps, final_error = min(
-        candidates, key=lambda row: (row[0], row[1])
-    )
+        best = min(rows, key=lambda row: (row["ale"], row["alpha_cap"], row["iterations"]))
+        iterations[name] = int(best["iterations"])
+        caps[name] = float(best["alpha_cap"])
+    final, _, proposal, _ = compose_policy(result, iterations, caps)
+    final_error = np.linalg.norm(final - expert, axis=-1)
     type_regression = {
         name: float(final_error[:, columns].mean() - base_error[:, columns].mean())
         for name, columns in _type_columns().items()
@@ -1072,16 +1306,13 @@ def calibrate_policy(result, expert, config):
         and bootstrap["probability_improved"] >= config.minimum_improvement_probability
         and max(type_regression.values()) <= config.maximum_type_regression_mm
     )
-    values = result["iterations"][iterations]
-    ungated_error = np.linalg.norm(values["proposal"] - expert, axis=-1)
+    ungated_error = np.linalg.norm(proposal - expert, axis=-1)
     return {
         "version": VERSION,
         "accepted": accepted,
-        "iterations": int(iterations),
-        "alpha_caps": {name: float(value) for name, value in caps.items()}
-        if accepted
-        else {name: 0.0 for name in LANDMARK_TYPES},
-        "proposed_alpha_caps": {name: float(value) for name, value in caps.items()},
+        "iterations": iterations,
+        "alpha_caps": caps if accepted else {name: 0.0 for name in LANDMARK_TYPES},
+        "proposed_alpha_caps": caps,
         "base": summarize(base_error),
         "ungated_proposal": summarize(ungated_error),
         "selected": summarize(final_error if accepted else base_error),
@@ -1097,20 +1328,15 @@ def calibrate_policy(result, expert, config):
 
 
 def apply_policy(result, policy):
-    iterations = int(policy["iterations"])
-    values = result["iterations"][iterations]
-    final, alpha = compose(
-        result["base"], values["proposal"], values["gate_alpha"], policy["alpha_caps"]
-    )
+    iterations = _policy_iterations(policy)
+    final, alpha, proposal, fields = compose_policy(result, iterations, policy["alpha_caps"])
     return {
         "sample_ids": list(result["sample_ids"]),
         "base": result["base"],
-        "proposal": values["proposal"],
+        "proposal": proposal,
         "prediction": final.astype(np.float32),
-        "gate_alpha": values["gate_alpha"],
         "effective_alpha": alpha.astype(np.float32),
-        "confidence": values["confidence"],
-        "entropy": values["entropy"],
+        **fields,
         "iteration_proposals": {
             key: value["proposal"] for key, value in result["iterations"].items()
         },

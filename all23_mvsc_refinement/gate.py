@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from all23_rgb_geodesic_cascade.anatomy import NUM_LANDMARKS
+from all23_rgb_geodesic_cascade.anatomy import NUM_LANDMARKS, SYMMETRY_PAIRS
 
 from .anatomy import TYPE_NAMES
 from .patches import type_indices
@@ -31,9 +31,12 @@ DIAGNOSTIC_NAMES = (
     "log_variance_over_4",
     "displacement_over_type_scale",
     "iteration_step_over_type_scale",
+    "mc_dropout_spread_over_type_scale",
+    "anatomical_inconsistency_over_type_scale",
 )
 # Typical incoming error per type (mm) used to put displacements on one scale.
 TYPE_SCALE_MM = {"corner": 2.0, "contour": 4.0, "texture_boundary": 5.0}
+MIDLINE_PLANE_LANDMARKS = tuple(range(1, 13))
 
 
 def type_scale_vector():
@@ -41,6 +44,40 @@ def type_scale_vector():
         [TYPE_SCALE_MM[TYPE_NAMES[index]] for index in type_indices()],
         dtype=np.float32,
     )
+
+
+def midsagittal_planes(shapes):
+    """Per-sample plane (centroid, unit normal) through the midline landmarks.
+
+    Fitted on the incoming estimate, never on expert landmarks. The normal is
+    the least-variance direction of LM1-LM12, i.e. the lateral axis.
+    """
+    midline = np.asarray(shapes, dtype=np.float64)[:, list(MIDLINE_PLANE_LANDMARKS)]
+    centroid = midline.mean(axis=1)
+    normals = []
+    for points, center in zip(midline, centroid):
+        _, _, vt = np.linalg.svd(points - center, full_matrices=False)
+        normals.append(vt[-1])
+    return centroid, np.stack(normals)
+
+
+def anatomical_inconsistency(proposal, base):
+    """Distance of each proposal from its anatomical expectation (mm).
+
+    Midline landmarks: absolute distance to the midsagittal plane.
+    Bilateral landmarks: distance to the partner proposal mirrored through it.
+    Faces are not perfectly symmetric, so this is an evidence signal for the
+    gate, not a constraint on the coordinates.
+    """
+    proposal = np.asarray(proposal, dtype=np.float64)
+    centroid, normal = midsagittal_planes(base)
+    signed = np.einsum("nlk,nk->nl", proposal - centroid[:, None], normal)
+    mirrored = proposal - 2.0 * signed[..., None] * normal[:, None]
+    result = np.abs(signed)
+    for left, right in SYMMETRY_PAIRS:
+        result[:, left] = np.linalg.norm(proposal[:, left] - mirrored[:, right], axis=-1)
+        result[:, right] = np.linalg.norm(proposal[:, right] - mirrored[:, left], axis=-1)
+    return result.astype(np.float32)
 
 
 def diagnostics_from_iterations(base, iterations):
@@ -52,6 +89,9 @@ def diagnostics_from_iterations(base, iterations):
     step = np.linalg.norm(last["proposal"] - previous, axis=-1) / scale
     if len(iterations) == 1:
         step = np.zeros_like(step)
+    spread = last.get("mc_spread")
+    if spread is None:
+        spread = np.zeros_like(displacement)
     return np.stack(
         [
             last["entropy"],
@@ -60,6 +100,8 @@ def diagnostics_from_iterations(base, iterations):
             last["log_variance"] / 4.0,
             displacement,
             step,
+            spread / scale,
+            anatomical_inconsistency(last["proposal"], base) / scale,
         ],
         axis=-1,
     ).astype(np.float32)

@@ -193,12 +193,15 @@ def policy_rows(v2, folds):
         if not path.exists():
             continue
         policy = json.loads(path.read_text(encoding="utf-8"))
-        selected_iterations[fold] = int(policy["iterations"])
+        iterations = policy["iterations"]
+        if not isinstance(iterations, dict):
+            iterations = {name: int(iterations) for name in LANDMARK_TYPES}
+        selected_iterations[fold] = {name: int(value) for name, value in iterations.items()}
         rows.append(
             {
                 "fold": fold,
                 "accepted": bool(policy["accepted"]),
-                "iterations": int(policy["iterations"]),
+                **{f"iterations_{name}": value for name, value in iterations.items()},
                 **{f"cap_{name}": value for name, value in policy["alpha_caps"].items()},
                 **{f"proposed_cap_{name}": value for name, value in policy["proposed_alpha_caps"].items()},
                 "base_ale": policy["base"]["ale"],
@@ -212,12 +215,16 @@ def policy_rows(v2, folds):
 
 def ungated_rows(v2, selected_iterations):
     """Selected-iteration proposal (alpha = 1) versus the gated output."""
-    if not selected_iterations or not all(v2.has(f"iter{k}") for k in set(selected_iterations.values())):
+    counts = {value for by_type in selected_iterations.values() for value in by_type.values()}
+    if not selected_iterations or not all(v2.has(f"iter{count}") for count in counts):
         return []
     proposal = np.zeros((len(v2.keys), NUM_LANDMARKS))
-    errors_by_iteration = {k: v2.errors(f"iter{k}") for k in set(selected_iterations.values())}
+    errors_by_iteration = {count: v2.errors(f"iter{count}") for count in counts}
     for row, fold in enumerate(v2.folds):
-        proposal[row] = errors_by_iteration[selected_iterations[int(fold)]][row]
+        for name, landmarks in LANDMARK_TYPES.items():
+            columns = list(landmarks)
+            count = selected_iterations[int(fold)][name]
+            proposal[row, columns] = errors_by_iteration[count][row, columns]
     final = v2.errors("prediction")
     incoming = v2.errors("prior")
     return [

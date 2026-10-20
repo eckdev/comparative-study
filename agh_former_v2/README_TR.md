@@ -1,4 +1,4 @@
-# AGH-Former v2 — sade 2 aşamalı yapı (Faz 1)
+# AGH-Former v2 / v2.1 — tek yerel düzelticili kaskad
 
 ## Neden
 `results/publication_cv_seed42` (vNext) çıktılarının aşama bazlı analizinde şunlar görüldü:
@@ -59,3 +59,40 @@ palnet_orthodontic_comparison/.venv/bin/python -m pytest all23_mvsc_refinement/t
 - **Gate kanıtında dağılım farkı:** kanıt, Stage-1 OOF merkezlerinden başlıyor. Uygulamada ise girdi Aşama A + şekil önceli; bu girdi genelde daha iyi olduğu için gate muhafazakâr kalabilir.
 - **Aşama A arşivden geliyor:** Faz 1'de Aşama A, vNext'in birlikte eğitilmiş Stage 2 modelinin fusion çıktısıdır. Local başlık olmadan yeniden eğitilmesi Faz 2'ye bırakıldı.
 - **Hesaplama maliyeti:** outer fold başına 6 düzeltici eğitimi gerekir (5 iç + 1 tam). Görüntüler `--scratch-dir` altında memmap olarak tutulur ve eğitim sonrası silinir.
+
+## v2.1 (güncel aday)
+
+### Neden?
+v2'nin 5 fold'luk validasyon tanı raporu (`validation_diagnostics/diagnostics_val.md`) iki bulgu verdi:
+- **Core20:** v2, vNext'ten güvenilir şekilde daha iyi: −0.066 mm (GA −0.088 … −0.045).
+- **Hard3:** v2 daha kötü: +0.63 mm. Kaybın ana kaynağı Aşama A seçimi. v2, vNext Stage 2'nin *fusion* merkezinden başlıyordu. Oysa Stage 2 yerel başlığı ve gate'i Hard3'ü validasyonda 6.10 → 5.24 mm'ye indiriyor. v1 tasarımında bu başlık yalnızca Core20 sonuçlarına bakılarak gereksiz sayılmıştı; bu yanlış bir değerlendirmeydi.
+
+### Değişiklikler
+**Model ve kaskad**
+- **Aşama A:** vNext Stage 2'nin gate'li çıktısı (`--stage-a-column neural_prediction`). Kaskad: Stage 1 → Stage 2 → Procrustes şekil önceli → tek All23 düzeltici → OOF gate. vNext'in Hard3 ve Core20 uzmanları ile eski şekil önceli kullanılmıyor; çıktılar yan yana dikilmiyor.
+- **Eğitim yok:** v2'nin eğittiği 30 düzeltici (fold başına 5 iç + 1 tam) `--refiner-source-run` ile değiştirilmeden yeniden kullanılır. Eğitim imzası sabittir ve bir testle korunur (`test_trained_refiner_signature_is_stable`).
+- **Ensemble:** val/test önerisi, tam modelin ve 5 iç modelin önerilerinin ortalamasıdır. Hiçbiri val/test kişilerini görmedi.
+
+**Gate**
+- İki yeni sinyal eklendi:
+  - MC-dropout yayılımı (tam model, 8 geçiş, sabit tohum);
+  - anatomik tutarsızlık: orta hat noktasının orta-sagital düzleme uzaklığı, bilateral noktanın aynalanmış eşine uzaklığı. Düzlem gelen tahminden kurulur, uzman noktalarından değil.
+- Gate kanıtının girdisi, Stage-1 OOF merkezlerine validasyonda seçilen şekil önceli ayarı uygulanarak üretilir. Önceli her iç fold'da yalnızca o fold'un eğitim kişileri üzerinde yeniden fit edilir.
+
+**Politika ve kilit**
+- İterasyon sayısı tip bazında seçilir. v2'de 2. iterasyon Hard3'ü kötüleştiriyordu.
+- `locked_validation_predictions.npz` kaydedilir. Final test koşusu validasyonu yeniden hesaplar; sonuç 0.01 mm'den fazla sapıyorsa koşu durur.
+
+### Çalıştırma
+Notebook'taki v2.1 hücrelerini çalıştırın. GPU yalnızca çıkarım ve gate kanıtı için kullanılır; eğitim yok.
+1. `--preset v21_val_all_folds`
+2. `--preset v21_diagnostics`
+3. `--preset v21_final_test`: yalnızca kapı geçerse çalışır.
+
+Kapı ölçütleri v2 ile aynıdır ve v2.1 sonuçları görülmeden önce sabitlenmiştir:
+- all-23 ALE ≤ vNext,
+- Hard3 ≤ vNext + 0.10 mm,
+- Core20 ≤ vNext + 0.05 mm.
+
+### Not
+Validasyon kümesi geliştirme sırasında birden çok kez kullanıldı (v2 → tanı → v2.1). Bu yüzden validasyon sonuçları tarafsız bir tahmin değildir. Tarafsız tek ölçüm, kapı geçtikten sonra yalnızca bir kez açılan testtir. Bu geliştirme geçmişi makalede raporlanmalıdır.
