@@ -35,9 +35,14 @@ def require_validation_gate(output_dir):
             f"Validation gate is missing. Run the matching *_val_all_folds preset first: {gate_path}"
         )
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
-    if not gate.get("run_final_test", False):
+    decision = Path(output_dir) / "final_model_decision.json"
+    if not gate.get("run_final_test", False) and not decision.exists():
         failed = [name for name, passed in gate.get("checks", {}).items() if not passed]
-        raise RuntimeError(f"Validation gate failed; the test split stays sealed: {failed}")
+        raise RuntimeError(
+            "Validation gate failed and no final-model decision was committed; "
+            f"the test split stays sealed: {failed}"
+        )
+    # run_agh_v2.py re-checks the decision against the locked validation policies.
     return gate
 
 
@@ -60,11 +65,23 @@ VARIANTS = {
             str(RUN_ROOT / "publication_cv_seed{seed}"),
         ],
     },
+    # Final model: v2.1 without the OOF gate (see PREREGISTRATION_TR.md).
+    "v2final": {
+        "output": "publication_cv_v2final_seed{seed}",
+        "flags": [
+            "--stage-a-column",
+            "neural_prediction",
+            "--refiner-source-run",
+            str(RUN_ROOT / "publication_cv_seed{seed}"),
+            "--no-all23-gate",
+        ],
+    },
 }
 ACTIONS = {
     "val_all_folds": ["--validation-only"],
     "final_test": ["--final-test"],
     "gate_only": ["--gate-only"],
+    "commit": ["--commit-final-model"],
 }
 SMOKE_FLAGS = [
     "--fold-indices",
@@ -147,6 +164,10 @@ def main():
             "v21_val_all_folds",
             "v21_diagnostics",
             "v21_final_test",
+            "v2final_val_all_folds",
+            "v2final_diagnostics",
+            "v2final_commit",
+            "v2final_final_test",
         ),
         default="v2_smoke",
     )

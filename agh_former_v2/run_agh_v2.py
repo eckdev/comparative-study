@@ -65,6 +65,13 @@ from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
 
 
 VERSION = "AGH-Former-v2.1"
+DEFAULT_RATIONALE = (
+    "Primary endpoint is all-23 ALE. On the pooled outer-validation partitions the "
+    "model improved all-23 ALE over the previous pipeline; the pre-specified Hard3 "
+    "non-inferiority margin (+0.10 mm) was not met and is reported as a limitation."
+)
+DECISION_FILE = "final_model_decision.json"
+TEST_LOG_FILE = "test_opening_log.json"
 STAGE_A_COLUMN = "coarse"
 SHARED_MANIFEST = (
     Path(__file__).resolve().parent.parent
@@ -104,6 +111,21 @@ def build_parser():
     parser.add_argument("--all23-mc-samples", type=int, default=8)
     parser.add_argument("--no-all23-ensemble", dest="all23_ensemble", action="store_false")
     parser.add_argument(
+        "--no-all23-gate",
+        dest="all23_gate",
+        action="store_false",
+        help="Final-model mode: apply refiner proposals without the OOF gate",
+    )
+    parser.add_argument(
+        "--commit-final-model",
+        action="store_true",
+        help=(
+            "Write final_model_decision.json: commit to this run's locked validation "
+            "policies as the reported model before the test split is opened"
+        ),
+    )
+    parser.add_argument("--decision-rationale", default=DEFAULT_RATIONALE)
+    parser.add_argument(
         "--refiner-source-run",
         default=None,
         help=(
@@ -136,6 +158,7 @@ def build_parser():
         all23_jaw_profile=True,
         v2_shape_prior=True,
         all23_ensemble=True,
+        all23_gate=True,
         gate_evidence_prior=True,
     )
     return parser
@@ -154,7 +177,8 @@ def all23_config_from_args(args):
         gate_folds=args.all23_gate_folds,
         gate_epochs=args.all23_gate_epochs,
         ensemble=args.all23_ensemble,
-        mc_samples=args.all23_mc_samples,
+        mc_samples=args.all23_mc_samples if args.all23_gate else 0,
+        use_gate=args.all23_gate,
         use_jaw_profile=args.all23_jaw_profile,
         bootstrap_iters=args.bootstrap_iters,
         mixed_precision=bool(args.mixed_precision),
@@ -356,12 +380,116 @@ def check_locked_validation(path, sample_ids, prediction, tolerance_mm=0.01):
     return drift
 
 
+def _sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _git_commit():
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _lock_digests(output_dir, folds):
+    digests = {}
+    for fold in folds:
+        lock_path = Path(output_dir) / f"fold_{fold}" / "v2_lock.json"
+        if not lock_path.exists():
+            raise RuntimeError(f"Validation lock is missing: {lock_path}")
+        digests[str(fold)] = _sha256_file(lock_path)
+    return digests
+
+
+def commit_final_model(output_dir, folds, rationale=DEFAULT_RATIONALE):
+    """Record, before any test label is read, which locked model will be reported."""
+    output_dir = Path(output_dir)
+    decision_path = output_dir / DECISION_FILE
+    if (output_dir / TEST_LOG_FILE).exists():
+        raise RuntimeError("The test split was already opened; the decision cannot change")
+    if decision_path.exists():
+        raise RuntimeError(f"A final-model decision already exists: {decision_path}")
+    gate_path = output_dir / "validation_gate.json"
+    if not gate_path.exists():
+        raise RuntimeError(f"Validation gate is missing: {gate_path}")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    if sorted(gate["folds"]) != sorted(folds):
+        raise RuntimeError("Decision folds differ from the validated folds")
+    from datetime import datetime, timezone
+
+    decision = {
+        "version": VERSION,
+        "decision": "report this run's locked validation policies as the final model",
+        "commitment": (
+            "The test split is opened once after this file is written and the result "
+            "is reported for this model whatever it is; no model will be re-selected "
+            "using test results."
+        ),
+        "rationale": rationale,
+        "validation_gate": {
+            key: gate[key]
+            for key in ("v2_validation", "vnext_validation", "checks", "run_final_test")
+        },
+        "folds": sorted(int(fold) for fold in folds),
+        "lock_sha256": _lock_digests(output_dir, folds),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(),
+        "test_labels_consumed": False,
+    }
+    decision_path.write_text(json.dumps(decision, indent=2), encoding="utf-8")
+    return decision
+
+
+def authorize_final_test(output_dir, folds):
+    """Allow the single test opening: passed gate or a matching prior decision."""
+    output_dir = Path(output_dir)
+    if (output_dir / "summary_metrics.json").exists():
+        raise RuntimeError("The test split was already evaluated for this run")
+    gate_path = output_dir / "validation_gate.json"
+    if not gate_path.exists():
+        raise RuntimeError(f"Validation gate is missing: {gate_path}")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    if sorted(gate["folds"]) != sorted(folds):
+        raise RuntimeError("Final test folds differ from the validated folds")
+    decision_path = output_dir / DECISION_FILE
+    if decision_path.exists():
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        if decision["folds"] != sorted(int(fold) for fold in folds):
+            raise RuntimeError("Final test folds differ from the committed decision")
+        if decision["lock_sha256"] != _lock_digests(output_dir, folds):
+            raise RuntimeError("Validation locks changed after the final-model decision")
+        authority = {"basis": "final_model_decision", "sha256": _sha256_file(decision_path)}
+    elif gate.get("run_final_test", False):
+        authority = {"basis": "validation_gate_passed", "sha256": _sha256_file(gate_path)}
+    else:
+        raise RuntimeError(
+            f"Validation gate failed and no final-model decision exists: {gate['checks']}"
+        )
+    log_path = output_dir / TEST_LOG_FILE
+    log = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else []
+    from datetime import datetime, timezone
+
+    log.append({"started_utc": datetime.now(timezone.utc).isoformat(), **authority})
+    log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
+    return authority
+
+
 def policy_digest(policy):
     payload = {key: policy[key] for key in ("iterations", "alpha_caps", "accepted")}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, device):
+def run_fold(
+    samples, splits, args, fold_index, fold_dir, preprocessing_dir, device, test_authority=None
+):
     fold_dir = Path(fold_dir)
     fold_dir.mkdir(parents=True, exist_ok=True)
     manifest_check = (
@@ -432,6 +560,7 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
     inference = {
         "stage_a_column": args.stage_a_column,
         "ensemble_members": refinement.reports["ensemble_members"],
+        "use_gate": bool(config.use_gate),
         "mc_samples": config.mc_samples,
         "model_dir": refinement.reports["model_dir"],
         "gate_evidence_prior": incoming_prior_config,
@@ -557,6 +686,7 @@ def run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, dev
         "roi_built_without_labels": True,
         "predictions_saved_before_expert_read": True,
         "policy_locked_before_test": True,
+        "test_authority": test_authority,
     }
     (fold_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2, default=str), encoding="utf-8"
@@ -681,7 +811,7 @@ def validation_gate(output_dir, stage_a_run, folds, seed, iterations=2000):
     return gate
 
 
-def aggregate_test(output_dir, summaries):
+def aggregate_test(output_dir, summaries, authority=None):
     rows = []
     for summary in summaries:
         test = summary["test"]
@@ -704,6 +834,7 @@ def aggregate_test(output_dir, summaries):
         "fold_mean_ale": float(values.mean()),
         "fold_std_ale": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
         "folds": rows,
+        "test_authority": authority,
     }
     (Path(output_dir) / "summary_metrics.json").write_text(
         json.dumps(payload, indent=2), encoding="utf-8"
@@ -751,15 +882,15 @@ def main():
     if args.fold_indices:
         requested = {int(value) for value in str(args.fold_indices).split(",") if value.strip()}
         folds = [item for item in folds if item[0] in requested]
+    if args.commit_final_model:
+        decision = commit_final_model(
+            output_dir, [index for index, _ in folds], args.decision_rationale
+        )
+        print(json.dumps(decision, indent=2), flush=True)
+        return
+    authority = None
     if args.final_test:
-        gate_path = output_dir / "validation_gate.json"
-        if not gate_path.exists():
-            raise RuntimeError(f"Validation gate is missing: {gate_path}")
-        gate = json.loads(gate_path.read_text(encoding="utf-8"))
-        if not gate.get("run_final_test", False):
-            raise RuntimeError(f"Validation gate failed; final test is blocked: {gate['checks']}")
-        if sorted(gate["folds"]) != sorted(index for index, _ in folds):
-            raise RuntimeError("Final test folds differ from the validated folds")
+        authority = authorize_final_test(output_dir, [index for index, _ in folds])
     (output_dir / ("experiment_config_test.json" if args.final_test else "experiment_config.json")).write_text(
         json.dumps({**vars(args), "version": VERSION}, indent=2, default=str), encoding="utf-8"
     )
@@ -776,11 +907,20 @@ def main():
             if preprocessing_root
             else None
         )
+        completed = fold_dir / "run_summary.json"
+        if args.final_test and completed.exists():
+            # Resume after an interruption without re-scoring a finished fold.
+            print(f"Fold {fold_index} test already evaluated; reusing it", flush=True)
+            summaries.append(json.loads(completed.read_text(encoding="utf-8")))
+            continue
         summaries.append(
-            run_fold(samples, splits, args, fold_index, fold_dir, preprocessing_dir, device)
+            run_fold(
+                samples, splits, args, fold_index, fold_dir, preprocessing_dir, device,
+                test_authority=authority,
+            )
         )
     if args.final_test:
-        summary = aggregate_test(output_dir, summaries)
+        summary = aggregate_test(output_dir, summaries, authority)
         print(
             f"\nAGH-Former v2 test fold ALE: {summary['fold_mean_ale']:.4f} +/- {summary['fold_std_ale']:.4f}",
             flush=True,

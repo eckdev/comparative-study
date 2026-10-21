@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -400,3 +402,57 @@ def test_trained_refiner_signature_is_stable():
     expected = "266488b5db0ed259366fd8c542fcae9fee53d80e4f2f7e297e01c9f8e15bda77"
     assert config_signature(All23MVSCConfig(), ["A", "B"]) == expected
     assert config_signature(All23MVSCConfig(ensemble=False, mc_samples=0), ["A", "B"]) == expected
+    assert config_signature(All23MVSCConfig(use_gate=False), ["A", "B"]) == expected
+
+
+def test_gate_free_policy_only_switches_refinement_on_or_off():
+    rng = np.random.default_rng(6)
+    expert = rng.normal(size=(30, NUM_LANDMARKS, 3)).astype(np.float32)
+    base = expert + rng.normal(0.0, 1.0, size=expert.shape).astype(np.float32)
+    proposal = expert + rng.normal(0.0, 0.3, size=expert.shape).astype(np.float32)
+    ones = np.ones((30, NUM_LANDMARKS), dtype=np.float32)
+    result = {
+        "sample_ids": [f"S{index}" for index in range(30)],
+        "base": base,
+        "iterations": {
+            1: {"proposal": proposal, "gate_alpha": ones, "confidence": ones, "entropy": ones}
+        },
+    }
+    policy = calibrate_policy(result, expert, All23MVSCConfig(use_gate=False, bootstrap_iters=100))
+    assert policy["use_gate"] is False
+    assert {row["alpha_cap"] for row in policy["sweep"]} == {0.0, 1.0}
+    np.testing.assert_allclose(apply_policy(result, policy)["prediction"], proposal, atol=1e-6)
+
+
+def test_gate_free_refinement_builds_no_evidence_or_gates(tmp_path, monkeypatch):
+    from all23_mvsc_refinement import refiner as module
+
+    class Fitted:
+        def __init__(self, name):
+            self.model, self.prior, self.report = name, "prior", {"name": name}
+
+    loaded = []
+
+    def fake_fit_refiner(dataset, output_dir, config, device, **kwargs):
+        loaded.append((Path(output_dir).name, kwargs.get("require_cached")))
+        return Fitted(Path(output_dir).name)
+
+    monkeypatch.setattr(module, "fit_refiner", fake_fit_refiner)
+    monkeypatch.setattr(
+        module, "crossfit_splits", lambda dataset, config: [(1, ["A"], ["B"]), (2, ["B"], ["A"])]
+    )
+    monkeypatch.setattr(module, "subset_dataset", lambda dataset, ids: dataset)
+    monkeypatch.setattr(
+        module,
+        "build_crossfit_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no evidence without gate")),
+    )
+    config = All23MVSCConfig(use_gate=False, mc_samples=8)
+    refinement = module.fit_or_load_all23_refinement(
+        object(), tmp_path / "out", config, torch.device("cpu"), model_dir=tmp_path / "source"
+    )
+    assert refinement.gates == {} and refinement.reports["use_gate"] is False
+    assert refinement.ensemble.models == ["full_model", "inner_fold_1", "inner_fold_2"]
+    assert refinement.ensemble.config.mc_samples == 0
+    assert all(require_cached for _, require_cached in loaded)
+    assert not (tmp_path / "out" / "crossfit").exists()

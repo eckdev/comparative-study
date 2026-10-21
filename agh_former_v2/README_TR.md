@@ -96,3 +96,14 @@ Kapı ölçütleri v2 ile aynıdır ve v2.1 sonuçları görülmeden önce sabit
 
 ### Not
 Validasyon kümesi geliştirme sırasında birden çok kez kullanıldı (v2 → tanı → v2.1). Bu yüzden validasyon sonuçları tarafsız bir tahmin değildir. Tarafsız tek ölçüm, kapı geçtikten sonra yalnızca bir kez açılan testtir. Bu geliştirme geçmişi makalede raporlanmalıdır.
+
+## Final model: gate'siz v2 (2026-10-21)
+- Karar, gerekçe, geliştirme geçmişi ve raporlanacak sonuçlar [PREREGISTRATION_TR.md](PREREGISTRATION_TR.md) dosyasında. Bu dosya testten önce commit edildi.
+- **Model:** v2.1'in güven kapısı, cross-fit gate kanıtı ve MC-dropout olmadan çalışan hali (`--no-all23-gate`). Politika yalnızca her tip için iterasyon sayısını ve düzeltmenin açık/kapalı olmasını seçer.
+- **Colab sırası:**
+  1. `v2final_val_all_folds`: yalnızca çıkarım.
+  2. `v2final_diagnostics`
+  3. `v2final_commit`: `final_model_decision.json` yazar.
+  4. `v2final_final_test`: bir kez çalışır.
+  5. `aggregate_cv_results`
+- **Yeniden üretim kontrolü:** `v2final_val_all_folds` sonucu, karar anındaki gate'siz validasyon değerlerine (all-23 ≈ 1.994, Core20 ≈ 1.578, Hard3 ≈ 4.762) çok yakın olmalı. Belirgin bir fark varsa `v2final_commit` çalıştırılmamalı ve önce nedeni bulunmalı.

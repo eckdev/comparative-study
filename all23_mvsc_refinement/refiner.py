@@ -112,6 +112,9 @@ class All23MVSCConfig:
     # full-fit refiner, and MC-dropout passes that feed the gate's spread signal.
     ensemble: bool = True
     mc_samples: int = 8
+    # Without the OOF gate the refiner proposal is applied as is (per-type
+    # on/off and iteration count are still chosen on validation).
+    use_gate: bool = True
     mixed_precision: bool = True
     amp_dtype: str = "bfloat16"
     seed: int = 42
@@ -129,6 +132,7 @@ _POLICY_ONLY_FIELDS = (
     "gate_folds",
     "ensemble",
     "mc_samples",
+    "use_gate",
 )
 EVIDENCE_VERSION = 2
 
@@ -948,6 +952,62 @@ def evidence_signature(config, sample_ids, prior_config):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def crossfit_splits(train_dataset, config):
+    """Stratified inner folds of the outer-train set: (fold, held_ids, fit_ids)."""
+    sample_ids = [sample.sample_id for sample in train_dataset.samples]
+    strata = [f"{sample.class_name}|{sample.gender}" for sample in train_dataset.samples]
+    rows = []
+    for fold_number, held_out in enumerate(
+        _folds_from_strata(strata, config.gate_folds, config.seed + 7), start=1
+    ):
+        held_ids = [sample_ids[index] for index in held_out]
+        fit_ids = [sample_id for sample_id in sample_ids if sample_id not in set(held_ids)]
+        if set(held_ids) & set(fit_ids):
+            raise AssertionError("Cross-fit participants leaked into the fit set")
+        rows.append((fold_number, held_ids, fit_ids))
+    return rows
+
+
+def fit_inner_refiner(
+    train_dataset,
+    model_dir,
+    fold_number,
+    fit_ids,
+    config,
+    device,
+    scratch_dir=None,
+    require_cached=False,
+):
+    return fit_refiner(
+        subset_dataset(train_dataset, fit_ids),
+        Path(model_dir) / f"inner_fold_{fold_number}",
+        config,
+        device,
+        scratch_dir=scratch_dir,
+        label=f"All23-MVSC inner fold {fold_number}",
+        require_cached=require_cached,
+    )
+
+
+def load_inner_refiners(
+    train_dataset, model_dir, config, device, scratch_dir=None, require_cached=False
+):
+    """Inner (cross-fit) refiners used as extra ensemble members."""
+    return [
+        fit_inner_refiner(
+            train_dataset,
+            model_dir,
+            fold_number,
+            fit_ids,
+            config,
+            device,
+            scratch_dir=scratch_dir,
+            require_cached=require_cached,
+        )
+        for fold_number, _, fit_ids in crossfit_splits(train_dataset, config)
+    ]
+
+
 def build_crossfit_evidence(
     train_dataset,
     output_dir,
@@ -976,27 +1036,19 @@ def build_crossfit_evidence(
     sample_ids = [sample.sample_id for sample in train_dataset.samples]
     manifest_path = output_dir / "crossfit_manifest.json"
     signature = evidence_signature(config, sample_ids, incoming_prior_config)
-    strata = [f"{sample.class_name}|{sample.gender}" for sample in train_dataset.samples]
-    folds = _folds_from_strata(strata, config.gate_folds, config.seed + 7)
+    split_rows = crossfit_splits(train_dataset, config)
 
     def inner_refiner(fold_number, fit_ids):
-        return fit_refiner(
-            subset_dataset(train_dataset, fit_ids),
-            model_dir / f"inner_fold_{fold_number}",
+        return fit_inner_refiner(
+            train_dataset,
+            model_dir,
+            fold_number,
+            fit_ids,
             config,
             device,
             scratch_dir=scratch_dir,
-            label=f"All23-MVSC inner fold {fold_number}",
             require_cached=require_cached_models,
         )
-
-    split_rows = []
-    for fold_number, held_out in enumerate(folds, start=1):
-        held_ids = [sample_ids[index] for index in held_out]
-        fit_ids = [sample_id for sample_id in sample_ids if sample_id not in set(held_ids)]
-        if set(held_ids) & set(fit_ids):
-            raise AssertionError("Cross-fit evidence participants leaked into the fit set")
-        split_rows.append((fold_number, held_ids, fit_ids))
 
     if manifest_path.exists() and all(path.exists() for path in evidence_paths.values()):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1121,10 +1173,14 @@ class All23Refinement:
         for iterations in range(1, self.config.max_iterations + 1):
             used = results[:iterations]
             diagnostics = diagnostics_from_iterations(base, used)
-            model, mean, std = self.gates[iterations]
+            if self.gates:
+                model, mean, std = self.gates[iterations]
+                gate_alpha = predict_gate_alpha(model, mean, std, diagnostics, self.device)
+            else:
+                gate_alpha = np.ones(base.shape[:2], dtype=np.float32)
             by_iterations[iterations] = {
                 "proposal": used[-1]["proposal"],
-                "gate_alpha": predict_gate_alpha(model, mean, std, diagnostics, self.device),
+                "gate_alpha": gate_alpha,
                 "diagnostics": diagnostics,
                 "confidence": used[-1]["confidence"],
                 "entropy": used[-1]["entropy"],
@@ -1155,6 +1211,10 @@ def fit_or_load_all23_refinement(
     output_dir.mkdir(parents=True, exist_ok=True)
     reuse = model_dir is not None and Path(model_dir) != output_dir
     model_root = Path(model_dir) if model_dir else output_dir
+    if not config.use_gate:
+        return _gate_free_refinement(
+            train_dataset, output_dir, model_root, config, device, scratch_dir, reuse
+        )
     evidence, inner_refiners = build_crossfit_evidence(
         train_dataset,
         output_dir / "crossfit",
@@ -1221,6 +1281,45 @@ def fit_or_load_all23_refinement(
     return All23Refinement(ensemble, gates, reports, config, device)
 
 
+def _gate_free_refinement(
+    train_dataset, output_dir, model_root, config, device, scratch_dir, reuse
+):
+    """Refiner ensemble without cross-fit evidence, gates or MC-dropout."""
+    inner = (
+        load_inner_refiners(
+            train_dataset,
+            model_root / "crossfit",
+            config,
+            device,
+            scratch_dir=scratch_dir,
+            require_cached=reuse,
+        )
+        if config.ensemble
+        else []
+    )
+    full = fit_refiner(
+        train_dataset,
+        model_root / "full_model",
+        config,
+        device,
+        scratch_dir=scratch_dir,
+        label="All23-MVSC full outer-train",
+        require_cached=reuse,
+    )
+    members = [full.model] + [refiner.model for refiner in inner]
+    reports = {
+        "gates": None,
+        "use_gate": False,
+        "full_model": full.report,
+        "ensemble_members": len(members),
+        "model_dir": str(model_root),
+    }
+    gate_free = copy.copy(config)
+    gate_free.mc_samples = 0
+    ensemble = RefinerEnsemble(members, full.prior, gate_free, device)
+    return All23Refinement(ensemble, {}, reports, gate_free, device)
+
+
 def _type_columns():
     return {name: list(landmarks) for name, landmarks in LANDMARK_TYPES.items()}
 
@@ -1270,14 +1369,18 @@ def compose_policy(result, iterations, caps):
 
 
 def calibrate_policy(result, expert, config):
-    """Choose iteration count and alpha cap per landmark type on outer validation."""
+    """Choose iteration count and alpha cap per landmark type on outer validation.
+
+    Without a gate the cap only switches a type's refinement on (1) or off (0).
+    """
     base = result["base"]
+    cap_grid = config.alpha_cap_grid if config.use_gate else (0.0, 1.0)
     base_error = np.linalg.norm(base - expert, axis=-1)
     sweep, iterations, caps = [], {}, {}
     for name, columns in _type_columns().items():
         rows = []
         for count, values in result["iterations"].items():
-            for cap in config.alpha_cap_grid:
+            for cap in cap_grid:
                 alpha = float(cap) * values["gate_alpha"][:, columns]
                 final = base[:, columns] + alpha[..., None] * (
                     values["proposal"][:, columns] - base[:, columns]
@@ -1309,6 +1412,7 @@ def calibrate_policy(result, expert, config):
     ungated_error = np.linalg.norm(proposal - expert, axis=-1)
     return {
         "version": VERSION,
+        "use_gate": bool(config.use_gate),
         "accepted": accepted,
         "iterations": iterations,
         "alpha_caps": caps if accepted else {name: 0.0 for name in LANDMARK_TYPES},

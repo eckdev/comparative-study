@@ -10,7 +10,9 @@ import pytest
 
 from agh_former_v2.analyze_validation import analyze, open_validation_csv
 from agh_former_v2.run_agh_v2 import (
+    authorize_final_test,
     check_locked_validation,
+    commit_final_model,
     cluster_bootstrap_delta,
     policy_digest,
     pooled_csv_errors,
@@ -104,6 +106,17 @@ def test_colab_presets_build_parseable_commands():
         assert args.stage_a_run == "/archive/run"
         assert Path(args.output_dir) == output_dir
         assert args.roi_points == 1024 and args.coarse_source == "stage1_oof"
+    for preset, flag in (
+        ("v2final_val_all_folds", "validation_only"),
+        ("v2final_commit", "commit_final_model"),
+        ("v2final_final_test", "final_test"),
+    ):
+        command, output_dir = module.command_for(preset, 42, "/archive/run")
+        args = build_parser().parse_args([str(value) for value in command[3:]])
+        assert getattr(args, flag) and not args.all23_gate
+        assert args.stage_a_column == "neural_prediction"
+        assert output_dir.name == "publication_cv_v2final_seed42"
+        assert args.refiner_source_run.endswith("publication_cv_seed42")
     command, _ = module.command_for("v2_smoke", 42, "/archive/run")
     args = build_parser().parse_args([str(value) for value in command[3:]])
     assert args.validation_only and args.fold_indices == "1" and args.all23_epochs == 2
@@ -212,3 +225,48 @@ def test_final_test_requires_reproduced_validation(tmp_path):
         check_locked_validation(path, ["A", "B"], prediction + 0.5)
     with pytest.raises(RuntimeError, match="participants differ"):
         check_locked_validation(path, ["B", "A"], prediction)
+
+
+def _validated_run(tmp_path, passed=False):
+    run = tmp_path / "run"
+    for fold in (1, 2):
+        (run / f"fold_{fold}").mkdir(parents=True)
+        (run / f"fold_{fold}" / "v2_lock.json").write_text(json.dumps({"fold": fold}))
+    gate = {
+        "folds": [1, 2],
+        "v2_validation": {"all23": 1.9},
+        "vnext_validation": {"all23": 2.0},
+        "checks": {"hard3_regression_at_most_0p10": passed},
+        "run_final_test": passed,
+    }
+    (run / "validation_gate.json").write_text(json.dumps(gate))
+    return run
+
+
+def test_failed_gate_needs_a_committed_decision(tmp_path):
+    run = _validated_run(tmp_path)
+    with pytest.raises(RuntimeError, match="no final-model decision"):
+        authorize_final_test(run, [1, 2])
+    decision = commit_final_model(run, [1, 2], "primary endpoint")
+    assert decision["validation_gate"]["run_final_test"] is False
+    authority = authorize_final_test(run, [1, 2])
+    assert authority["basis"] == "final_model_decision"
+    assert len(json.loads((run / "test_opening_log.json").read_text())) == 1
+    with pytest.raises(RuntimeError, match="already opened"):
+        commit_final_model(run, [1, 2])
+
+
+def test_decision_is_bound_to_the_locked_policies(tmp_path):
+    run = _validated_run(tmp_path)
+    commit_final_model(run, [1, 2])
+    (run / "fold_2" / "v2_lock.json").write_text(json.dumps({"fold": 2, "edited": True}))
+    with pytest.raises(RuntimeError, match="changed after the final-model decision"):
+        authorize_final_test(run, [1, 2])
+
+
+def test_test_split_is_evaluated_only_once(tmp_path):
+    run = _validated_run(tmp_path, passed=True)
+    assert authorize_final_test(run, [1, 2])["basis"] == "validation_gate_passed"
+    (run / "summary_metrics.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="already evaluated"):
+        authorize_final_test(run, [1, 2])
