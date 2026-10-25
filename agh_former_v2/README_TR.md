@@ -108,7 +108,13 @@ Validasyon kümesi geliştirme sırasında birden çok kez kullanıldı (v2 → 
   5. `aggregate_cv_results`
 - **Yeniden üretim kontrolü:** `v2final_val_all_folds` sonucu, karar anındaki gate'siz validasyon değerlerine (all-23 ≈ 1.994, Core20 ≈ 1.578, Hard3 ≈ 4.762) çok yakın olmalı. Belirgin bir fark varsa `v2final_commit` çalıştırılmamalı ve önce nedeni bulunmalı.
 
-## Değişiklik: sınıf bilgisi olmadan (2026-10-25)
-- Uzamsal prior yalnızca cinsiyeti eş değişken olarak kullanır (`--all23-prior-covariates sex`). Eğitilmiş modeller aynen kullanılır; yalnızca prior yeniden fit edilir.
-- Bu değişiklik **testten sonra** yapıldı. Ayrıntı ve dürüstlük notu: [PREREGISTRATION_TR.md](PREREGISTRATION_TR.md) → "Değişiklik kaydı".
-- Colab preset sırası: `v2final_noclass_val_all_folds` → `v2final_noclass_diagnostics` → `v2final_noclass_commit` → `v2final_noclass_final_test` → aggregate.
+## Değişiklik: katılımcı bilgisi olmadan, yalnızca mesh (2026-10-25)
+- Uzamsal prior hiçbir katılımcı bilgisi kullanmaz; sınıf ve cinsiyet çıkarıldı (`--all23-prior-covariates none`).
+- Eğitilmiş modeller aynen kullanılır; yalnızca prior yeniden fit edilir.
+- Bu değişiklik **testten sonra** yapıldı. Ayrıntı: [PREREGISTRATION_TR.md](PREREGISTRATION_TR.md) → "Değişiklik kaydı" ve "Ek".
+- Colab preset sırası:
+  1. `v2final_meshonly_val_all_folds`
+  2. `v2final_meshonly_diagnostics`
+  3. `v2final_meshonly_commit`
+  4. `v2final_meshonly_final_test`
+  5. aggregate

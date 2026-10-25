@@ -90,3 +90,17 @@ Bu bölüm, final testten (`publication_cv_v2final_seed42`, 2026-10-21) **sonra*
 
   Karar dosyasının gerekçe metni bu değişikliği açıkça içerir.
 - **Beklenti:** sonuçların önceki sürümden çok az farklı olması (|Δ ALE| ≲ 0.02 mm). Belirgin bir fark çıkarsa nedeni araştırılmadan raporlanmayacak.
+
+### Ek (2026-10-25, aynı gün): değişikliğin kapsamı genişletildi — koşu yapılmadan önce
+- Yukarıdaki değişiklik için planlanan `v2final_noclass` koşusu **hiç çalıştırılmadı**.
+- Kapsam, koşudan önce genişletildi: uzamsal prior'dan **sınıf ile birlikte cinsiyet de** çıkarıldı (`--all23-prior-covariates none`). Model artık yalnızca 3D tarama ve landmark koordinatlarıyla çalışıyor; hiçbir katılımcı bilgisi kullanmıyor.
+- **Gerekçe:**
+  - Çalışma genel bir 3D yüz landmark modeli olarak sunuluyor.
+  - Aynı betimleyici kontrolde cinsiyetin prior'a katkısı ~0.02 mm idi (yalnızca cinsiyet 2.705 mm, hiçbiri 2.729 mm).
+  - Karşılaştırılan modeller de katılımcı bilgisi kullanmıyor.
+- **Yeni koşu:** `agh_v2_runs/publication_cv_v2final_meshonly_seed42`. Preset sırası:
+  1. `v2final_meshonly_val_all_folds`
+  2. `v2final_meshonly_diagnostics`
+  3. `v2final_meshonly_commit`
+  4. `v2final_meshonly_final_test`
+- **Dürüstlük notu:** yukarıdaki not aynen geçerli. Bu, testten sonra yapılan bir değişikliktir ve tek seferlik, ön-kayıtlı bir değerlendirme sayılamaz.

@@ -516,3 +516,30 @@ def test_inference_prior_is_refitted_only_when_covariates_change(tmp_path, monke
     assert config_signature(All23MVSCConfig(prior_covariates=("sex",)), ["A"]) == config_signature(
         All23MVSCConfig(), ["A"]
     )
+
+
+def test_landmark_only_prior_ignores_participant_metadata(tmp_path, monkeypatch):
+    from all23_mvsc_refinement import refiner as module
+
+    shapes = synthetic_shapes()
+    ids = [f"S{index}" for index in range(len(shapes))]
+    classes = ["Class1", "Class2"] * (len(shapes) // 2)
+    genders = ["men", "women", "women", "men"] * (len(shapes) // 4)
+    original = ConditionalSpatialPrior(SpatialPriorConfig(folds=4)).fit(shapes, ids, classes, genders)
+
+    class Full:
+        prior = original
+
+    monkeypatch.setattr(module, "dataset_shapes", lambda dataset: (shapes, ids, classes, genders))
+    prior = module.inference_prior(
+        Full(), object(), All23MVSCConfig(prior_covariates=(), prior_folds=4), tmp_path
+    )
+    assert prior.config.covariates == ()
+    assert (tmp_path / "spatial_prior_none.json").exists()
+    context_width = 3 * 19  # Core20 context minus the target landmark
+    assert prior._raw_design(shapes, 1, classes, genders)[0].shape[1] == context_width
+    other_meta = (["Class3"] * 4, ["women"] * 4)
+    np.testing.assert_allclose(
+        prior.predict(shapes[:4], classes[:4], genders[:4])[0],
+        prior.predict(shapes[:4], *other_meta)[0],
+    )

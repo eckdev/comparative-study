@@ -128,7 +128,7 @@ def build_parser():
     parser.add_argument(
         "--all23-prior-covariates",
         default="class,sex",
-        help="Comma-separated participant metadata used by the spatial prior (class, sex)",
+        help="Participant metadata used by the spatial prior: class, sex, or none",
     )
     parser.add_argument(
         "--refiner-source-run",
@@ -170,6 +170,9 @@ def build_parser():
 
 
 def parse_prior_covariates(value):
+    """Comma-separated covariates; "none" (or empty) means landmarks only."""
+    if str(value).strip().lower() == "none":
+        return ()
     covariates = tuple(item.strip() for item in str(value).split(",") if item.strip())
     unknown = sorted(set(covariates) - {"class", "sex"})
     if unknown:

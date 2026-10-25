@@ -76,10 +76,10 @@ VARIANTS = {
             "--no-all23-gate",
         ],
     },
-    # Amendment after the v2final test evaluation: the class covariate is
-    # removed from the spatial prior (see PREREGISTRATION_TR.md).
-    "v2final_noclass": {
-        "output": "publication_cv_v2final_noclass_seed42",
+    # Amendment after the v2final test evaluation: participant metadata (class
+    # and sex) are removed from the spatial prior (see PREREGISTRATION_TR.md).
+    "v2final_meshonly": {
+        "output": "publication_cv_v2final_meshonly_seed42",
         "flags": [
             "--stage-a-column",
             "neural_prediction",
@@ -87,11 +87,12 @@ VARIANTS = {
             str(RUN_ROOT / "publication_cv_seed{seed}"),
             "--no-all23-gate",
             "--all23-prior-covariates",
-            "sex",
+            "none",
             "--decision-rationale",
-            "Post-test amendment: the class covariate was removed from the spatial "
-            "prior after a descriptive check on the reference coordinates showed no "
-            "contribution. The test partitions had been evaluated with the previous "
+            "Post-test amendment: participant metadata (class and sex) were removed "
+            "from the spatial prior after a descriptive check on the reference "
+            "coordinates showed no meaningful contribution; the model uses the 3D "
+            "scan only. The test partitions had been evaluated with the previous "
             "version (publication_cv_v2final_seed42). Primary endpoint: all-23 ALE.",
         ],
     },
@@ -193,10 +194,10 @@ def main():
             "v2final_diagnostics",
             "v2final_commit",
             "v2final_final_test",
-            "v2final_noclass_val_all_folds",
-            "v2final_noclass_diagnostics",
-            "v2final_noclass_commit",
-            "v2final_noclass_final_test",
+            "v2final_meshonly_val_all_folds",
+            "v2final_meshonly_diagnostics",
+            "v2final_meshonly_commit",
+            "v2final_meshonly_final_test",
         ),
         default="v2_smoke",
     )

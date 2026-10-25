@@ -276,22 +276,23 @@ def test_test_split_is_evaluated_only_once(tmp_path):
 def test_prior_covariates_are_validated():
     assert parse_prior_covariates("sex") == ("sex",)
     assert parse_prior_covariates("class, sex") == ("class", "sex")
+    assert parse_prior_covariates("none") == ()
     assert parse_prior_covariates("") == ()
     with pytest.raises(ValueError):
         parse_prior_covariates("age")
 
 
-def test_noclass_presets_parse():
+def test_meshonly_presets_parse():
     path = Path(__file__).resolve().parents[1] / "colab_run_agh_v2.py"
     spec = importlib.util.spec_from_file_location("colab_run_agh_v2", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     from agh_former_v2.run_agh_v2 import build_parser
 
-    assert module._split_preset("v2final_noclass_final_test") == ("v2final_noclass", "final_test")
+    assert module._split_preset("v2final_meshonly_final_test") == ("v2final_meshonly", "final_test")
     assert module._split_preset("v2final_commit") == ("v2final", "commit")
-    command, output_dir = module.command_for("v2final_noclass_commit", 42, "/archive/run")
+    command, output_dir = module.command_for("v2final_meshonly_commit", 42, "/archive/run")
     args = build_parser().parse_args([str(value) for value in command[3:]])
-    assert args.all23_prior_covariates == "sex" and not args.all23_gate
+    assert parse_prior_covariates(args.all23_prior_covariates) == () and not args.all23_gate
     assert "Post-test amendment" in args.decision_rationale
-    assert output_dir.name == "publication_cv_v2final_noclass_seed42"
+    assert output_dir.name == "publication_cv_v2final_meshonly_seed42"
