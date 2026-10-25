@@ -115,6 +115,9 @@ class All23MVSCConfig:
     # Without the OOF gate the refiner proposal is applied as is (per-type
     # on/off and iteration count are still chosen on validation).
     use_gate: bool = True
+    # Participant metadata used by the spatial prior at inference. Refiners
+    # trained with ("class", "sex") are reused; only the prior is refitted.
+    prior_covariates: tuple[str, ...] = ("class", "sex")
     mixed_precision: bool = True
     amp_dtype: str = "bfloat16"
     seed: int = 42
@@ -133,6 +136,7 @@ _POLICY_ONLY_FIELDS = (
     "ensemble",
     "mc_samples",
     "use_gate",
+    "prior_covariates",
 )
 EVIDENCE_VERSION = 2
 
@@ -1275,10 +1279,34 @@ def fit_or_load_all23_refinement(
     members = [full.model] + (
         [refiner.model for refiner in inner_refiners] if config.ensemble else []
     )
+    prior = inference_prior(full, train_dataset, config, output_dir)
     reports["ensemble_members"] = len(members)
     reports["model_dir"] = str(model_root)
-    ensemble = RefinerEnsemble(members, full.prior, config, device)
+    reports["prior_covariates"] = list(prior.config.covariates)
+    ensemble = RefinerEnsemble(members, prior, config, device)
     return All23Refinement(ensemble, gates, reports, config, device)
+
+
+def inference_prior(full, train_dataset, config, output_dir):
+    """Spatial prior used at inference, refitted if its covariates differ.
+
+    Only the conditional regression is refitted, on the same outer-training
+    shapes; the trained networks are unchanged.
+    """
+    wanted = tuple(config.prior_covariates)
+    if tuple(full.prior.config.covariates) == wanted:
+        return full.prior
+    shapes, sample_ids, classes, genders = dataset_shapes(train_dataset)
+    prior = ConditionalSpatialPrior(
+        SpatialPriorConfig(
+            folds=config.prior_folds,
+            l2_grid=tuple(config.prior_l2_grid),
+            seed=config.seed,
+            covariates=wanted,
+        )
+    ).fit(shapes, sample_ids, classes, genders)
+    prior.save(Path(output_dir) / f"spatial_prior_{'_'.join(wanted) or 'none'}.json")
+    return prior
 
 
 def _gate_free_refinement(
@@ -1307,16 +1335,18 @@ def _gate_free_refinement(
         require_cached=reuse,
     )
     members = [full.model] + [refiner.model for refiner in inner]
+    prior = inference_prior(full, train_dataset, config, output_dir)
     reports = {
         "gates": None,
         "use_gate": False,
         "full_model": full.report,
         "ensemble_members": len(members),
         "model_dir": str(model_root),
+        "prior_covariates": list(prior.config.covariates),
     }
     gate_free = copy.copy(config)
     gate_free.mc_samples = 0
-    ensemble = RefinerEnsemble(members, full.prior, gate_free, device)
+    ensemble = RefinerEnsemble(members, prior, gate_free, device)
     return All23Refinement(ensemble, {}, reports, gate_free, device)
 
 

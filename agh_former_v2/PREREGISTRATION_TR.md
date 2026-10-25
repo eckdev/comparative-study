@@ -61,3 +61,32 @@ Outer-validation bölümleri bu süreçte birden çok kez kullanıldı. Bu neden
   - test daha önce değerlendirilmemiş olmalı;
   - validasyon yeniden hesaplandığında kilitlenen tahminlerden en fazla 0.01 mm sapmalı.
 - **Kayıt:** her test açılışı `test_opening_log.json` dosyasına yazılır. Kesintiden sonra devam edilirse tamamlanmış fold'lar yeniden puanlanmaz.
+
+## Değişiklik kaydı (2026-10-25) — testten sonra yapılan değişiklik
+Bu bölüm, final testten (`publication_cv_v2final_seed42`, 2026-10-21) **sonra** yapılan bir model değişikliğini belgeler. Yukarıdaki içerik değiştirilmemiştir.
+
+- **Değişiklik:** düzelticinin uzamsal prior'ından **sınıf** eş değişkeni çıkarıldı. Cinsiyet eş değişkeni korundu.
+  - Eğitilmiş sinir ağları değişmedi; yalnızca prior'ın regresyonu aynı outer-train şekilleri üzerinde yeniden fit edildi (`--all23-prior-covariates sex`).
+  - Validasyon politikası her fold için yeniden seçilip kilitlendi.
+- **Gerekçe:** prior düzeyinde yapılan betimleyici bir kontrolde sınıf bilgisinin katkısı sıfıra yakın çıktı:
+
+  | Prior'ın girdileri | Prior hatası |
+  |---|---|
+  | Sınıf + cinsiyet | 2.708 mm |
+  | Yalnızca cinsiyet | 2.705 mm |
+  | Hiçbiri | 2.729 mm |
+
+  Ayrıca model, sınıf bilgisi olmadan uygulanabilir hale geliyor.
+- **Dürüstlük notu:**
+  - Bu kontrol, **test bölümündeki referans koordinatları** üzerinde yapıldı.
+  - Test bölümü önceki sürümle zaten değerlendirilmişti.
+  - Bu nedenle değiştirilmiş modelin test sonucu, tek seferlik ve ön-kayıtlı bir değerlendirme sayılamaz.
+  - Makalede "testin bir kez açıldığı" ya da "modelin testten önce kilitlendiği" iddiası yer almayacak. Sınırlılıklar bölümünde, tasarım kararlarının aynı çapraz doğrulama verisiyle bilgilendirildiği ve test bölümlerinin önceki sürümlerle değerlendirildiği belirtilecek.
+- **Yeni koşu:** `agh_v2_runs/publication_cv_v2final_noclass_seed42`. Preset sırası:
+  1. `v2final_noclass_val_all_folds`
+  2. `v2final_noclass_diagnostics`
+  3. `v2final_noclass_commit`
+  4. `v2final_noclass_final_test`
+
+  Karar dosyasının gerekçe metni bu değişikliği açıkça içerir.
+- **Beklenti:** sonuçların önceki sürümden çok az farklı olması (|Δ ALE| ≲ 0.02 mm). Belirgin bir fark çıkarsa nedeni araştırılmadan raporlanmayacak.

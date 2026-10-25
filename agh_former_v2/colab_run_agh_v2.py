@@ -76,6 +76,25 @@ VARIANTS = {
             "--no-all23-gate",
         ],
     },
+    # Amendment after the v2final test evaluation: the class covariate is
+    # removed from the spatial prior (see PREREGISTRATION_TR.md).
+    "v2final_noclass": {
+        "output": "publication_cv_v2final_noclass_seed42",
+        "flags": [
+            "--stage-a-column",
+            "neural_prediction",
+            "--refiner-source-run",
+            str(RUN_ROOT / "publication_cv_seed{seed}"),
+            "--no-all23-gate",
+            "--all23-prior-covariates",
+            "sex",
+            "--decision-rationale",
+            "Post-test amendment: the class covariate was removed from the spatial "
+            "prior after a descriptive check on the reference coordinates showed no "
+            "contribution. The test partitions had been evaluated with the previous "
+            "version (publication_cv_v2final_seed42). Primary endpoint: all-23 ALE.",
+        ],
+    },
 }
 ACTIONS = {
     "val_all_folds": ["--validation-only"],
@@ -107,10 +126,16 @@ SMOKE_FLAGS = [
 
 
 def _split_preset(preset):
-    variant, _, action = preset.partition("_")
-    if variant not in VARIANTS or (action not in ACTIONS and preset != "v2_smoke"):
-        raise ValueError(f"Unknown preset: {preset}")
-    return variant, action
+    """Split "<variant>_<action>"; variant names may themselves contain "_"."""
+    if preset == "v2_smoke":
+        return "v2", "smoke"
+    for variant in sorted(VARIANTS, key=len, reverse=True):
+        prefix = variant + "_"
+        if preset.startswith(prefix):
+            action = preset[len(prefix):]
+            if action in ACTIONS or action == "diagnostics":
+                return variant, action
+    raise ValueError(f"Unknown preset: {preset}")
 
 
 def command_for(preset, seed, stage_a_run, fold_indices=None):
@@ -168,6 +193,10 @@ def main():
             "v2final_diagnostics",
             "v2final_commit",
             "v2final_final_test",
+            "v2final_noclass_val_all_folds",
+            "v2final_noclass_diagnostics",
+            "v2final_noclass_commit",
+            "v2final_noclass_final_test",
         ),
         default="v2_smoke",
     )
@@ -182,7 +211,7 @@ def main():
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     if args.preset.endswith("_diagnostics"):
         commands, _ = diagnostics_commands(
-            args.seed, args.stage_a_run, variant=args.preset.split("_")[0]
+            args.seed, args.stage_a_run, variant=_split_preset(args.preset)[0]
         )
     else:
         command, output_dir = command_for(

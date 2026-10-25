@@ -23,6 +23,8 @@ class SpatialPriorConfig:
     covariance_shrinkage: float = 0.25
     covariance_floor_mm: float = 0.25
     seed: int = 42
+    # Participant metadata used as one-hot covariates of every regression.
+    covariates: tuple[str, ...] = ("class", "sex")
 
 
 def _folds_from_strata(strata, folds, seed):
@@ -80,13 +82,20 @@ class ConditionalSpatialPrior:
         context = shapes[:, list(prior_context_indices(target_landmark))]
         origin = context.mean(axis=1)
         centered = (context - origin[:, None]).reshape(len(shapes), -1)
-        class_features = np.stack(
-            [np.asarray(classes) == value for value in self.class_values], axis=1
-        ).astype(np.float64)
-        gender_features = np.stack(
-            [np.asarray(genders) == value for value in self.gender_values], axis=1
-        ).astype(np.float64)
-        design = np.concatenate([centered, class_features, gender_features], axis=1)
+        blocks = [centered]
+        if "class" in self.config.covariates:
+            blocks.append(
+                np.stack(
+                    [np.asarray(classes) == value for value in self.class_values], axis=1
+                ).astype(np.float64)
+            )
+        if "sex" in self.config.covariates:
+            blocks.append(
+                np.stack(
+                    [np.asarray(genders) == value for value in self.gender_values], axis=1
+                ).astype(np.float64)
+            )
+        design = np.concatenate(blocks, axis=1)
         target = shapes[:, int(target_landmark)] - origin
         return design, target, origin
 
@@ -270,6 +279,7 @@ class ConditionalSpatialPrior:
         return {
             "version": self.version,
             "method": "core20_context_conditional_gaussian_ridge",
+            "covariates": list(self.config.covariates),
             "folds": int(self.config.folds),
             "l2_grid": list(map(float, self.config.l2_grid)),
             "selected_l2": self.selected_l2,
@@ -290,6 +300,7 @@ class ConditionalSpatialPrior:
                 "l2_grid": list(self.config.l2_grid),
                 "covariance_shrinkage": self.config.covariance_shrinkage,
                 "covariance_floor_mm": self.config.covariance_floor_mm,
+                "covariates": list(self.config.covariates),
                 "seed": self.config.seed,
             },
             "parameters": {
@@ -320,7 +331,11 @@ class ConditionalSpatialPrior:
     @classmethod
     def load(cls, path):
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        instance = cls(SpatialPriorConfig(**payload["config"]))
+        config = dict(payload["config"])
+        # Files written before covariates were configurable used class and sex.
+        config["covariates"] = tuple(config.get("covariates", ("class", "sex")))
+        config["l2_grid"] = tuple(config["l2_grid"])
+        instance = cls(SpatialPriorConfig(**config))
         instance.fit_sample_ids = list(payload["fit_sample_ids"])
         instance.class_values = list(payload["class_values"])
         instance.gender_values = list(payload["gender_values"])

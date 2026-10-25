@@ -427,9 +427,12 @@ def test_gate_free_policy_only_switches_refinement_on_or_off():
 def test_gate_free_refinement_builds_no_evidence_or_gates(tmp_path, monkeypatch):
     from all23_mvsc_refinement import refiner as module
 
+    from types import SimpleNamespace
+
     class Fitted:
         def __init__(self, name):
-            self.model, self.prior, self.report = name, "prior", {"name": name}
+            self.model, self.report = name, {"name": name}
+            self.prior = SimpleNamespace(config=SimpleNamespace(covariates=("class", "sex")))
 
     loaded = []
 
@@ -456,3 +459,60 @@ def test_gate_free_refinement_builds_no_evidence_or_gates(tmp_path, monkeypatch)
     assert refinement.ensemble.config.mc_samples == 0
     assert all(require_cached for _, require_cached in loaded)
     assert not (tmp_path / "out" / "crossfit").exists()
+
+
+def test_spatial_prior_covariates_are_configurable(tmp_path):
+    shapes = synthetic_shapes()
+    ids = [f"S{index}" for index in range(len(shapes))]
+    classes = ["Class1", "Class2", "Class3", "Class1"] * (len(shapes) // 4)
+    genders = ["men", "women"] * (len(shapes) // 2)
+    both = ConditionalSpatialPrior(SpatialPriorConfig(folds=4)).fit(shapes, ids, classes, genders)
+    sex_only = ConditionalSpatialPrior(SpatialPriorConfig(folds=4, covariates=("sex",))).fit(
+        shapes, ids, classes, genders
+    )
+    width_both = both._raw_design(shapes, 1, classes, genders)[0].shape[1]
+    width_sex = sex_only._raw_design(shapes, 1, classes, genders)[0].shape[1]
+    assert width_both - width_sex == len(set(classes))
+    # Predictions must not depend on class once the covariate is removed.
+    swapped = list(reversed(classes))
+    np.testing.assert_allclose(
+        sex_only.predict(shapes[:4], classes[:4], genders[:4])[0],
+        sex_only.predict(shapes[:4], swapped[:4], genders[:4])[0],
+    )
+    path = tmp_path / "prior.json"
+    sex_only.save(path)
+    assert ConditionalSpatialPrior.load(path).config.covariates == ("sex",)
+    # Files written before covariates were configurable load with class and sex.
+    import json
+
+    payload = json.loads(path.read_text())
+    del payload["config"]["covariates"]
+    path.write_text(json.dumps(payload))
+    assert ConditionalSpatialPrior.load(path).config.covariates == ("class", "sex")
+
+
+def test_inference_prior_is_refitted_only_when_covariates_change(tmp_path, monkeypatch):
+    from all23_mvsc_refinement import refiner as module
+
+    shapes = synthetic_shapes()
+    ids = [f"S{index}" for index in range(len(shapes))]
+    classes = ["Class1", "Class2"] * (len(shapes) // 2)
+    genders = ["men", "women", "women", "men"] * (len(shapes) // 4)
+    original = ConditionalSpatialPrior(SpatialPriorConfig(folds=4)).fit(shapes, ids, classes, genders)
+
+    class Full:
+        prior = original
+
+    monkeypatch.setattr(module, "dataset_shapes", lambda dataset: (shapes, ids, classes, genders))
+    same = module.inference_prior(Full(), object(), All23MVSCConfig(), tmp_path)
+    assert same is original
+    refitted = module.inference_prior(
+        Full(), object(), All23MVSCConfig(prior_covariates=("sex",), prior_folds=4), tmp_path
+    )
+    assert refitted is not original and refitted.config.covariates == ("sex",)
+    assert (tmp_path / "spatial_prior_sex.json").exists()
+    from all23_mvsc_refinement.refiner import config_signature
+
+    assert config_signature(All23MVSCConfig(prior_covariates=("sex",)), ["A"]) == config_signature(
+        All23MVSCConfig(), ["A"]
+    )

@@ -126,6 +126,11 @@ def build_parser():
     )
     parser.add_argument("--decision-rationale", default=DEFAULT_RATIONALE)
     parser.add_argument(
+        "--all23-prior-covariates",
+        default="class,sex",
+        help="Comma-separated participant metadata used by the spatial prior (class, sex)",
+    )
+    parser.add_argument(
         "--refiner-source-run",
         default=None,
         help=(
@@ -164,6 +169,14 @@ def build_parser():
     return parser
 
 
+def parse_prior_covariates(value):
+    covariates = tuple(item.strip() for item in str(value).split(",") if item.strip())
+    unknown = sorted(set(covariates) - {"class", "sex"})
+    if unknown:
+        raise ValueError(f"Unknown spatial-prior covariates: {unknown}")
+    return covariates
+
+
 def all23_config_from_args(args):
     return All23MVSCConfig(
         epochs=args.all23_epochs,
@@ -179,6 +192,7 @@ def all23_config_from_args(args):
         ensemble=args.all23_ensemble,
         mc_samples=args.all23_mc_samples if args.all23_gate else 0,
         use_gate=args.all23_gate,
+        prior_covariates=parse_prior_covariates(args.all23_prior_covariates),
         use_jaw_profile=args.all23_jaw_profile,
         bootstrap_iters=args.bootstrap_iters,
         mixed_precision=bool(args.mixed_precision),
@@ -561,6 +575,7 @@ def run_fold(
         "stage_a_column": args.stage_a_column,
         "ensemble_members": refinement.reports["ensemble_members"],
         "use_gate": bool(config.use_gate),
+        "prior_covariates": refinement.reports["prior_covariates"],
         "mc_samples": config.mc_samples,
         "model_dir": refinement.reports["model_dir"],
         "gate_evidence_prior": incoming_prior_config,
