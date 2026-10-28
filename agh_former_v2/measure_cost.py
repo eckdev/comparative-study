@@ -330,36 +330,12 @@ def measure_palnet(fold, sample_ids, device, smoke, warmup):
 # ----------------------------------------------------------------------------
 # Proposed model: Stage 1 -> Stage 2 (TTA) -> shape prior -> six refiners
 # ----------------------------------------------------------------------------
-def measure_proposed(fold, sample_ids, device, warmup):
-    from torch.utils.data import DataLoader, Subset
-
+def proposed_args(device):
+    """Arguments of the reported proposed-model run, checked against its saved config."""
     from agh_former_v2 import colab_run_agh_v2 as colab
-    from agh_former_v2.run_agh_v2 import all23_config_from_args, build_parser
-    from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import (
-        configure_vnext,
-        model_from_args,
-    )
-    import all23_mvsc_refinement.refiner as refiner_module
-    from all23_mvsc_refinement import ProcrustesShapePrior, apply_policy, fit_or_load_all23_refinement
-    from all23_mvsc_refinement.refiner import dataset_shapes, subset_dataset
-    from all23_rgb_geodesic_cascade.data import (
-        collate_graphs,
-        collate_surface_graphs,
-        discover_samples,
-        prepare_mesh_record,
-    )
-    from all23_rgb_geodesic_cascade.model import GlobalCoarseNetwork
-    from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
-        fold_output_dir,
-        make_cv_splits,
-        prepare_fold,
-        resolve_precision,
-        set_seed,
-        validate_preprocessing_root,
-    )
-    from all23_rgb_geodesic_cascade.stage1 import _dataset as stage1_dataset
-    from all23_rgb_geodesic_cascade.stage1 import _train_template, collect_stage1
-    from all23_rgb_geodesic_cascade.train import collect_outputs
+    from agh_former_v2.run_agh_v2 import build_parser
+    from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import configure_vnext
+    from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import resolve_precision, set_seed
 
     command, _ = colab.command_for(PROPOSED_PRESET, 42, colab.STAGE_A_RUN)
     args = configure_vnext(build_parser().parse_args([str(item) for item in command[3:]]))
@@ -379,6 +355,35 @@ def measure_proposed(fold, sample_ids, device, warmup):
     args.no_tqdm = True
     set_seed(args.seed)
     resolve_precision(args, device)
+    return args
+
+
+def measure_proposed(fold, sample_ids, device, warmup):
+    from torch.utils.data import DataLoader, Subset
+
+    from agh_former_v2.run_agh_v2 import all23_config_from_args
+    from agh_former_vnext_orthodontic_comparison.run_aghformer_vnext import model_from_args
+    import all23_mvsc_refinement.refiner as refiner_module
+    from all23_mvsc_refinement import ProcrustesShapePrior, apply_policy, fit_or_load_all23_refinement
+    from all23_mvsc_refinement.refiner import dataset_shapes, subset_dataset
+    from all23_rgb_geodesic_cascade.data import (
+        collate_graphs,
+        collate_surface_graphs,
+        discover_samples,
+        prepare_mesh_record,
+    )
+    from all23_rgb_geodesic_cascade.model import GlobalCoarseNetwork
+    from all23_rgb_geodesic_cascade.run_all23_rgb_geodesic import (
+        fold_output_dir,
+        make_cv_splits,
+        prepare_fold,
+        validate_preprocessing_root,
+    )
+    from all23_rgb_geodesic_cascade.stage1 import _dataset as stage1_dataset
+    from all23_rgb_geodesic_cascade.stage1 import _train_template, collect_stage1
+    from all23_rgb_geodesic_cascade.train import collect_outputs
+
+    args = proposed_args(device)
     samples = discover_samples(args.data_root)
     preprocessing_root = validate_preprocessing_root(args.preprocessing_root, args)
     splits = make_cv_splits(samples, args.folds, args.val_fraction, args.seed)[fold - 1]

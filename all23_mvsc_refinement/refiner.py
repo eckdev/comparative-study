@@ -121,7 +121,25 @@ class All23MVSCConfig:
     mixed_precision: bool = True
     amp_dtype: str = "bfloat16"
     seed: int = 42
+    # Ablation switches. ``view_subset`` keeps only these views (indices into
+    # VIEW_NAMES), ``view_fusion="mean"`` replaces the view attention by equal
+    # weights, ``use_geometry=False`` zeroes the candidate geometric descriptor
+    # and ``drop_colour=True`` zeroes every colour channel and feature. They act
+    # in training and at inference alike.
+    view_subset: tuple[int, ...] = (0, 1, 2, 3)
+    view_fusion: str = "attention"
+    use_geometry: bool = True
+    drop_colour: bool = False
 
+
+# Ablation switches at their defaults are left out of the signature, so that
+# refiners trained before the switches existed still load.
+_ABLATION_DEFAULTS = {
+    "view_subset": (0, 1, 2, 3),
+    "view_fusion": "attention",
+    "use_geometry": True,
+    "drop_colour": False,
+}
 
 # Hyper-parameters that do not change a fitted network (policy-only settings).
 _POLICY_ONLY_FIELDS = (
@@ -141,11 +159,16 @@ _POLICY_ONLY_FIELDS = (
 EVIDENCE_VERSION = 2
 
 
+def tuple_or_value(value):
+    return tuple(value) if isinstance(value, list) else value
+
+
 def config_signature(config, fit_sample_ids=()):
     payload = {
         key: value
         for key, value in asdict(config).items()
         if key not in _POLICY_ONLY_FIELDS
+        and not (key in _ABLATION_DEFAULTS and tuple_or_value(value) == _ABLATION_DEFAULTS[key])
     }
     payload.update(
         {
@@ -269,11 +292,16 @@ class FlatAll23Dataset(Dataset):
                 closest = int(np.argmin(candidates.target_distance[sample, landmark]))
                 dropped[closest] = False
                 mask &= ~dropped
+        if self.config.drop_colour:
+            images[:, list(RGB_IMAGE_CHANNELS)] = 0.0
+            features[:, list(RGB_GEOMETRY_FEATURES)] = 0.0
+        if not self.config.use_geometry:
+            features.zero_()
+        views = list(self.config.view_subset)
+        grids = torch.from_numpy(np.asarray(candidates.grids[sample, landmark], dtype=np.float32))
         return {
-            "images": images,
-            "grids": torch.from_numpy(
-                np.asarray(candidates.grids[sample, landmark], dtype=np.float32)
-            ),
+            "images": images[views],
+            "grids": grids[views],
             "points": torch.from_numpy(candidates.points[sample, landmark]),
             "features": features,
             "mask": torch.from_numpy(mask),
@@ -442,6 +470,7 @@ def build_model(config, image_channels, geometry_dim):
         coordinate_temperature=config.coordinate_temperature,
         use_images=config.use_images,
         use_spatial_prior=config.use_spatial_prior,
+        view_fusion=config.view_fusion,
     )
 
 
@@ -702,7 +731,7 @@ def predict_candidates(model, candidates, config, device, mc_samples=0):
     for name in ("confidence", "entropy", "margin", "prior_disagreement", "log_variance"):
         stacked[name] = stacked[name].reshape(samples, NUM_LANDMARKS)
     stacked["view_weights"] = stacked["view_weights"].reshape(
-        samples, NUM_LANDMARKS, len(VIEW_NAMES)
+        samples, NUM_LANDMARKS, len(config.view_subset)
     )
     if mc_samples and mc_samples > 1:
         stacked["mc_spread"] = _mc_dropout_spread(

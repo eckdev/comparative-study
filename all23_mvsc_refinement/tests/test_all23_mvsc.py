@@ -543,3 +543,45 @@ def test_landmark_only_prior_ignores_participant_metadata(tmp_path, monkeypatch)
         prior.predict(shapes[:4], classes[:4], genders[:4])[0],
         prior.predict(shapes[:4], *other_meta)[0],
     )
+
+
+def test_ablation_switches_alter_inputs_and_signature():
+    from all23_mvsc_refinement.patches import RGB_GEOMETRY_FEATURES, RGB_IMAGE_CHANNELS
+    from all23_mvsc_refinement.refiner import FlatAll23Dataset, config_signature
+
+    default = config_signature(All23MVSCConfig(), ["A", "B"])
+    for switch in (
+        {"view_subset": (0, 1, 2)},
+        {"view_fusion": "mean"},
+        {"use_geometry": False},
+        {"drop_colour": True},
+    ):
+        assert config_signature(All23MVSCConfig(**switch), ["A", "B"]) != default
+    candidates = _candidate_set()
+    row = FlatAll23Dataset(
+        candidates, [0], All23MVSCConfig(view_subset=(0, 1, 2), drop_colour=True)
+    )[0]
+    assert row["images"].shape[0] == 3 and row["grids"].shape[0] == 3
+    assert torch.all(row["images"][:, list(RGB_IMAGE_CHANNELS)] == 0)
+    assert torch.all(row["features"][:, list(RGB_GEOMETRY_FEATURES)] == 0)
+    assert torch.any(row["features"] != 0)
+    geometry_free = FlatAll23Dataset(candidates, [0], All23MVSCConfig(use_geometry=False))[0]
+    assert torch.all(geometry_free["features"] == 0) and geometry_free["images"].shape[0] == 4
+
+
+def test_mean_fusion_and_three_views_train_and_predict(tmp_path):
+    batch = synthetic_batch(views=3)
+    model = All23MVSCNet(len(IMAGE_CHANNELS), 78, width=16, coordinate_topk=4, view_fusion="mean")
+    weights = model(batch)["view_weights"]
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 3.0))
+    with pytest.raises(ValueError):
+        All23MVSCNet(len(IMAGE_CHANNELS), 78, view_fusion="max")
+    candidates = _candidate_set()
+    config = All23MVSCConfig(
+        epochs=1, min_epochs=1, patience=1, batch_size=32, width=16, coordinate_topk=4,
+        view_subset=(0, 1, 2), view_fusion="mean",
+    )
+    model, _ = fit_network(candidates, tmp_path, config, torch.device("cpu"), "sig")
+    prediction = predict_candidates(model, candidates, config, torch.device("cpu"))
+    assert prediction["view_weights"].shape == (10, NUM_LANDMARKS, 3)
+    assert np.isfinite(prediction["proposal"]).all()

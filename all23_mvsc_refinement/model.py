@@ -32,12 +32,16 @@ class All23MVSCNet(nn.Module):
         coordinate_temperature=0.5,
         use_images=True,
         use_spatial_prior=True,
+        view_fusion="attention",
     ):
         super().__init__()
+        if view_fusion not in ("attention", "mean"):
+            raise ValueError(f"Unknown view fusion: {view_fusion}")
         self.coordinate_topk = int(coordinate_topk)
         self.coordinate_temperature = float(coordinate_temperature)
         self.use_images = bool(use_images)
         self.use_spatial_prior = bool(use_spatial_prior)
+        self.view_fusion = view_fusion
         image_width = max(16, int(width) // 2)
         hidden = max(32, int(width))
         self.image_encoder = CompactFeaturePyramid(image_channels, image_width, dropout)
@@ -112,13 +116,18 @@ class All23MVSCNet(nn.Module):
             .reshape(batch, views, candidates, feature_channels)
         )
         pooled = feature_map.mean(dim=(-2, -1)).reshape(batch, views, feature_channels)
-        embedded = landmark_embedding[:, None].expand(-1, views, -1).to(pooled.dtype)
-        view_weight = torch.softmax(
-            self.view_attention(torch.cat([pooled, embedded], dim=-1))
-            .squeeze(-1)
-            .float(),
-            dim=-1,
-        )
+        if self.view_fusion == "mean":
+            view_weight = torch.full(
+                (batch, views), 1.0 / views, device=pooled.device, dtype=torch.float32
+            )
+        else:
+            embedded = landmark_embedding[:, None].expand(-1, views, -1).to(pooled.dtype)
+            view_weight = torch.softmax(
+                self.view_attention(torch.cat([pooled, embedded], dim=-1))
+                .squeeze(-1)
+                .float(),
+                dim=-1,
+            )
         fused = (sampled.float() * view_weight[:, :, None, None]).sum(dim=1)
         pooled_fused = (pooled.float() * view_weight[..., None]).sum(dim=1)
         return fused, pooled_fused, view_weight
